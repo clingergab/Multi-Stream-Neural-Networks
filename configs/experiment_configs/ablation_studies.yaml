@@ -1,0 +1,93 @@
+# Ablation Studies Experiment Configuration
+experiment:
+  name: "ablation_studies"
+  description: "Systematic ablation of MSNN components"
+
+# Ablation dimensions
+ablations:
+  # Integration method ablation
+  integration_methods:
+    base_config: "configs/model_configs/direct_mixing/scalar.yaml"
+    ablate:
+      - name: "no_gamma"
+        params: {gamma_init: 0.0, freeze_gamma: true}
+      - name: "no_interaction"
+        params: {gamma_init: 0.0, freeze_gamma: true, freeze_alpha: true}
+      - name: "equal_weights"
+        params: {alpha_init: 0.5, beta_init: 0.5, freeze_alpha: true, freeze_beta: true}
+      - name: "color_only"
+        params: {alpha_init: 1.0, beta_init: 0.0, freeze_alpha: true, freeze_beta: true}
+      - name: "brightness_only"
+        params: {alpha_init: 0.0, beta_init: 1.0, freeze_alpha: true, freeze_beta: true}
+
+  # Initialization strategy ablation
+  initialization:
+    base_config: "configs/model_configs/direct_mixing/scalar.yaml"
+    ablate:
+      - name: "zero_init"
+        params: {alpha_init: 0.0, beta_init: 0.0, gamma_init: 0.0}
+      - name: "random_init"
+        params: {alpha_init: "random", beta_init: "random", gamma_init: "random"}
+      - name: "biased_color"
+        params: {alpha_init: 1.5, beta_init: 0.5, gamma_init: 0.1}
+      - name: "biased_brightness"
+        params: {alpha_init: 0.5, beta_init: 1.5, gamma_init: 0.1}
+
+  # Regularization ablation
+  regularization:
+    base_config: "configs/model_configs/direct_mixing/scalar.yaml"
+    ablate:
+      - name: "no_regularization"
+        params: {pathway_regularization: 0.0}
+      - name: "strong_regularization"
+        params: {pathway_regularization: 1e-2}
+      - name: "diversity_loss"
+        params: {diversity_regularization: 1e-3}
+      - name: "weight_decay_only"
+        params: {pathway_regularization: 0.0, weight_decay: 1e-3}
+
+  # Architecture ablation
+  architecture:
+    base_config: "configs/model_configs/direct_mixing/scalar.yaml"
+    ablate:
+      - name: "shallow_network"
+        params: {num_layers: 2}
+      - name: "deep_network" 
+        params: {num_layers: 5}
+      - name: "narrow_network"
+        params: {hidden_size: 256}
+      - name: "wide_network"
+        params: {hidden_size: 1024}
+
+# Datasets for ablation
+datasets:
+  - "configs/data_configs/cifar10_derived.yaml"
+
+# Training configuration
+training:
+  epochs: 50  # Shorter for ablation studies
+  runs_per_ablation: 3
+  
+# Analysis
+analysis:
+  # Component importance analysis
+  pathway_importance: true
+  gradient_analysis: true
+  feature_visualization: true
+  
+  # Statistical analysis
+  anova: true                    # Analysis of variance
+  post_hoc: "tukey"             # Post-hoc test
+  
+# Output
+output:
+  results_dir: "experiments/results/ablation_studies"
+  plots_dir: "experiments/plots/ablation_studies"
+  
+  # Ablation-specific plots
+  plots:
+    - component_importance
+    - initialization_impact
+    - regularization_effects
+    - architecture_sensitivity
+    - interaction_analysis

@@ -1,0 +1,109 @@
+# Multimodal Sensor Dataset Configuration
+dataset:
+  name: "multimodal_sensor"
+  source: "custom"
+  
+  # Data paths
+  root: "./data/sensor_data"
+  processed_root: "./data/processed/multimodal_sensor"
+  
+  # Sensor modalities
+  modalities:
+    rgb:
+      type: "rgb_camera"
+      channels: 3
+      resolution: [640, 480]
+      preprocessing:
+        normalize: true
+        mean: [0.485, 0.456, 0.406]
+        std: [0.229, 0.224, 0.225]
+    
+    thermal:
+      type: "thermal_camera"
+      channels: 1
+      resolution: [320, 240]
+      preprocessing:
+        normalize: true
+        temperature_range: [-20, 60]  # Celsius
+        mean: [0.5]
+        std: [0.3]
+    
+    depth:
+      type: "depth_sensor"
+      channels: 1
+      resolution: [640, 480]
+      preprocessing:
+        normalize: true
+        depth_range: [0.1, 10.0]  # meters
+        mean: [0.3]
+        std: [0.2]
+    
+    lidar:
+      type: "lidar_point_cloud"
+      points: 1024
+      features: 4  # x, y, z, intensity
+      preprocessing:
+        normalize: true
+        range_limit: 50.0  # meters
+
+# Pathway configuration for multimodal
+pathways:
+  visual:
+    modalities: ["rgb", "thermal"]
+    fusion_method: "early"  # Fuse before processing
+    
+  spatial:
+    modalities: ["depth", "lidar"]
+    fusion_method: "late"   # Fuse after processing
+
+# Data augmentation
+augmentation:
+  enabled: true
+  transforms:
+    rgb:
+      - random_horizontal_flip: 0.5
+      - color_jitter:
+          brightness: 0.2
+          contrast: 0.2
+    
+    thermal:
+      - random_horizontal_flip: 0.5
+      - temperature_shift: 5.0  # Celsius
+    
+    depth:
+      - random_horizontal_flip: 0.5
+      - depth_noise: 0.01       # meters
+    
+    lidar:
+      - random_rotation: 15     # degrees
+      - point_dropout: 0.1      # fraction
+
+# Data loading
+dataloader:
+  batch_size: 16  # Smaller due to multimodal complexity
+  num_workers: 4
+  pin_memory: true
+  shuffle: true
+  
+# Synchronization
+temporal:
+  synchronization: true        # Ensure temporal alignment
+  tolerance: 0.1              # seconds
+  interpolation: "linear"     # For missing frames
+
+# Task configuration
+task:
+  type: "classification"      # or "detection", "segmentation"
+  num_classes: 50
+  
+# Sensor-specific processing
+sensors:
+  calibration_files:
+    rgb: "calibration/rgb_camera.yaml"
+    thermal: "calibration/thermal_camera.yaml" 
+    depth: "calibration/depth_sensor.yaml"
+    lidar: "calibration/lidar.yaml"
+  
+  coordinate_frames:
+    reference: "rgb"          # Reference coordinate frame
+    transforms: "calibration/transforms.yaml"

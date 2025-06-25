@@ -1,0 +1,46 @@
+{
+  "results": {
+    "mnist_data_pipeline": true,
+    "cifar100_data_pipeline": true,
+    "model_pipeline": true,
+    "mnist_training_accuracy": 53.0,
+    "mnist_test_accuracy": 51.0,
+    "cifar100_training_accuracy": 0.0,
+    "cifar100_test_accuracy": 1.6666666666666667,
+    "model_persistence": true
+  },
+  "metrics": {
+    "train_losses": [
+      1.1388448476791382,
+      0.30931935608386996,
+      5.024569193522136,
+      3.248864928881327
+    ],
+    "train_accuracies": [
+      63.75,
+      90.3125,
+      4.166666666666667,
+      31.770833333333332
+    ],
+    "val_losses": [
+      4.869991421699524,
+      2.387296497821808,
+      6.578713893890381,
+      5.878235101699829
+    ],
+    "val_accuracies": [
+      20.0,
+      53.0,
+      0.0,
+      0.0
+    ],
+    "test_loss": 6.237150192260742,
+    "test_accuracy": 1.6666666666666667,
+    "best_val_accuracy": 53.0,
+    "best_epoch": 1,
+    "final_train_accuracy": 31.770833333333332,
+    "final_val_accuracy": 0.0
+  },
+  "device": "mps",
+  "test_passed": false
+}

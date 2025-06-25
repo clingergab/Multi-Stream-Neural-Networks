@@ -1,0 +1,60 @@
+# CIFAR-10 Derived Dataset Configuration
+dataset:
+  name: "cifar10_derived"
+  source: "cifar10"
+  
+  # Data paths
+  root: "./data/cifar10"
+  processed_root: "./data/processed/cifar10_derived"
+  
+  # Pathway derivation
+  pathways:
+    color:
+      channels: [0, 1, 2]  # RGB channels
+      preprocessing:
+        normalize: true
+        mean: [0.485, 0.456, 0.406]
+        std: [0.229, 0.224, 0.225]
+        
+    brightness:
+      derivation: "luminance"  # Y = 0.299*R + 0.587*G + 0.114*B
+      channels: [3]           # Single luminance channel
+      preprocessing:
+        normalize: true
+        mean: [0.449]
+        std: [0.226]
+
+# Data augmentation
+augmentation:
+  enabled: true
+  transforms:
+    both_pathways:
+      - random_horizontal_flip: 0.5
+      - random_crop:
+          size: 32
+          padding: 4
+    
+    color_specific:
+      - color_jitter:
+          brightness: 0.2
+          contrast: 0.2
+          saturation: 0.2
+          hue: 0.1
+    
+    brightness_specific:
+      - random_brightness: 0.1
+      - random_contrast: 0.1
+
+# Data loading
+dataloader:
+  batch_size: 128
+  num_workers: 4
+  pin_memory: true
+  shuffle: true
+  
+# Dataset splits
+splits:
+  train: 0.8
+  val: 0.1  
+  test: 0.1
+  stratified: true

@@ -1,0 +1,73 @@
+# Base configuration for Multi-Stream Neural Networks
+
+# Experiment settings
+experiment:
+  name: "msnn_base_experiment"
+  output_dir: "outputs"
+  seed: 42
+  device: "auto"  # auto, cpu, cuda
+  
+# Logging settings  
+logging:
+  level: "INFO"
+  wandb_project: null
+  tensorboard: true
+  log_interval: 100
+
+# Model architecture
+model:
+  model_type: "direct_mixing"
+  variant: "scalar"
+  input_size: [4, 32, 32]  # RGB + Luminance
+  hidden_size: 512
+  num_classes: 10
+  num_layers: 3
+  
+  # Integration parameters
+  alpha_init: 1.0
+  beta_init: 1.0
+  gamma_init: 0.2
+  
+  # Regularization
+  min_weight_val: 0.01
+  dropout_rate: 0.1
+
+# Training configuration
+training:
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  epochs: 100
+  optimizer: "adam"
+  scheduler: "cosine"
+  
+  # Early stopping
+  patience: 10
+  min_delta: 0.0001
+  
+  # Checkpointing
+  save_every: 10
+  checkpoint_dir: "checkpoints"
+
+# Data configuration
+data:
+  dataset: "cifar10"
+  data_dir: "data"
+  num_workers: 4
+  pin_memory: true
+  
+  # Preprocessing
+  image_size: 32
+  normalize: true
+  augmentation: true
+  
+  # Split ratios
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+# Evaluation settings
+evaluation:
+  metrics: ["accuracy", "top5_accuracy", "loss"]
+  save_predictions: false
+  compute_pathway_importance: true

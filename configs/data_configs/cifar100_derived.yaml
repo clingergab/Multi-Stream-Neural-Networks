@@ -1,0 +1,70 @@
+# CIFAR-100 Derived Dataset Configuration
+dataset:
+  name: "cifar100_derived"
+  source: "cifar100"
+  
+  # Data paths
+  root: "./data/cifar100"
+  processed_root: "./data/processed/cifar100_derived"
+  
+  # Pathway derivation (same as CIFAR-10)
+  pathways:
+    color:
+      channels: [0, 1, 2]  # RGB channels
+      preprocessing:
+        normalize: true
+        mean: [0.507, 0.487, 0.441]  # CIFAR-100 specific
+        std: [0.267, 0.256, 0.276]
+        
+    brightness:
+      derivation: "luminance"
+      channels: [3]
+      preprocessing:
+        normalize: true
+        mean: [0.478]  # CIFAR-100 brightness mean
+        std: [0.250]
+
+# Data augmentation (enhanced for CIFAR-100)
+augmentation:
+  enabled: true
+  transforms:
+    both_pathways:
+      - random_horizontal_flip: 0.5
+      - random_crop:
+          size: 32
+          padding: 4
+      - cutout:
+          n_holes: 1
+          length: 8
+    
+    color_specific:
+      - color_jitter:
+          brightness: 0.3
+          contrast: 0.3
+          saturation: 0.3
+          hue: 0.15
+      - random_rotation: 15
+    
+    brightness_specific:
+      - random_brightness: 0.15
+      - random_contrast: 0.15
+
+# Data loading
+dataloader:
+  batch_size: 128
+  num_workers: 4
+  pin_memory: true
+  shuffle: true
+  
+# Dataset splits
+splits:
+  train: 0.8
+  val: 0.1
+  test: 0.1
+  stratified: true
+
+# CIFAR-100 specific
+classes:
+  num_classes: 100
+  fine_labels: true
+  coarse_labels: false  # Use fine-grained labels

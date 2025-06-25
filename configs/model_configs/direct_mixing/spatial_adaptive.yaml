@@ -1,0 +1,27 @@
+model:
+  type: "spatial_adaptive_mixing"
+  params:
+    input_channels: 4
+    hidden_dim: 128
+    num_classes: 10
+
+training:
+  batch_size: 32
+  epochs: 100
+  learning_rate: 0.001
+  optimizer: "adam"
+  scheduler:
+    type: "step"
+    step_size: 30
+    gamma: 0.1
+
+data:
+  input_size: [224, 224]
+  num_workers: 4
+  pin_memory: true
+
+loss:
+  type: "cross_entropy"
+  
+evaluation:
+  metrics: ["accuracy", "precision", "recall", "f1"]

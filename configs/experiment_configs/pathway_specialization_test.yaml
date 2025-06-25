@@ -1,0 +1,135 @@
+# Pathway Specialization Test Configuration
+experiment:
+  name: "pathway_specialization_test"
+  description: "Test biological hypothesis of pathway specialization"
+
+# Specialization tests
+tests:
+  # Color pathway specialization
+  color_specialization:
+    description: "Test if color pathway specializes in color discrimination"
+    
+    # Datasets with varying color complexity
+    datasets:
+      - name: "high_color_variance"
+        config: "configs/data_configs/cifar10_derived.yaml"
+        augmentation_override:
+          color_jitter:
+            saturation: 0.5
+            hue: 0.2
+            
+      - name: "low_color_variance" 
+        config: "configs/data_configs/cifar10_derived.yaml"
+        augmentation_override:
+          color_jitter:
+            saturation: 0.1
+            hue: 0.05
+            
+      - name: "grayscale_only"
+        config: "configs/data_configs/cifar10_derived.yaml" 
+        color_pathway_override: "grayscale"
+
+    # Models to test
+    models:
+      - "configs/model_configs/direct_mixing/scalar.yaml"
+      - "configs/model_configs/direct_mixing/channel_wise.yaml"
+
+  # Brightness pathway specialization  
+  brightness_specialization:
+    description: "Test if brightness pathway specializes in luminance patterns"
+    
+    # Datasets with varying brightness patterns
+    datasets:
+      - name: "high_contrast"
+        config: "configs/data_configs/cifar10_derived.yaml"
+        augmentation_override:
+          brightness: 0.4
+          contrast: 0.4
+          
+      - name: "low_contrast"
+        config: "configs/data_configs/cifar10_derived.yaml"
+        augmentation_override:
+          brightness: 0.1
+          contrast: 0.1
+          
+      - name: "uniform_brightness"
+        config: "configs/data_configs/cifar10_derived.yaml"
+        brightness_pathway_override: "uniform"
+
+    models:
+      - "configs/model_configs/direct_mixing/scalar.yaml"
+      - "configs/model_configs/direct_mixing/channel_wise.yaml"
+
+  # Cross-pathway interaction
+  interaction_analysis:
+    description: "Analyze how pathways interact during learning"
+    
+    datasets:
+      - "configs/data_configs/cifar10_derived.yaml"
+      
+    models:
+      - "configs/model_configs/direct_mixing/scalar.yaml"
+      - "configs/model_configs/direct_mixing/channel_wise.yaml"
+      - "configs/model_configs/direct_mixing/dynamic.yaml"
+    
+    # Track interaction term evolution
+    monitoring:
+      gamma_evolution: true
+      pathway_correlations: true
+      gradient_interactions: true
+
+# Biological validation
+biological_validation:
+  # Compare with known neuroscience findings
+  parvocellular_properties:
+    - high_spatial_resolution
+    - color_sensitivity
+    - slower_response
+    
+  magnocellular_properties:
+    - lower_spatial_resolution
+    - motion_sensitivity
+    - faster_response
+    
+  # Computational tests for these properties
+  property_tests:
+    spatial_resolution:
+      test_type: "frequency_analysis"
+      frequency_bands: [0.1, 0.5, 1.0, 2.0, 4.0]  # cycles/degree
+      
+    temporal_response:
+      test_type: "frame_rate_analysis"
+      frame_rates: [5, 10, 15, 30, 60]  # fps
+      
+    motion_sensitivity:
+      test_type: "optical_flow"
+      motion_speeds: [1, 5, 10, 20]  # pixels/frame
+
+# Analysis metrics
+analysis:
+  # Pathway specialization metrics
+  specialization_index: true    # How specialized each pathway becomes
+  cross_pathway_similarity: true  # Similarity between pathway features
+  task_relevance: true          # Relevance of each pathway to task
+  
+  # Dynamic analysis
+  temporal_evolution: true      # How specialization changes over time
+  learning_dynamics: true      # Pathway learning rates
+  
+# Output
+output:
+  results_dir: "experiments/results/pathway_specialization"
+  plots_dir: "experiments/plots/pathway_specialization"
+  
+  # Specialization-specific outputs
+  plots:
+    - pathway_specialization_index
+    - feature_similarity_analysis
+    - interaction_evolution
+    - biological_property_validation
+    - cross_dataset_generalization
+    
+  reports:
+    - specialization_summary
+    - biological_validation_report
+    - pathway_interaction_analysis

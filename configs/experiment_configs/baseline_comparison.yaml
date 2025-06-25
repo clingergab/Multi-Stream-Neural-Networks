@@ -1,0 +1,74 @@
+# Baseline Comparison Experiment Configuration
+experiment:
+  name: "baseline_comparison"
+  description: "Compare MSNN against traditional baselines"
+  
+# Models to compare
+models:
+  # Traditional baselines
+  single_stream_rgb:
+    config: "configs/baselines/single_stream_rgb.yaml"
+    
+  single_stream_grayscale:
+    config: "configs/baselines/single_stream_grayscale.yaml"
+    
+  dual_network:
+    config: "configs/baselines/dual_network.yaml"
+    
+  early_fusion:
+    config: "configs/baselines/early_fusion.yaml"
+    
+  basic_multi_channel:
+    config: "configs/model_configs/basic_multi_channel.yaml"
+  
+  # MSNN variants
+  scalar_mixing:
+    config: "configs/model_configs/direct_mixing/scalar.yaml"
+    
+  channel_mixing:
+    config: "configs/model_configs/direct_mixing/channel_wise.yaml"
+    
+  concat_linear:
+    config: "configs/model_configs/concat_linear.yaml"
+
+# Datasets
+datasets:
+  - "configs/data_configs/cifar10_derived.yaml"
+  - "configs/data_configs/cifar100_derived.yaml"
+
+# Training configuration
+training:
+  epochs: 100
+  runs_per_model: 5        # Multiple runs for statistical significance
+  early_stopping: true
+  patience: 15
+  
+# Evaluation metrics
+metrics:
+  - accuracy
+  - top5_accuracy
+  - f1_score
+  - precision
+  - recall
+  - parameter_count
+  - flops
+  - inference_time
+  - memory_usage
+
+# Statistical analysis
+analysis:
+  significance_test: "wilcoxon"  # Statistical test
+  confidence_level: 0.95
+  effect_size: true              # Compute effect sizes
+  
+# Output
+output:
+  results_dir: "experiments/results/baseline_comparison"
+  plots_dir: "experiments/plots/baseline_comparison"
+  
+  # Generate comparison plots
+  plots:
+    - accuracy_comparison
+    - parameter_efficiency
+    - training_curves
+    - statistical_significance

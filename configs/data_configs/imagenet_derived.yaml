@@ -1,0 +1,82 @@
+# ImageNet Derived Dataset Configuration
+dataset:
+  name: "imagenet_derived"
+  source: "imagenet"
+  
+  # Data paths
+  root: "./data/imagenet"
+  processed_root: "./data/processed/imagenet_derived"
+  
+  # Image settings
+  image_size: 224
+  
+  # Pathway derivation
+  pathways:
+    color:
+      channels: [0, 1, 2]  # RGB channels
+      preprocessing:
+        normalize: true
+        mean: [0.485, 0.456, 0.406]  # ImageNet standard
+        std: [0.229, 0.224, 0.225]
+        
+    brightness:
+      derivation: "luminance"
+      channels: [3]
+      preprocessing:
+        normalize: true
+        mean: [0.449]
+        std: [0.226]
+
+# Data augmentation
+augmentation:
+  enabled: true
+  transforms:
+    both_pathways:
+      - random_resized_crop:
+          size: 224
+          scale: [0.08, 1.0]
+          ratio: [0.75, 1.33]
+      - random_horizontal_flip: 0.5
+    
+    color_specific:
+      - color_jitter:
+          brightness: 0.4
+          contrast: 0.4
+          saturation: 0.4
+          hue: 0.1
+      - auto_augment: "imagenet"  # ImageNet AutoAugment policy
+    
+    brightness_specific:
+      - random_brightness: 0.2
+      - random_contrast: 0.2
+
+# Validation transforms (no augmentation)
+val_transforms:
+  - resize: 256
+  - center_crop: 224
+  - normalize:
+      mean: [0.485, 0.456, 0.406, 0.449]  # RGB + L
+      std: [0.229, 0.224, 0.225, 0.226]
+
+# Data loading
+dataloader:
+  batch_size: 64  # Smaller batch for memory
+  num_workers: 8
+  pin_memory: true
+  shuffle: true
+  
+# Dataset splits (use ImageNet standard)
+splits:
+  train: "train"      # Use official train split
+  val: "val"          # Use official validation split
+  test: "val"         # Use validation as test
+
+# ImageNet specific
+classes:
+  num_classes: 1000
+  
+# Memory optimization
+optimization:
+  cache_dataset: false     # Too large to cache
+  progressive_resize: true # Start with smaller images
+  mixed_precision: true    # Use FP16 for memory efficiency
