@@ -60,17 +60,27 @@ Multi-Stream-Neural-Networks/
 │   │   └── builders/            # Model factory and registry
 │   ├── transforms/              # Data transforms (RGBtoRGBL)
 │   └── utils/                   # Utilities and registry
-├── tests/                       # Test suites
+├── tests/                       # All test suites
 │   ├── end_to_end/             # End-to-end integration tests
 │   └── archived_tests/         # Legacy tests
 ├── scripts/                     # Utility scripts
 │   ├── analysis/               # Model analysis tools
-│   └── download_datasets.py   # Dataset preparation
+│   ├── train_multi_channel.py  # Training script
+│   └── download_datasets.py    # Dataset preparation
+├── verification/               # Verification scripts
+│   ├── verify_corrections.py   # Comprehensive verification
+│   ├── final_verification.py   # Final claim verification
+│   └── check_optimizer_calc.py # Optimizer memory analysis
 ├── docs/                       # Documentation
+│   └── comparisons.md          # Architecture comparison
 ├── examples/                   # Usage examples
 ├── experiments/               # Experiment results
-├── notebooks/                # Jupyter notebooks
-└── configs/                  # Configuration files
+├── notebooks/                 # Jupyter notebooks
+├── configs/                   # Configuration files
+├── archive/                   # Archived files (temp/redundant)
+├── DESIGN.md                  # Architecture design document
+├── VERIFICATION_SUMMARY.md    # Verification report
+└── README.md                  # This file
 ```
 
 ## Usage Examples
