@@ -41,6 +41,30 @@ color_data, brightness_data = transform(rgb_tensor)
 outputs = model.forward_combined(color_data, brightness_data)
 ```
 
+## CIFAR-100 Data Loading
+
+The project includes robust CIFAR-100 data loading utilities that work directly with pickle files:
+
+```python
+from src.utils.cifar100_loader import get_cifar100_datasets, CIFAR100_FINE_LABELS
+
+# Load CIFAR-100 datasets
+train_dataset, test_dataset, class_names = get_cifar100_datasets()
+
+# Access raw data for processing
+train_data = train_dataset.data    # [50000, 3, 32, 32]
+train_labels = train_dataset.labels # [50000]
+
+# No torchvision naming conventions required!
+# Works directly with data/cifar-100/ pickle files
+```
+
+### Key Features
+- **Direct pickle loading**: No torchvision folder naming requirements
+- **Multiple return formats**: Tensors, numpy arrays, or dataset objects
+- **Simple dataset wrapper**: PyTorch-compatible for training loops
+- **Full integration**: Works seamlessly with RGBtoRGBL processor
+
 ## Installation
 
 ```bash
