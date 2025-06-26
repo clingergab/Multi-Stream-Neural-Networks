@@ -37,6 +37,40 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
     - Image classification with RGB + brightness streams
     - Computer vision tasks requiring multi-modal processing
     - Spatial feature extraction with residual learning
+    
+    Fusion Strategies:
+    -----------------
+    - **Shared Classifier (default)**: Feature-level fusion where features from both 
+      streams are concatenated and passed through a unified classifier for integrated 
+      decision-making. Better for learning complex inter-stream relationships.
+    - **Separate Classifiers**: Output-level fusion where each stream has its own 
+      classifier and outputs are added. Simpler but less expressive fusion.
+    
+    API Design:
+    -----------
+    This model follows a simplified, clean API design:
+    
+    1. **forward()** - The primary method for training, inference, and evaluation
+       - Called automatically by model(x, y)
+       - Returns single tensor suitable for loss computation
+       - Use this for all training and classification tasks
+    
+    2. **analyze_pathways()** - For research and analysis purposes only
+       - Returns separate outputs for each stream/pathway
+       - Use this to analyze individual pathway contributions
+       - Never use this for training (returns tuple, not single tensor)
+    
+    Example Usage:
+    -------------
+    # Training/inference (standard PyTorch pattern):
+    model = MultiChannelResNetNetwork(...)
+    output = model(color_data, brightness_data)  # Single tensor
+    loss = criterion(output, labels)  # Works seamlessly
+    
+    # Research/analysis:
+    color_logits, brightness_logits = model.analyze_pathways(color_data, brightness_data)
+    color_accuracy = accuracy_metric(color_logits, labels)
+    brightness_accuracy = accuracy_metric(brightness_logits, labels)
     """
     
     def __init__(
@@ -47,6 +81,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         num_blocks: List[int] = [2, 2, 2, 2],
         block_type: str = 'basic',
         activation: str = 'relu',
+        use_shared_classifier: bool = True,  # NEW: Enable proper fusion
         input_channels: int = None,  # For backward compatibility
         device: str = 'auto',  # NEW: Automatic device detection
         **kwargs
@@ -69,6 +104,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         self.num_blocks = num_blocks
         self.block_type = block_type
         self.activation = activation
+        self.use_shared_classifier = use_shared_classifier
         
         # Setup device management with proper detection
         self.device_manager = DeviceManager(preferred_device=device if device != 'auto' else None)
@@ -127,10 +163,20 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         # Global average pooling and classifier
         self.avgpool = MultiChannelAdaptiveAvgPool2d((1, 1))
         
-        # Final classifier - note we keep separate outputs for multi-channel consistency
+        # Final classifier - choose between shared fusion or separate classifiers
         final_features = 512 * self.block.expansion
-        self.color_classifier = nn.Linear(final_features, self.num_classes)
-        self.brightness_classifier = nn.Linear(final_features, self.num_classes)
+        
+        if self.use_shared_classifier:
+            # Shared classifier with proper fusion - concatenates features from both streams
+            self.shared_classifier = nn.Linear(final_features * 2, self.num_classes, bias=True)
+            # Also create separate projection heads for research/analysis purposes
+            self.color_head = nn.Linear(final_features, self.num_classes, bias=True)
+            self.brightness_head = nn.Linear(final_features, self.num_classes, bias=True)
+        else:
+            # Legacy: Separate classifiers for each stream
+            self.shared_classifier = None  # Not used in separate mode
+            self.color_classifier = nn.Linear(final_features, self.num_classes)
+            self.brightness_classifier = nn.Linear(final_features, self.num_classes)
     
     def _make_layer(self, planes: int, blocks: int, stride: int = 1) -> MultiChannelSequential:
         """
@@ -196,16 +242,19 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
-    def forward(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through the ResNet network.
+        Forward pass through the ResNet network for training and classification.
+        
+        This is the primary method called by model(x, y) and used for training, inference, and evaluation.
+        Returns a single tensor suitable for loss computation and classification.
         
         Args:
             color_input: Color image tensor [batch_size, channels, height, width]
             brightness_input: Brightness image tensor [batch_size, channels, height, width]
             
         Returns:
-            Tuple of (color_logits, brightness_logits) [batch_size, num_classes] each
+            Combined classification logits [batch_size, num_classes]
         """
         # Initial layers
         color_x, brightness_x = self.conv1(color_input, brightness_input)
@@ -229,25 +278,65 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         color_x = torch.flatten(color_x, 1)
         brightness_x = torch.flatten(brightness_x, 1)
         
-        # Separate classification for each stream
-        color_logits = self.color_classifier(color_x)
-        brightness_logits = self.brightness_classifier(brightness_x)
-        
-        return color_logits, brightness_logits
+        # Combine outputs for classification
+        if self.use_shared_classifier:
+            # Use shared classifier for optimal fusion
+            fused_features = torch.cat([color_x, brightness_x], dim=1)
+            return self.shared_classifier(fused_features)
+        else:
+            # Legacy: Add separate outputs
+            color_logits = self.color_classifier(color_x)
+            brightness_logits = self.brightness_classifier(brightness_x)
+            return color_logits + brightness_logits
     
-    def forward_combined(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> torch.Tensor:
+    def analyze_pathways(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass with combined output for standard classification.
+        Analyze individual pathway contributions for research purposes.
+        
+        Returns separate outputs for each stream to analyze individual pathway contributions.
+        Use this method only for research, visualization, and pathway analysis.
         
         Args:
-            color_input: Color image tensor
-            brightness_input: Brightness image tensor
+            color_input: Color image tensor [batch_size, channels, height, width]
+            brightness_input: Brightness image tensor [batch_size, channels, height, width]
             
         Returns:
-            Combined classification logits [batch_size, num_classes]
+            Tuple of (color_logits, brightness_logits) [batch_size, num_classes] each
+            Separate outputs for analyzing individual pathway performance
         """
-        color_logits, brightness_logits = self.forward(color_input, brightness_input)
-        return color_logits + brightness_logits
+        # Initial layers
+        color_x, brightness_x = self.conv1(color_input, brightness_input)
+        color_x, brightness_x = self.bn1(color_x, brightness_x)
+        color_x, brightness_x = self.activation_initial(color_x, brightness_x)
+        
+        # Apply maxpool to both streams
+        color_x = self.maxpool(color_x)
+        brightness_x = self.maxpool(brightness_x)
+        
+        # ResNet layers
+        color_x, brightness_x = self.layer1(color_x, brightness_x)
+        color_x, brightness_x = self.layer2(color_x, brightness_x)
+        color_x, brightness_x = self.layer3(color_x, brightness_x)
+        color_x, brightness_x = self.layer4(color_x, brightness_x)
+        
+        # Global average pooling
+        color_x, brightness_x = self.avgpool(color_x, brightness_x)
+        
+        # Flatten features
+        color_x = torch.flatten(color_x, 1)
+        brightness_x = torch.flatten(brightness_x, 1)
+        
+        # Separate classification for each stream (for analysis)
+        if self.use_shared_classifier:
+            # Use individual heads for analysis when shared classifier is used
+            color_logits = self.color_head(color_x)
+            brightness_logits = self.brightness_head(brightness_x)
+        else:
+            # Use separate classifiers when in legacy mode
+            color_logits = self.color_classifier(color_x)
+            brightness_logits = self.brightness_classifier(brightness_x)
+        
+        return color_logits, brightness_logits
     
     def extract_features(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Extract features before final classification."""
@@ -274,15 +363,39 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
     def get_pathway_importance(self) -> Dict[str, float]:
         """Calculate pathway importance based on classifier weights."""
         with torch.no_grad():
-            color_weight_norm = torch.norm(self.color_classifier.weight.data).item()
-            brightness_weight_norm = torch.norm(self.brightness_classifier.weight.data).item()
-            total_norm = color_weight_norm + brightness_weight_norm + 1e-8
-            
-            return {
-                'color_pathway': color_weight_norm / total_norm,
-                'brightness_pathway': brightness_weight_norm / total_norm,
-                'pathway_ratio': color_weight_norm / (brightness_weight_norm + 1e-8)
-            }
+            if self.use_shared_classifier:
+                # For shared classifier, analyze both the shared weights and separate heads
+                shared_weights = self.shared_classifier.weight.data
+                feature_size = shared_weights.shape[1] // 2
+                color_shared_weights = shared_weights[:, :feature_size]
+                brightness_shared_weights = shared_weights[:, feature_size:]
+                
+                # Also analyze separate heads
+                color_head_weights = self.color_head.weight.data
+                brightness_head_weights = self.brightness_head.weight.data
+                
+                color_norm = torch.norm(color_shared_weights).item() + torch.norm(color_head_weights).item()
+                brightness_norm = torch.norm(brightness_shared_weights).item() + torch.norm(brightness_head_weights).item()
+                total_norm = color_norm + brightness_norm + 1e-8
+                
+                return {
+                    'color_pathway': color_norm / total_norm,
+                    'brightness_pathway': brightness_norm / total_norm,
+                    'pathway_ratio': color_norm / (brightness_norm + 1e-8),
+                    'fusion_type': 'shared_with_separate_heads'
+                }
+            else:
+                # For separate classifiers, analyze each pathway
+                color_weight_norm = torch.norm(self.color_classifier.weight.data).item()
+                brightness_weight_norm = torch.norm(self.brightness_classifier.weight.data).item()
+                total_norm = color_weight_norm + brightness_weight_norm + 1e-8
+                
+                return {
+                    'color_pathway': color_weight_norm / total_norm,
+                    'brightness_pathway': brightness_weight_norm / total_norm,
+                    'pathway_ratio': color_weight_norm / (brightness_weight_norm + 1e-8),
+                    'fusion_type': 'separate_classifiers'
+                }
 
     def fit(self, train_color_data: np.ndarray, train_brightness_data: np.ndarray, train_labels: np.ndarray,
             val_color_data: Optional[np.ndarray] = None, val_brightness_data: Optional[np.ndarray] = None,
@@ -399,14 +512,14 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 
                 if self.use_mixed_precision:
                     with autocast():
-                        outputs = self.forward_combined(batch_color, batch_brightness)
+                        outputs = self(batch_color, batch_brightness)
                         loss = criterion(outputs, batch_labels)
                     
                     self.scaler.scale(loss).backward()
                     self.scaler.step(optimizer)
                     self.scaler.update()
                 else:
-                    outputs = self.forward_combined(batch_color, batch_brightness)
+                    outputs = self(batch_color, batch_brightness)
                     loss = criterion(outputs, batch_labels)
                     loss.backward()
                     optimizer.step()
@@ -444,10 +557,10 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(val_loader):
                         if self.use_mixed_precision:
                             with autocast():
-                                outputs = self.forward_combined(batch_color, batch_brightness)
+                                outputs = self(batch_color, batch_brightness)
                                 loss = criterion(outputs, batch_labels)
                         else:
-                            outputs = self.forward_combined(batch_color, batch_brightness)
+                            outputs = self(batch_color, batch_brightness)
                             loss = criterion(outputs, batch_labels)
                         total_val_loss += loss.item()
                         
@@ -550,7 +663,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         predictions = []
         with torch.no_grad():
             for batch_color, batch_brightness in loader:
-                outputs = self.forward_combined(batch_color, batch_brightness)
+                outputs = self(batch_color, batch_brightness)
                 _, predicted = torch.max(outputs.data, 1)
                 predictions.extend(predicted.cpu().numpy())
         
@@ -583,7 +696,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         probabilities = []
         with torch.no_grad():
             for batch_color, batch_brightness in loader:
-                outputs = self.forward_combined(batch_color, batch_brightness)
+                outputs = self(batch_color, batch_brightness)
                 probs = torch.softmax(outputs, dim=1)
                 probabilities.extend(probs.cpu().numpy())
         
@@ -622,7 +735,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         
         with torch.no_grad():
             for batch_color, batch_brightness, batch_labels in loader:
-                outputs = self.forward_combined(batch_color, batch_brightness)
+                outputs = self(batch_color, batch_brightness)
                 loss = criterion(outputs, batch_labels)
                 total_loss += loss.item()
                 

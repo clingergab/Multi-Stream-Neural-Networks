@@ -30,6 +30,32 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
     - Automatic GPU detection and optimization
     - Keras-like training API
     - Built-in training loop with progress tracking
+    
+    API Design:
+    -----------
+    This model follows a simplified, clean API design:
+    
+    1. **forward()** - The primary method for training, inference, and evaluation
+       - Called automatically by model(x, y)
+       - Returns single tensor suitable for loss computation
+       - Use this for all training and classification tasks
+    
+    2. **analyze_pathways()** - For research and analysis purposes only
+       - Returns separate outputs for each stream/pathway
+       - Use this to analyze individual pathway contributions
+       - Never use this for training (returns tuple, not single tensor)
+    
+    Example Usage:
+    -------------
+    # Training/inference (standard PyTorch pattern):
+    model = BaseMultiChannelNetwork(...)
+    output = model(color_data, brightness_data)  # Single tensor
+    loss = criterion(output, labels)  # Works seamlessly
+    
+    # Research/analysis:
+    color_logits, brightness_logits = model.analyze_pathways(color_data, brightness_data)
+    color_accuracy = accuracy_metric(color_logits, labels)
+    brightness_accuracy = accuracy_metric(brightness_logits, labels)
     """
     
     def __init__(
@@ -156,11 +182,16 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         
         if self.use_shared_classifier:
             # Shared classifier with proper fusion - concatenates features from both streams
-            self.classifier = nn.Linear(final_size * 2, self.num_classes, bias=True)
+            self.shared_classifier = nn.Linear(final_size * 2, self.num_classes, bias=True)
+            # Also create separate projection heads for research/analysis purposes
+            self.color_head = nn.Linear(final_size, self.num_classes, bias=True)
+            self.brightness_head = nn.Linear(final_size, self.num_classes, bias=True)
             self.multi_channel_classifier = None  # Not used in shared mode
         else:
             # Legacy: Separate classifiers for each stream
-            self.classifier = None  # Not used in separate mode
+            self.shared_classifier = None  # Not used in separate mode
+            self.color_head = None
+            self.brightness_head = None
             self.multi_channel_classifier = BasicMultiChannelLayer(
                 color_input_size=final_size,
                 brightness_input_size=final_size,
@@ -180,21 +211,22 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
-    def forward(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def _extract_features(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass through the multi-channel network.
+        Extract features through all hidden layers.
+        
+        Private method that handles all the layer processing.
         
         Args:
-            color_input: Color features tensor [batch_size, input_size]
-            brightness_input: Brightness features tensor [batch_size, input_size]
+            color_input: Color features tensor
+            brightness_input: Brightness features tensor
             
         Returns:
-            If use_shared_classifier=True: Single output tensor [batch_size, num_classes]
-            If use_shared_classifier=False: Tuple of (color_logits, brightness_logits) [batch_size, num_classes] each
+            Tuple of (color_features, brightness_features) after processing through all layers
         """
         color_x, brightness_x = color_input, brightness_input
         
-        # Process through layers
+        # Process through all layers
         for layer in self.layers:
             if isinstance(layer, BasicMultiChannelLayer):
                 color_x, brightness_x = layer(color_x, brightness_x)
@@ -203,20 +235,14 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                 color_x = layer(color_x)
                 brightness_x = layer(brightness_x)
         
-        # Final classification
-        if self.use_shared_classifier:
-            # Concatenate features and pass through shared classifier
-            fused_features = torch.cat([color_x, brightness_x], dim=1)
-            logits = self.classifier(fused_features)
-            return logits
-        else:
-            # Legacy: Separate classifiers
-            color_logits, brightness_logits = self.multi_channel_classifier(color_x, brightness_x)
-            return color_logits, brightness_logits
-    
-    def forward_combined(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> torch.Tensor:
+        return color_x, brightness_x
+
+    def forward(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass with combined output for standard classification.
+        Forward pass through the multi-channel network for training and classification.
+        
+        This is the primary method called by model(x, y) and used for training, inference, and evaluation.
+        Returns a single tensor suitable for loss computation and classification.
         
         Args:
             color_input: Color features tensor
@@ -225,13 +251,46 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         Returns:
             Combined classification logits [batch_size, num_classes]
         """
+        # Extract features through all layers
+        color_x, brightness_x = self._extract_features(color_input, brightness_input)
+        
         if self.use_shared_classifier:
-            # Already combined in the forward method
-            return self.forward(color_input, brightness_input)
+            # Use shared classifier for optimal fusion
+            fused_features = torch.cat([color_x, brightness_x], dim=1)
+            return self.shared_classifier(fused_features)
         else:
             # Legacy: Add separate outputs
-            color_logits, brightness_logits = self.forward(color_input, brightness_input)
+            color_logits, brightness_logits = self.multi_channel_classifier(color_x, brightness_x)
             return color_logits + brightness_logits
+    
+    def analyze_pathways(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Analyze individual pathway contributions for research purposes.
+        
+        Returns separate outputs for each stream to analyze individual pathway contributions.
+        Use this method only for research, visualization, and pathway analysis.
+        
+        Args:
+            color_input: Color features tensor [batch_size, input_size]
+            brightness_input: Brightness features tensor [batch_size, input_size]
+            
+        Returns:
+            Tuple of (color_logits, brightness_logits) [batch_size, num_classes] each
+            Separate outputs for analyzing individual pathway performance
+        """
+        # Extract features through all layers
+        color_x, brightness_x = self._extract_features(color_input, brightness_input)
+        
+        # Apply separate classifiers/heads for analysis
+        if self.use_shared_classifier:
+            # Use separate heads for meaningful individual stream analysis
+            color_logits = self.color_head(color_x)
+            brightness_logits = self.brightness_head(brightness_x)
+            return color_logits, brightness_logits
+        else:
+            # Legacy: Separate classifiers
+            color_logits, brightness_logits = self.multi_channel_classifier(color_x, brightness_x)
+            return color_logits, brightness_logits
     
     def extract_features(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
@@ -245,15 +304,8 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
             If use_shared_classifier=True: Concatenated features [batch_size, feature_size * 2]
             If use_shared_classifier=False: Tuple of (color_features, brightness_features)
         """
-        color_x, brightness_x = color_input, brightness_input
-        
-        # Process through all layers except classifier
-        for layer in self.layers:
-            if isinstance(layer, BasicMultiChannelLayer):
-                color_x, brightness_x = layer(color_x, brightness_x)
-            elif isinstance(layer, nn.Dropout):
-                color_x = layer(color_x)
-                brightness_x = layer(brightness_x)
+        # Use the private helper method to avoid code duplication
+        color_x, brightness_x = self._extract_features(color_input, brightness_input)
         
         if self.use_shared_classifier:
             # Return concatenated features
@@ -261,8 +313,6 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         else:
             # Return separate features
             return color_x, brightness_x
-        
-        return color_x, brightness_x
     
     @property
     def fusion_type(self) -> str:
@@ -272,11 +322,17 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
     def get_classifier_info(self) -> Dict:
         """Get information about the classifier architecture."""
         if self.use_shared_classifier:
+            shared_params = sum(p.numel() for p in self.shared_classifier.parameters())
+            color_params = sum(p.numel() for p in self.color_head.parameters())
+            brightness_params = sum(p.numel() for p in self.brightness_head.parameters())
             return {
-                'type': 'shared',
-                'input_size': self.classifier.in_features,
-                'output_size': self.classifier.out_features,
-                'parameters': sum(p.numel() for p in self.classifier.parameters())
+                'type': 'shared_with_separate_heads',
+                'shared_classifier_params': shared_params,
+                'color_head_params': color_params,
+                'brightness_head_params': brightness_params,
+                'total_params': shared_params + color_params + brightness_params,
+                'shared_input_size': self.shared_classifier.in_features,
+                'output_size': self.shared_classifier.out_features
             }
         else:
             return {
@@ -309,21 +365,29 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
             Dictionary with pathway weight statistics
         """
         if self.use_shared_classifier:
-            # For shared classifier, analyze the concatenated input weights
-            classifier_weights = self.classifier.weight.data
-            feature_size = classifier_weights.shape[1] // 2
-            color_weights = classifier_weights[:, :feature_size]
-            brightness_weights = classifier_weights[:, feature_size:]
+            # For shared classifier, analyze both the shared weights and separate heads
+            shared_weights = self.shared_classifier.weight.data
+            feature_size = shared_weights.shape[1] // 2
+            color_shared_weights = shared_weights[:, :feature_size]
+            brightness_shared_weights = shared_weights[:, feature_size:]
             
-            color_norm = torch.norm(color_weights).item()
-            brightness_norm = torch.norm(brightness_weights).item()
+            # Also analyze separate heads
+            color_head_weights = self.color_head.weight.data
+            brightness_head_weights = self.brightness_head.weight.data
+            
+            color_norm = torch.norm(color_shared_weights).item() + torch.norm(color_head_weights).item()
+            brightness_norm = torch.norm(brightness_shared_weights).item() + torch.norm(brightness_head_weights).item()
             total_norm = color_norm + brightness_norm + 1e-8
             
             return {
                 'color_pathway': color_norm / total_norm,
                 'brightness_pathway': brightness_norm / total_norm,
                 'pathway_ratio': color_norm / (brightness_norm + 1e-8),
-                'fusion_type': 'shared_classifier'
+                'fusion_type': 'shared_with_separate_heads',
+                'shared_color_norm': torch.norm(color_shared_weights).item(),
+                'shared_brightness_norm': torch.norm(brightness_shared_weights).item(),
+                'head_color_norm': torch.norm(color_head_weights).item(),
+                'head_brightness_norm': torch.norm(brightness_head_weights).item()
             }
         else:
             # For separate classifiers, analyze each pathway
