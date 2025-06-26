@@ -800,30 +800,117 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         
 
 # Factory functions
-def base_multi_channel_small(input_size: int, num_classes: int = 10, **kwargs) -> BaseMultiChannelNetwork:
-    """Create a small BaseMultiChannelNetwork."""
+def base_multi_channel_small(
+    *,  # Force keyword-only arguments for clarity
+    input_size: int = None, 
+    color_input_size: int = None,
+    brightness_input_size: int = None,
+    num_classes: int = 10, 
+    **kwargs
+) -> BaseMultiChannelNetwork:
+    """
+    Create a small BaseMultiChannelNetwork.
+    
+    Args:
+        input_size: For backward compatibility - both streams use same input size
+        color_input_size: Input size for color stream
+        brightness_input_size: Input size for brightness stream
+        num_classes: Number of output classes
+        **kwargs: Additional arguments passed to BaseMultiChannelNetwork
+    
+    Example:
+        # Different input sizes (preferred for multi-stream)
+        model = base_multi_channel_small(
+            color_input_size=3072, 
+            brightness_input_size=1024, 
+            num_classes=100
+        )
+        
+        # Same input size (backward compatibility)
+        model = base_multi_channel_small(input_size=2048, num_classes=10)
+    """
     return BaseMultiChannelNetwork(
         input_size=input_size,
+        color_input_size=color_input_size,
+        brightness_input_size=brightness_input_size,
         hidden_sizes=[256, 128],
         num_classes=num_classes,
         **kwargs
     )
 
 
-def base_multi_channel_medium(input_size: int, num_classes: int = 10, **kwargs) -> BaseMultiChannelNetwork:
-    """Create a medium BaseMultiChannelNetwork."""
+def base_multi_channel_medium(
+    *,  # Force keyword-only arguments for clarity
+    input_size: int = None,
+    color_input_size: int = None,
+    brightness_input_size: int = None,
+    num_classes: int = 10,
+    **kwargs
+) -> BaseMultiChannelNetwork:
+    """
+    Create a medium BaseMultiChannelNetwork.
+    
+    Args:
+        input_size: For backward compatibility - both streams use same input size
+        color_input_size: Input size for color stream
+        brightness_input_size: Input size for brightness stream
+        num_classes: Number of output classes
+        **kwargs: Additional arguments passed to BaseMultiChannelNetwork
+    
+    Example:
+        # Different input sizes (preferred for multi-stream)
+        model = base_multi_channel_medium(
+            color_input_size=3072, 
+            brightness_input_size=1024, 
+            num_classes=100
+        )
+        
+        # Same input size (backward compatibility)
+        model = base_multi_channel_medium(input_size=2048, num_classes=10)
+    """
     return BaseMultiChannelNetwork(
         input_size=input_size,
+        color_input_size=color_input_size,
+        brightness_input_size=brightness_input_size,
         hidden_sizes=[512, 256, 128],
         num_classes=num_classes,
         **kwargs
     )
 
 
-def base_multi_channel_large(input_size: int, num_classes: int = 10, **kwargs) -> BaseMultiChannelNetwork:
-    """Create a large BaseMultiChannelNetwork."""
+def base_multi_channel_large(
+    *,  # Force keyword-only arguments for clarity
+    input_size: int = None,
+    color_input_size: int = None,
+    brightness_input_size: int = None,
+    num_classes: int = 10,
+    **kwargs
+) -> BaseMultiChannelNetwork:
+    """
+    Create a large BaseMultiChannelNetwork.
+    
+    Args:
+        input_size: For backward compatibility - both streams use same input size
+        color_input_size: Input size for color stream
+        brightness_input_size: Input size for brightness stream
+        num_classes: Number of output classes
+        **kwargs: Additional arguments passed to BaseMultiChannelNetwork
+    
+    Example:
+        # Different input sizes (preferred for multi-stream)
+        model = base_multi_channel_large(
+            color_input_size=3072, 
+            brightness_input_size=1024, 
+            num_classes=100
+        )
+        
+        # Same input size (backward compatibility)
+        model = base_multi_channel_large(input_size=2048, num_classes=10)
+    """
     return BaseMultiChannelNetwork(
         input_size=input_size,
+        color_input_size=color_input_size,
+        brightness_input_size=brightness_input_size,
         hidden_sizes=[1024, 512, 256, 128],
         num_classes=num_classes,
         **kwargs
