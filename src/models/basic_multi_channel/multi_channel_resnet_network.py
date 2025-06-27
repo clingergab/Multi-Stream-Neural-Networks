@@ -81,6 +81,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         num_blocks: List[int] = [2, 2, 2, 2],
         block_type: str = 'basic',
         activation: str = 'relu',
+        dropout: float = 0.0,  # NEW: Dropout support
         use_shared_classifier: bool = True,  # NEW: Enable proper fusion
         input_channels: int = None,  # For backward compatibility
         device: str = 'auto',  # NEW: Automatic device detection
@@ -104,6 +105,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         self.num_blocks = num_blocks
         self.block_type = block_type
         self.activation = activation
+        self.dropout = dropout  # NEW: Store dropout rate
         self.use_shared_classifier = use_shared_classifier
         
         # Setup device management with proper detection
@@ -165,6 +167,12 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         
         # Final classifier - choose between shared fusion or separate classifiers
         final_features = 512 * self.block.expansion
+        
+        # Add dropout before classifier if specified
+        if self.dropout > 0:
+            self.dropout_layer = nn.Dropout(self.dropout)
+        else:
+            self.dropout_layer = None
         
         if self.use_shared_classifier:
             # Shared classifier with proper fusion - concatenates features from both streams
@@ -278,6 +286,11 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         color_x = torch.flatten(color_x, 1)
         brightness_x = torch.flatten(brightness_x, 1)
         
+        # Apply dropout if enabled
+        if self.dropout_layer is not None:
+            color_x = self.dropout_layer(color_x)
+            brightness_x = self.dropout_layer(brightness_x)
+        
         # Combine outputs for classification
         if self.use_shared_classifier:
             # Use shared classifier for optimal fusion
@@ -325,6 +338,11 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         # Flatten features
         color_x = torch.flatten(color_x, 1)
         brightness_x = torch.flatten(brightness_x, 1)
+        
+        # Apply dropout if enabled (for consistency)
+        if self.dropout_layer is not None:
+            color_x = self.dropout_layer(color_x)
+            brightness_x = self.dropout_layer(brightness_x)
         
         # Separate classification for each stream (for analysis)
         if self.use_shared_classifier:
@@ -620,6 +638,217 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         # Clear cache after training
         self.device_manager.clear_cache()
 
+    def fit_dataloader(
+        self,
+        train_loader: DataLoader,
+        val_loader: Optional[DataLoader] = None,
+        epochs: int = 10,
+        early_stopping_patience: int = 5,
+        scheduler_type: str = 'cosine',
+        min_lr: float = 1e-6,
+        verbose: int = 1
+    ) -> Dict[str, List[float]]:
+        """
+        Fit the ResNet model using pre-configured DataLoaders (for augmented training).
+        
+        This method is designed to work with augmented DataLoaders that handle
+        data augmentation internally, providing seamless integration with
+        the enhanced training pipeline.
+        
+        Args:
+            train_loader: Training DataLoader (with optional augmentation)
+            val_loader: Validation DataLoader (optional)
+            epochs: Number of epochs to train
+            early_stopping_patience: Patience for early stopping
+            scheduler_type: Learning rate scheduler type ('cosine', 'step', 'none')
+            min_lr: Minimum learning rate for cosine annealing
+            verbose: Verbosity level (0: silent, 1: progress bar, 2: detailed)
+            
+        Returns:
+            Training history dictionary with losses and accuracies
+        """
+        if not self.is_compiled:
+            raise RuntimeError("Model must be compiled before training. Call model.compile() first.")
+        
+        if verbose > 0:
+            print("🚀 Training ResNet model with enhanced DataLoader pipeline:")
+            print(f"   Device: {self.device}")
+            print(f"   Mixed precision: {self.use_mixed_precision}")
+            print(f"   Train batches: {len(train_loader)}")
+            if val_loader:
+                print(f"   Val batches: {len(val_loader)}")
+            print(f"   Scheduler: {scheduler_type}")
+        
+        # Setup learning rate scheduler
+        if scheduler_type.lower() == 'cosine':
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=min_lr)
+        elif scheduler_type.lower() == 'step':
+            scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=epochs//3, gamma=0.1)
+        else:
+            scheduler = None
+        
+        # Training history
+        history = {
+            'train_loss': [],
+            'train_accuracy': [],
+            'val_loss': [],
+            'val_accuracy': []
+        }
+        
+        # Training loop with enhanced tracking
+        best_val_loss = float('inf')
+        patience_counter = 0
+        
+        for epoch in range(epochs):
+            # Single progress bar for training batches only
+            if verbose == 1:
+                epoch_pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+            
+            # Training phase
+            self.train()
+            total_loss = 0.0
+            train_correct = 0
+            train_total = 0
+            
+            for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(train_loader):
+                # Move data to device
+                batch_color = batch_color.to(self.device, non_blocking=True)
+                batch_brightness = batch_brightness.to(self.device, non_blocking=True)
+                batch_labels = batch_labels.to(self.device, non_blocking=True)
+                
+                self.optimizer.zero_grad()
+                
+                if self.use_mixed_precision:
+                    with autocast():
+                        outputs = self(batch_color, batch_brightness)
+                        loss = self.criterion(outputs, batch_labels)
+                    
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    outputs = self(batch_color, batch_brightness)
+                    loss = self.criterion(outputs, batch_labels)
+                    loss.backward()
+                    self.optimizer.step()
+                
+                total_loss += loss.item()
+                
+                # Calculate training accuracy
+                _, predicted = torch.max(outputs.data, 1)
+                train_total += batch_labels.size(0)
+                train_correct += (predicted == batch_labels).sum().item()
+                
+                # Update progress bar with current training metrics
+                if verbose == 1:
+                    train_acc = train_correct / train_total
+                    epoch_pbar.set_postfix({
+                        'Loss': f'{total_loss/(batch_idx+1):.4f}',
+                        'Acc': f'{train_acc:.4f}'
+                    })
+                    epoch_pbar.update(1)
+            
+            if scheduler:
+                scheduler.step()
+            
+            avg_train_loss = total_loss / len(train_loader)
+            train_accuracy = train_correct / train_total
+            
+            # Store training metrics
+            history['train_loss'].append(avg_train_loss)
+            history['train_accuracy'].append(train_accuracy)
+            
+            # Validation phase
+            if val_loader is not None:
+                self.eval()
+                total_val_loss = 0.0
+                val_correct = 0
+                val_total = 0
+                
+                with torch.no_grad():
+                    for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(val_loader):
+                        # Move data to device
+                        batch_color = batch_color.to(self.device, non_blocking=True)
+                        batch_brightness = batch_brightness.to(self.device, non_blocking=True)
+                        batch_labels = batch_labels.to(self.device, non_blocking=True)
+                        
+                        if self.use_mixed_precision:
+                            with autocast():
+                                outputs = self(batch_color, batch_brightness)
+                                loss = self.criterion(outputs, batch_labels)
+                        else:
+                            outputs = self(batch_color, batch_brightness)
+                            loss = self.criterion(outputs, batch_labels)
+                        total_val_loss += loss.item()
+                        
+                        # Calculate validation accuracy
+                        _, predicted = torch.max(outputs.data, 1)
+                        val_total += batch_labels.size(0)
+                        val_correct += (predicted == batch_labels).sum().item()
+                
+                avg_val_loss = total_val_loss / len(val_loader)
+                val_accuracy = val_correct / val_total
+                
+                # Store validation metrics
+                history['val_loss'].append(avg_val_loss)
+                history['val_accuracy'].append(val_accuracy)
+                
+                # Update progress bar with final validation metrics
+                if verbose == 1:
+                    epoch_pbar.set_postfix({
+                        'Loss': f'{avg_train_loss:.4f}',
+                        'Acc': f'{train_accuracy:.4f}',
+                        'Val_Loss': f'{avg_val_loss:.4f}',
+                        'Val_Acc': f'{val_accuracy:.4f}'
+                    })
+            else:
+                # Training only - final update
+                if verbose == 1:
+                    epoch_pbar.set_postfix({
+                        'Loss': f'{avg_train_loss:.4f}',
+                        'Acc': f'{train_accuracy:.4f}'
+                    })
+                avg_val_loss = float('inf')  # For early stopping logic
+                history['val_loss'].append(float('nan'))
+                history['val_accuracy'].append(float('nan'))
+            
+            # Close progress bar
+            if verbose == 1:
+                epoch_pbar.close()
+            
+            # Early stopping check (only if validation data provided)
+            if val_loader is not None:
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    patience_counter = 0
+                    # Save the best model
+                    self.save_model()
+                else:
+                    patience_counter += 1
+                
+                if patience_counter >= early_stopping_patience:
+                    if verbose > 0:
+                        print(f"Early stopping triggered. Stopping training at epoch {epoch + 1}.")
+                    break
+            
+            # Print epoch summary
+            if verbose > 0:
+                lr = self.optimizer.param_groups[0]['lr']
+                if val_loader is not None:
+                    print(f"Epoch {epoch + 1}/{epochs} - "
+                          f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
+                          f"Val Loss: {avg_val_loss:.4f} - Val Acc: {val_accuracy:.4f} - "
+                          f"LR: {lr:.6f}")
+                else:
+                    print(f"Epoch {epoch + 1}/{epochs} - "
+                          f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
+                          f"LR: {lr:.6f}")
+        
+        # Clear cache after training
+        self.device_manager.clear_cache()
+        
+        return history
+
     def predict(self, color_data: Union[np.ndarray, torch.Tensor], brightness_data: Union[np.ndarray, torch.Tensor], 
                 batch_size: int = None) -> np.ndarray:
         """Make predictions on new data."""
@@ -738,14 +967,16 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         }
 
     def compile(self, optimizer: str = 'adam', learning_rate: float = 0.001, 
-                loss: str = 'cross_entropy', metrics: List[str] = None):
+                weight_decay: float = 0.0, loss: str = 'cross_entropy', metrics: List[str] = None):
         """Compile the model with optimizer and loss function (Keras-like API)."""
         if optimizer.lower() == 'adam':
-            self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+            self.optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        elif optimizer.lower() == 'adamw':
+            self.optimizer = optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
         elif optimizer.lower() == 'sgd':
-            self.optimizer = optim.SGD(self.parameters(), lr=learning_rate)
+            self.optimizer = optim.SGD(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
         elif optimizer.lower() == 'rmsprop':
-            self.optimizer = optim.RMSprop(self.parameters(), lr=learning_rate)
+            self.optimizer = optim.RMSprop(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer}")
         
@@ -757,7 +988,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         self.metrics = metrics or ['accuracy']
         self.is_compiled = True
         
-        print(f"ResNet model compiled with {optimizer} optimizer, {loss} loss, learning rate: {learning_rate}")
+        print(f"ResNet model compiled with {optimizer} optimizer, {loss} loss, learning rate: {learning_rate}, weight decay: {weight_decay}")
 
     def save_model(self, file_path: str = None):
         """Save the model parameters to a file."""
