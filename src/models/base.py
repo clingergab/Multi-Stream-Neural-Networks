@@ -3,6 +3,11 @@ Base classes for Multi-Stream Neural Networks
 """
 
 import torch
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+from torch.cuda.amp import GradScaler, autocast
+from torch import optim
+from tqdm import tqdm
 import torch.nn as nn
 from abc import ABC, abstractmethod
 from typing import Tuple, Dict, Any, List, Union, Optional
@@ -36,6 +41,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
         self.criterion = None
         self.metrics = []
         
+    
     @abstractmethod
     def forward(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> torch.Tensor:
         """
@@ -142,6 +148,13 @@ class BaseMultiStreamModel(nn.Module, ABC):
         print(f"{model_name} compiled with {optimizer} optimizer, {loss} loss, "
               f"learning rate: {learning_rate}, weight decay: {weight_decay}")
 
+    @abstractmethod
+    def fit(self, *args, **kwargs):
+        """
+        Fit the model to data. Must be implemented by subclasses.
+        """
+        raise NotImplementedError("Subclasses must implement fit() method.")
+    
     def fit_dataloader(
         self,
         train_loader: "DataLoader",
@@ -383,34 +396,27 @@ class BaseMultiStreamModel(nn.Module, ABC):
         if hasattr(self, 'verbose') and self.verbose:
             print(f"Model parameters loaded from {file_path}.")
 
-    def predict(self, color_data: Union["np.ndarray", torch.Tensor], 
-                brightness_data: Union["np.ndarray", torch.Tensor], 
-                batch_size: int = None) -> "np.ndarray":
+    def predict(self, color_data: Union[np.ndarray, torch.Tensor], brightness_data: Union[np.ndarray, torch.Tensor], 
+                batch_size: int = None) -> np.ndarray:
         """
-        Make predictions on new data.
+        Make predictions on new data with GPU optimizations.
         
         Args:
             color_data: Color input data
-            brightness_data: Brightness input data  
+            brightness_data: Brightness input data
             batch_size: Batch size for prediction (auto-detected if None)
             
         Returns:
             Predicted class labels
         """
-        # Import here to avoid circular imports
-        import numpy as np
-        from torch.utils.data import DataLoader, TensorDataset
-        
         # Auto-detect optimal batch size for inference
         if batch_size is None:
-            device = getattr(self, 'device', torch.device('cpu'))
-            if device.type == 'cuda':
+            if self.device.type == 'cuda':
                 batch_size = 512  # Larger batches for inference
             else:
                 batch_size = 128
         
         self.eval()
-        device = getattr(self, 'device', torch.device('cpu'))
         
         # Convert to tensors if needed
         if isinstance(color_data, np.ndarray):
@@ -424,8 +430,8 @@ class BaseMultiStreamModel(nn.Module, ABC):
             brightness_tensor = brightness_data
         
         # Move to device efficiently
-        color_tensor = color_tensor.to(device, non_blocking=True)
-        brightness_tensor = brightness_tensor.to(device, non_blocking=True)
+        color_tensor = color_tensor.to(self.device, non_blocking=True)
+        brightness_tensor = brightness_tensor.to(self.device, non_blocking=True)
         
         # Create dataset and loader with optimizations
         dataset = TensorDataset(color_tensor, brightness_tensor)
@@ -433,28 +439,36 @@ class BaseMultiStreamModel(nn.Module, ABC):
             dataset, 
             batch_size=batch_size, 
             shuffle=False,
-            pin_memory=device.type == 'cuda'
+            pin_memory=self.device.type == 'cuda'
         )
         
         predictions = []
         with torch.no_grad():
             for batch_color, batch_brightness in loader:
-                outputs = self(batch_color, batch_brightness)
+                if self.use_mixed_precision:
+                    with autocast():
+                        outputs = self(batch_color, batch_brightness)
+                else:
+                    outputs = self(batch_color, batch_brightness)
                 _, predicted = torch.max(outputs.data, 1)
                 predictions.extend(predicted.cpu().numpy())
         
         return np.array(predictions)
 
-    def predict_proba(self, color_data: Union["np.ndarray", torch.Tensor], 
-                      brightness_data: Union["np.ndarray", torch.Tensor], 
-                      batch_size: int = 32) -> "np.ndarray":
-        """Get prediction probabilities."""
-        # Import here to avoid circular imports
-        import numpy as np
-        from torch.utils.data import DataLoader, TensorDataset
+    def predict_proba(self, color_data: Union[np.ndarray, torch.Tensor], brightness_data: Union[np.ndarray, torch.Tensor], 
+                      batch_size: int = 32) -> np.ndarray:
+        """
+        Get prediction probabilities.
         
+        Args:
+            color_data: Color input data
+            brightness_data: Brightness input data
+            batch_size: Batch size for prediction
+            
+        Returns:
+            Prediction probabilities
+        """
         self.eval()
-        device = getattr(self, 'device', torch.device('cpu'))
         
         # Convert to tensors if needed
         if isinstance(color_data, np.ndarray):
@@ -468,8 +482,8 @@ class BaseMultiStreamModel(nn.Module, ABC):
             brightness_tensor = brightness_data
         
         # Move to device
-        color_tensor = color_tensor.to(device)
-        brightness_tensor = brightness_tensor.to(device)
+        color_tensor = color_tensor.to(self.device)
+        brightness_tensor = brightness_tensor.to(self.device)
         
         # Create dataset and loader
         dataset = TensorDataset(color_tensor, brightness_tensor)
@@ -484,33 +498,38 @@ class BaseMultiStreamModel(nn.Module, ABC):
         
         return np.array(probabilities)
 
-    def evaluate(self, test_color_data: Union["np.ndarray", torch.Tensor], 
-                 test_brightness_data: Union["np.ndarray", torch.Tensor], 
-                 test_labels: Union["np.ndarray", torch.Tensor], 
-                 batch_size: int = 32) -> Dict[str, float]:
-        """Evaluate the model on test data."""
-        # Import here to avoid circular imports
-        import numpy as np
-        from torch.utils.data import DataLoader, TensorDataset
+    def evaluate(self, test_color_data: Union[np.ndarray, torch.Tensor], 
+                 test_brightness_data: Union[np.ndarray, torch.Tensor], 
+                 test_labels: Union[np.ndarray, torch.Tensor], batch_size: int = 32) -> Dict[str, float]:
+        """
+        Evaluate the model on test data.
         
+        Args:
+            test_color_data: Test color data
+            test_brightness_data: Test brightness data
+            test_labels: Test labels
+            batch_size: Batch size for evaluation
+            
+        Returns:
+            Dictionary with evaluation metrics
+        """
         self.eval()
-        device = getattr(self, 'device', torch.device('cpu'))
         
         # Convert to tensors if needed and move to device
         if isinstance(test_color_data, np.ndarray):
-            color_tensor = torch.tensor(test_color_data, dtype=torch.float32).to(device)
+            color_tensor = torch.tensor(test_color_data, dtype=torch.float32).to(self.device)
         else:
-            color_tensor = test_color_data.to(device)
+            color_tensor = test_color_data.to(self.device)
             
         if isinstance(test_brightness_data, np.ndarray):
-            brightness_tensor = torch.tensor(test_brightness_data, dtype=torch.float32).to(device)
+            brightness_tensor = torch.tensor(test_brightness_data, dtype=torch.float32).to(self.device)
         else:
-            brightness_tensor = test_brightness_data.to(device)
+            brightness_tensor = test_brightness_data.to(self.device)
             
         if isinstance(test_labels, np.ndarray):
-            labels_tensor = torch.tensor(test_labels, dtype=torch.long).to(device)
+            labels_tensor = torch.tensor(test_labels, dtype=torch.long).to(self.device)
         else:
-            labels_tensor = test_labels.to(device)
+            labels_tensor = test_labels.to(self.device)
         
         # Create dataset and loader
         dataset = TensorDataset(color_tensor, brightness_tensor, labels_tensor)
@@ -552,16 +571,6 @@ class BaseMultiStreamModel(nn.Module, ABC):
         # Register hooks for pathway analysis
         # Subclasses should override to register specific pathway hooks
         pass
-    
-    def get_pathway_importance(self) -> Dict[str, float]:
-        """
-        Calculate relative importance of different pathways.
-        
-        Returns:
-            Dictionary mapping pathway names to importance scores
-        """
-        # Default implementation - subclasses should override
-        return {}
     
     def get_model_stats(self) -> Dict[str, Any]:
         """
