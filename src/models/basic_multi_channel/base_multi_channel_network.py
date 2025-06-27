@@ -513,10 +513,9 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         patience_counter = 0
         
         for epoch in range(epochs):
-            # Single progress bar for the entire epoch
-            total_batches = len(train_loader) + (len(val_loader) if val_loader is not None else 0)
+            # Single progress bar for training batches only
             if verbose == 1:
-                epoch_pbar = tqdm(total=total_batches, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+                epoch_pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}", leave=False)
             
             # Training phase
             self.train()
@@ -552,10 +551,8 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                 if verbose == 1:
                     train_acc = train_correct / train_total
                     epoch_pbar.set_postfix({
-                        'T_loss': f'{total_loss/(batch_idx+1):.4f}',
-                        'T_acc': f'{train_acc:.4f}',
-                        'V_loss': 'N/A',
-                        'V_acc': 'N/A'
+                        'Loss': f'{total_loss/(batch_idx+1):.4f}',
+                        'Acc': f'{train_acc:.4f}'
                     })
                     epoch_pbar.update(1)
             
@@ -585,37 +582,24 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                         _, predicted = torch.max(outputs.data, 1)
                         val_total += batch_labels.size(0)
                         val_correct += (predicted == batch_labels).sum().item()
-                        
-                        # Update progress bar with both training and validation metrics
-                        if verbose == 1:
-                            val_acc = val_correct / val_total
-                            epoch_pbar.set_postfix({
-                                'T_loss': f'{avg_train_loss:.4f}',
-                                'T_acc': f'{train_accuracy:.4f}',
-                                'V_loss': f'{total_val_loss/(batch_idx+1):.4f}',
-                                'V_acc': f'{val_acc:.4f}'
-                            })
-                            epoch_pbar.update(1)
                 
                 avg_val_loss = total_val_loss / len(val_loader)
                 val_accuracy = val_correct / val_total
                 
-                # Final update with complete metrics
+                # Update progress bar with final validation metrics
                 if verbose == 1:
                     epoch_pbar.set_postfix({
-                        'T_loss': f'{avg_train_loss:.4f}',
-                        'T_acc': f'{train_accuracy:.4f}',
-                        'V_loss': f'{avg_val_loss:.4f}',
-                        'V_acc': f'{val_accuracy:.4f}'
+                        'Loss': f'{avg_train_loss:.4f}',
+                        'Acc': f'{train_accuracy:.4f}',
+                        'Val_Loss': f'{avg_val_loss:.4f}',
+                        'Val_Acc': f'{val_accuracy:.4f}'
                     })
             else:
                 # Training only - final update
                 if verbose == 1:
                     epoch_pbar.set_postfix({
-                        'T_loss': f'{avg_train_loss:.4f}',
-                        'T_acc': f'{train_accuracy:.4f}',
-                        'V_loss': 'N/A',
-                        'V_acc': 'N/A'
+                        'Loss': f'{avg_train_loss:.4f}',
+                        'Acc': f'{train_accuracy:.4f}'
                     })
                 avg_val_loss = float('inf')  # For early stopping logic
             
