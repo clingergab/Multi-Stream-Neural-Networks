@@ -71,3 +71,14 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Experiments and temporary directories
+experiments/
+temp/
+temporary/
+
+# Auto-generated code and CI artifacts
+
+# Results and output directories
+results/
+output/
