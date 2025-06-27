@@ -182,13 +182,49 @@ def get_cifar100_datasets(data_dir: Union[str, Path] = "./data/cifar-100") -> Tu
     train_dataset = SimpleDataset(train_data, train_labels)
     test_dataset = SimpleDataset(test_data, test_labels)
     
-    print(f"✅ CIFAR-100 datasets ready:")
+    print("✅ CIFAR-100 datasets ready:")
     print(f"   Training samples: {len(train_dataset)}")
     print(f"   Test samples: {len(test_dataset)}")
     print(f"   Classes: {len(label_names)}")
     print("💡 No torchvision naming conventions needed - loaded directly from pickle files!")
     
     return train_dataset, test_dataset, label_names
+
+
+def create_validation_split(train_dataset: 'SimpleDataset', val_split: float = 0.1) -> Tuple['SimpleDataset', 'SimpleDataset']:
+    """
+    Create a validation split from the training dataset.
+    
+    Args:
+        train_dataset: Training dataset to split
+        val_split: Fraction of training data to use for validation
+        
+    Returns:
+        Tuple of (new_train_dataset, val_dataset)
+    """
+    num_train = len(train_dataset)
+    num_val = int(num_train * val_split)
+    
+    # Create random indices for train/val split
+    indices = torch.randperm(num_train)
+    train_indices = indices[num_val:]
+    val_indices = indices[:num_val]
+    
+    # Split the data
+    train_data = train_dataset.data[train_indices]
+    train_labels = train_dataset.labels[train_indices]
+    val_data = train_dataset.data[val_indices]
+    val_labels = train_dataset.labels[val_indices]
+    
+    # Create new dataset objects
+    new_train_dataset = SimpleDataset(train_data, train_labels)
+    val_dataset = SimpleDataset(val_data, val_labels)
+    
+    print(f"📊 Created validation split: {val_split*100:.1f}% ({num_val} samples)")
+    print(f"   New training: {len(new_train_dataset)} samples")
+    print(f"   Validation: {len(val_dataset)} samples")
+    
+    return new_train_dataset, val_dataset
 
 
 # CIFAR-100 class names for reference
@@ -221,7 +257,7 @@ if __name__ == "__main__":
         # Test a sample
         sample = train_dataset[0]
         image, label = sample
-        print(f"\n🔍 Sample verification:")
+        print("\n🔍 Sample verification:")
         print(f"   Image shape: {image.shape}")
         print(f"   Label: {label} ({class_names[label]})")
         print(f"   Image range: [{image.min():.3f}, {image.max():.3f}]")
