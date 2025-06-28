@@ -515,10 +515,29 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         
         for epoch in range(epochs):
             # Single progress bar for training batches only
+            epoch_pbar = None
             if verbose == 1:
-                epoch_pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}", leave=False)
-            
-            # Training phase
+                # Clear any existing tqdm instances to avoid duplicate progress bars
+                try:
+                    # Force clear any existing progress bars to prevent duplication
+                    # Check if any existing progress bars are in the tqdm instances list
+                    for inst in list(getattr(tqdm, '_instances', [])):
+                        try:
+                            inst.close()
+                        except Exception:
+                            pass  # Ignore if we can't close an instance
+                except Exception:
+                    pass  # Ignore any errors in cleaning up tqdm instances
+                
+                # Create a new progress bar with appropriate settings to prevent duplication
+                epoch_pbar = tqdm(
+                    total=len(train_loader), 
+                    desc=f"Epoch {epoch+1}/{epochs}", 
+                    leave=True,  # Leave this progress bar after completion
+                    dynamic_ncols=True,  # Adapt to terminal width
+                    position=0,  # Keep it at position 0 (top)
+                    smoothing=0.3  # Smooth updates for better display
+                )
             self.train()
             total_loss = 0.0
             train_correct = 0
@@ -527,7 +546,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(train_loader):
                 optimizer.zero_grad()
                 
-                if self.use_mixed_precision:
+                if self.use_mixed_precision and self.scaler is not None:
                     with autocast('cuda'):
                         outputs = self(batch_color, batch_brightness)
                         loss = criterion(outputs, batch_labels)
@@ -549,13 +568,15 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 train_correct += (predicted == batch_labels).sum().item()
                 
                 # Update progress bar with current training metrics
-                if verbose == 1:
+                if verbose == 1 and epoch_pbar is not None:
                     train_acc = train_correct / train_total
                     epoch_pbar.set_postfix({
                         'Loss': f'{total_loss/(batch_idx+1):.4f}',
                         'Acc': f'{train_acc:.4f}'
                     })
                     epoch_pbar.update(1)
+                    # Force refresh the display with no lingering artifacts
+                    epoch_pbar.refresh()
             
             scheduler.step()
             avg_train_loss = total_loss / len(train_loader)
@@ -570,7 +591,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 
                 with torch.no_grad():
                     for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(val_loader):
-                        if self.use_mixed_precision:
+                        if self.use_mixed_precision and self.scaler is not None:
                             with autocast('cuda'):
                                 outputs = self(batch_color, batch_brightness)
                                 loss = criterion(outputs, batch_labels)
@@ -588,25 +609,30 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 val_accuracy = val_correct / val_total
                 
                 # Update progress bar with final validation metrics
-                if verbose == 1:
+                if verbose == 1 and epoch_pbar is not None:
                     epoch_pbar.set_postfix({
                         'Loss': f'{avg_train_loss:.4f}',
                         'Acc': f'{train_accuracy:.4f}',
                         'Val_Loss': f'{avg_val_loss:.4f}',
                         'Val_Acc': f'{val_accuracy:.4f}'
                     })
+                    # Make sure to display the final metrics before closing
+                    epoch_pbar.refresh()
             else:
                 # Training only - final update
-                if verbose == 1:
+                if verbose == 1 and epoch_pbar is not None:
                     epoch_pbar.set_postfix({
                         'Loss': f'{avg_train_loss:.4f}',
                         'Acc': f'{train_accuracy:.4f}'
                     })
+                    # Make sure to display the final metrics
+                    epoch_pbar.refresh()
                 avg_val_loss = float('inf')  # For early stopping logic
             
-            # Close progress bar
-            if verbose == 1:
+            # Close progress bar and clear line to prevent duplication
+            if verbose == 1 and epoch_pbar is not None:
                 epoch_pbar.close()
+                print("\r\033[K", end="")  # Clear the current line
             
             # Early stopping check (only if validation data provided)
             if val_loader is not None:
