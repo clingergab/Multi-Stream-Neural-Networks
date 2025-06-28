@@ -5,7 +5,7 @@ Base classes for Multi-Stream Neural Networks
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
-from torch.cuda.amp import GradScaler, autocast
+from torch import GradScaler, autocast
 from torch import optim
 from tqdm import tqdm
 import torch.nn as nn

@@ -6,9 +6,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from torch.cuda.amp import GradScaler, autocast
+from torch import GradScaler, autocast
 import numpy as np
-from typing import List, Tuple, Dict, Union, Optional
+from typing import List, Tuple, Dict, Optional
 from tqdm import tqdm
 from ..base import BaseMultiStreamModel
 from ..layers.resnet_blocks import (

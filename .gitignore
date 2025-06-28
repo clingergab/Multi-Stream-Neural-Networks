@@ -78,6 +78,7 @@ temp/
 temporary/
 
 # Auto-generated code and CI artifacts
+pyrightconfig.json
 
 # Results and output directories
 results/
