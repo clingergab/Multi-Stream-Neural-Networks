@@ -114,7 +114,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         
         # Mixed precision support
         self.use_mixed_precision = self.device_manager.enable_mixed_precision()
-        self.scaler = GradScaler() if self.use_mixed_precision else None
+        self.scaler = GradScaler('cuda') if self.use_mixed_precision else None
         
         # Track current channel count for proper ResNet progression
         self.inplanes = 64
@@ -528,7 +528,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 optimizer.zero_grad()
                 
                 if self.use_mixed_precision:
-                    with autocast():
+                    with autocast('cuda'):
                         outputs = self(batch_color, batch_brightness)
                         loss = criterion(outputs, batch_labels)
                     
@@ -571,7 +571,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 with torch.no_grad():
                     for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(val_loader):
                         if self.use_mixed_precision:
-                            with autocast():
+                            with autocast('cuda'):
                                 outputs = self(batch_color, batch_brightness)
                                 loss = criterion(outputs, batch_labels)
                         else:

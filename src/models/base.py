@@ -185,10 +185,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
         """
         if not self.is_compiled:
             raise RuntimeError("Model must be compiled before training. Call model.compile() first.")
-        
-        # Import here to avoid circular imports
-        from torch.cuda.amp import GradScaler, autocast
-        
+                
         if verbose > 0:
             model_name = self.__class__.__name__
             print(f"🚀 Training {model_name} with enhanced DataLoader pipeline:")
@@ -209,7 +206,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
         
         # Mixed precision support
         use_mixed_precision = getattr(self, 'use_mixed_precision', False)
-        scaler = GradScaler() if use_mixed_precision else None
+        scaler = GradScaler('cuda') if use_mixed_precision else None
         
         # Training history
         history = {
@@ -244,7 +241,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
                 self.optimizer.zero_grad()
                 
                 if use_mixed_precision and scaler:
-                    with autocast():
+                    with autocast('cuda'):
                         outputs = self(batch_color, batch_brightness)
                         loss = self.criterion(outputs, batch_labels)
                     
@@ -298,7 +295,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
                         batch_labels = batch_labels.to(device, non_blocking=True)
                         
                         if use_mixed_precision:
-                            with autocast():
+                            with autocast('cuda'):
                                 outputs = self(batch_color, batch_brightness)
                                 loss = self.criterion(outputs, batch_labels)
                         else:
@@ -446,7 +443,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
         with torch.no_grad():
             for batch_color, batch_brightness in loader:
                 if self.use_mixed_precision:
-                    with autocast():
+                    with autocast('cuda'):
                         outputs = self(batch_color, batch_brightness)
                 else:
                     outputs = self(batch_color, batch_brightness)
