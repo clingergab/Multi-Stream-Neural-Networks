@@ -198,11 +198,76 @@ def main():
     
     # TODO: Create data loaders
     logger.info(f"Loading {args.dataset} dataset")
-    # train_loader, val_loader, test_loader = get_cifar_rgbl(
-    #     data_dir=args.data_dir,
-    #     batch_size=args.batch_size,
-    #     dataset=args.dataset
-    # )
+    
+    # Data loading and transformation
+    if args.dataset in ["cifar10", "cifar100"]:
+        from src.utils.cifar100_loader import get_cifar100_datasets, create_validation_split
+        from src.transforms.rgb_to_rgbl import RGBtoRGBL
+        from src.transforms.augmentation import (
+            create_augmented_dataloaders, 
+            create_test_dataloader,
+            CIFAR100Augmentation
+        )
+        
+        # Load datasets
+        dataset_name = "cifar-100" if args.dataset == "cifar100" else "cifar-10"
+        train_dataset, test_dataset, class_names = get_cifar100_datasets(
+            data_dir=os.path.join(args.data_dir, dataset_name)
+        )
+        
+        # Create validation split
+        train_dataset, val_dataset = create_validation_split(
+            train_dataset, 
+            val_split=0.1
+        )
+        
+        # Convert RGB data to RGB + Brightness
+        logger.info("Converting RGB data to RGB + Brightness streams...")
+        rgb_to_rgbl = RGBtoRGBL()
+        
+        # Process datasets into color and brightness tensors
+        # TODO: Implement batch processing for memory efficiency
+        
+        # Create augmented dataloaders
+        logger.info("Creating augmented dataloaders...")
+        augmentation_config = {
+            'horizontal_flip_prob': 0.5,
+            'rotation_degrees': 10.0,
+            'translate_range': 0.1,
+            'scale_range': (0.9, 1.1),
+            'color_jitter_strength': 0.3,
+            'gaussian_noise_std': 0.01,
+            'cutout_prob': 0.3,
+            'cutout_size': 8,
+            'enabled': True
+        }
+        
+        # TODO: Use create_augmented_dataloaders once batch processing is implemented
+        # train_loader, val_loader = create_augmented_dataloaders(
+        #     train_color, train_brightness, train_labels,
+        #     val_color, val_brightness, val_labels,
+        #     batch_size=args.batch_size,
+        #     dataset=args.dataset,
+        #     augmentation_config=augmentation_config,
+        #     mixup_alpha=0.2,  # Enable MixUp
+        #     num_workers=4,
+        #     pin_memory=True if device.type == 'cuda' else False
+        # )
+        # 
+        # test_loader = create_test_dataloader(
+        #     test_color, test_brightness, test_labels,
+        #     batch_size=args.batch_size,
+        #     num_workers=4,
+        #     pin_memory=True if device.type == 'cuda' else False
+        # )
+        
+    elif args.dataset == "imagenet":
+        # TODO: Add ImageNet data loading
+        from src.transforms.augmentation import ImageNetAugmentation
+        logger.info("ImageNet data loading to be implemented")
+    else:
+        logger.error(f"Unsupported dataset: {args.dataset}")
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
     
     # TODO: Create trainer
     # trainer = MSNNTrainer(

@@ -9,22 +9,14 @@ import os
 import torch
 import numpy as np
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import our utilities and models
-try:
-    from src.utils.cifar100_loader import load_cifar100_numpy
-    from src.models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork
-    from src.models.basic_multi_channel.multi_channel_resnet_network import MultiChannelResNetNetwork
-    from src.transforms.rgb_to_rgbl import RGBtoRGBL
-except ImportError:
-    # Alternative import method
-    sys.path.insert(0, os.path.dirname(__file__))
-    from src.utils.cifar100_loader import load_cifar100_numpy
-    from src.models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork
-    from src.models.basic_multi_channel.multi_channel_resnet_network import MultiChannelResNetNetwork
-    from src.transforms.rgb_to_rgbl import RGBtoRGBL
+from src.utils.cifar100_loader import load_cifar100_numpy
+from src.models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork
+from src.models.basic_multi_channel.multi_channel_resnet_network import MultiChannelResNetNetwork
+from src.transforms.rgb_to_rgbl import RGBtoRGBL
 
 def create_brightness_channel(rgb_data):
     """Convert RGB data to brightness channel using our transform."""

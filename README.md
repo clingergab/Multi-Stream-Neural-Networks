@@ -7,6 +7,7 @@ A PyTorch implementation of Multi-Stream Neural Networks for processing color an
 - **Multi-Channel Architecture**: Separate processing streams for color (RGB) and brightness data
 - **ResNet & Dense Models**: Both convolutional (ResNet-based) and dense network architectures
 - **Efficient Channel Handling**: Optimized for different input channels (3 for color, 1 for brightness)
+- **Dataset-Agnostic Augmentation**: Comprehensive augmentation pipeline for CIFAR-100, ImageNet and custom datasets
 - **Modular Design**: Easy to extend and customize
 - **Comprehensive Testing**: End-to-end tests with real datasets (MNIST, CIFAR-100)
 
@@ -15,6 +16,7 @@ A PyTorch implementation of Multi-Stream Neural Networks for processing color an
 ```python
 from src.models.builders.model_factory import create_model
 from src.transforms.rgb_to_rgbl import RGBtoRGBL
+from src.transforms.augmentation import create_augmented_dataloaders
 
 # Create a dense multi-channel model
 dense_model = create_model(
@@ -36,6 +38,16 @@ resnet_model = create_model(
 # Transform RGB data to RGB + Brightness
 transform = RGBtoRGBL()
 color_data, brightness_data = transform(rgb_tensor)
+
+# Create augmented dataloaders
+train_loader, val_loader = create_augmented_dataloaders(
+    train_color, train_brightness, train_labels,
+    val_color, val_brightness, val_labels,
+    batch_size=64,
+    dataset="cifar100",
+    augmentation_config={'horizontal_flip_prob': 0.5},
+    mixup_alpha=0.2  # Enable MixUp augmentation
+)
 
 # Forward pass
 outputs = model.forward_combined(color_data, brightness_data)
@@ -118,6 +130,44 @@ Run the comprehensive end-to-end tests:
 ```bash
 python tests/end_to_end/test_refactored_models_e2e.py
 ```
+
+## Data Augmentation
+
+The project includes a comprehensive data augmentation pipeline for multi-stream neural networks:
+
+```python
+from src.transforms.augmentation import (
+    CIFAR100Augmentation,
+    ImageNetAugmentation, 
+    MixUp,
+    create_augmented_dataloaders
+)
+
+# Create augmentation with dataset-specific defaults
+cifar_augmentation = CIFAR100Augmentation(
+    horizontal_flip_prob=0.5,
+    rotation_degrees=10.0,
+    color_jitter_strength=0.3
+)
+
+# Create dataloaders with augmentation
+train_loader, val_loader = create_augmented_dataloaders(
+    train_color, train_brightness, train_labels,
+    val_color, val_brightness, val_labels,
+    batch_size=64,
+    dataset="cifar100",  # Options: "cifar100", "imagenet", "custom"
+    augmentation_config={'cutout_prob': 0.3, 'cutout_size': 8},
+    mixup_alpha=0.2  # Enable MixUp augmentation
+)
+```
+
+Key features:
+- Dataset-specific augmentations (CIFAR-100, ImageNet, extensible)
+- Consistent transformations across color and brightness streams
+- Advanced techniques (MixUp, cutout, color jitter)
+- Memory-efficient batch processing
+
+See `src/utils/README_augmentation.md` for detailed documentation.
 
 ## Models
 

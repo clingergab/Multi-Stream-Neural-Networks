@@ -2,9 +2,12 @@
 
 from .rgb_to_rgbl import RGBtoRGBL, AdaptiveBrightnessExtraction, create_rgbl_transform
 from .spatial_transforms import SpatialConsistentTransform, RandomCropBoth, RandomFlipBoth, create_spatial_transforms
-from .augmentations import ColorJitter, BrightnessNoise, MultiStreamAugmentation, MixUp
+from .augmentation import BaseAugmentation, CIFAR100Augmentation, ImageNetAugmentation, MixUp
+from .augmentation import AugmentedMultiStreamDataset, create_augmented_dataloaders, create_test_dataloader
+from .augmentation import ColorJitter, BrightnessNoise, MultiStreamAugmentation
 
 __all__ = [
+    # Core transforms
     'RGBtoRGBL',
     'AdaptiveBrightnessExtraction',
     'create_rgbl_transform',
@@ -12,6 +15,16 @@ __all__ = [
     'RandomCropBoth',
     'RandomFlipBoth', 
     'create_spatial_transforms',
+    
+    # Augmentation - New API
+    'BaseAugmentation',
+    'CIFAR100Augmentation',
+    'ImageNetAugmentation',
+    'AugmentedMultiStreamDataset',
+    'create_augmented_dataloaders',
+    'create_test_dataloader',
+    
+    # Deprecated - For backward compatibility
     'ColorJitter',
     'BrightnessNoise',
     'MultiStreamAugmentation',
