@@ -430,6 +430,13 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         1. Direct data array input (original behavior): Provide train_color_data, train_brightness_data, train_labels
         2. DataLoader input (for on-the-fly augmentation): Provide train_loader directly
         
+        Memory-Efficient Training:
+        -------------------------
+        For large datasets:
+        - Tabular data can use much larger batch sizes (512-4096) compared to CNNs
+        - For extremely large datasets, use DataLoaders with num_workers > 0
+        - Mixed precision training is enabled by default on compatible GPUs
+        
         Args:
             train_color_data: Training data for color stream [N, features] (used if train_loader not provided)
             train_brightness_data: Training data for brightness stream [N, features] (used if train_loader not provided)
@@ -464,9 +471,21 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         # Determine if we're using DataLoaders or direct data
         using_dataloaders = train_loader is not None
         
-        # Auto-detect batch size if not provided
+        # Auto-detect optimal batch size based on GPU memory
         if batch_size is None and not using_dataloaders:
-            batch_size = 32  # Default for tabular data
+            if self.device.type == 'cuda':
+                # For tabular data, we can use larger batch sizes than for CNNs
+                memory_gb = torch.cuda.get_device_properties(self.device).total_memory / 1e9
+                if memory_gb >= 80:  # A100 80GB
+                    batch_size = 4096  # Very large batch size for A100 80GB
+                elif memory_gb >= 40:  # A100 40GB
+                    batch_size = 2048  # Large batch size for A100 40GB
+                elif memory_gb >= 16:  # V100
+                    batch_size = 1024  # Medium batch size for V100
+                else:
+                    batch_size = 512   # Conservative for smaller GPUs
+            else:
+                batch_size = 128  # Default for CPU/MPS with tabular data
         
         # Auto-detect optimal number of workers
         if num_workers is None:

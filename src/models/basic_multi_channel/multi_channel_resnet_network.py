@@ -428,6 +428,13 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         1. Direct data array input (original behavior): Provide train_color_data, train_brightness_data, train_labels
         2. DataLoader input (for on-the-fly augmentation): Provide train_loader directly
         
+        Memory-Efficient Training:
+        -------------------------
+        For large datasets like ImageNet, it's recommended to:
+        - Use custom DataLoaders with transforms (Option 2) to enable on-the-fly augmentation
+        - Use a smaller batch_size (16-32 even on large GPUs) to prevent OOM errors
+        - Consider using the mixed precision training (enabled by default on compatible GPUs)
+        
         Args:
             train_color_data: Training data for color stream [N, C, H, W] (used if train_loader not provided)
             train_brightness_data: Training data for brightness stream [N, C, H, W] (used if train_loader not provided)
@@ -465,16 +472,18 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         # Auto-detect optimal batch size for CNN (used only if creating DataLoaders from direct data)
         if batch_size is None and not using_dataloaders:
             if self.device.type == 'cuda':
-                # For CNNs, use smaller batch sizes due to memory requirements
+                # For CNNs, use appropriate batch sizes based on GPU memory
                 memory_gb = torch.cuda.get_device_properties(self.device).total_memory / 1e9
-                if memory_gb >= 40:  # A100
-                    batch_size = 64
+                if memory_gb >= 80:  # A100 80GB
+                    batch_size = 256  # Much larger batch size for A100 80GB
+                elif memory_gb >= 40:  # A100 40GB
+                    batch_size = 128  # Larger batch size for A100 40GB
                 elif memory_gb >= 16:  # V100
-                    batch_size = 32
+                    batch_size = 64   # Medium batch size for V100
                 else:
-                    batch_size = 16
+                    batch_size = 32   # Conservative for smaller GPUs
             else:
-                batch_size = 8  # Conservative for CPU/MPS
+                batch_size = 4  # Conservative for CPU/MPS with large datasets
         
         # Auto-detect optimal number of workers
         if num_workers is None:
@@ -504,10 +513,10 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             if train_color_data is None or train_brightness_data is None or train_labels is None:
                 raise ValueError("When train_loader is not provided, you must provide train_color_data, train_brightness_data, and train_labels")
             
-            # Create DataLoaders from direct data
-            train_color_tensor = torch.tensor(train_color_data, dtype=torch.float32).to(self.device, non_blocking=True)
-            train_brightness_tensor = torch.tensor(train_brightness_data, dtype=torch.float32).to(self.device, non_blocking=True)
-            train_labels_tensor = torch.tensor(train_labels, dtype=torch.long).to(self.device, non_blocking=True)
+            # Create DataLoaders from direct data - keep tensors on CPU for memory efficiency
+            train_color_tensor = torch.tensor(train_color_data, dtype=torch.float32)
+            train_brightness_tensor = torch.tensor(train_brightness_data, dtype=torch.float32)
+            train_labels_tensor = torch.tensor(train_labels, dtype=torch.long)
             
             train_dataset = TensorDataset(train_color_tensor, train_brightness_tensor, train_labels_tensor)
             train_loader = DataLoader(
@@ -521,9 +530,9 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             
             # Set up validation loader if validation data is provided
             if val_color_data is not None and val_brightness_data is not None and val_labels is not None:
-                val_color_tensor = torch.tensor(val_color_data, dtype=torch.float32).to(self.device, non_blocking=True)
-                val_brightness_tensor = torch.tensor(val_brightness_data, dtype=torch.float32).to(self.device, non_blocking=True)
-                val_labels_tensor = torch.tensor(val_labels, dtype=torch.long).to(self.device, non_blocking=True)
+                val_color_tensor = torch.tensor(val_color_data, dtype=torch.float32)
+                val_brightness_tensor = torch.tensor(val_brightness_data, dtype=torch.float32)
+                val_labels_tensor = torch.tensor(val_labels, dtype=torch.long)
                 
                 val_dataset = TensorDataset(val_color_tensor, val_brightness_tensor, val_labels_tensor)
                 val_loader = DataLoader(
@@ -620,9 +629,15 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 total_loss += loss.item()
                 
                 # Calculate training accuracy
-                _, predicted = torch.max(outputs.data, 1)
-                train_total += batch_labels.size(0)
-                train_correct += (predicted == batch_labels).sum().item()
+                with torch.no_grad():  # Ensure no unnecessary memory is retained for gradient calculation
+                    _, predicted = torch.max(outputs.data, 1)
+                    train_total += batch_labels.size(0)
+                    train_correct += (predicted == batch_labels).sum().item()
+                
+                # Explicitly clear unnecessary tensors to help with memory management
+                del outputs, loss, predicted
+                if self.use_mixed_precision and self.scaler is not None:
+                    torch.cuda.empty_cache()  # Periodic cache clearing for large datasets
                 
                 # Update progress bar with current training metrics
                 if verbose == 1 and epoch_pbar is not None:
@@ -685,6 +700,13 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                         _, predicted = torch.max(outputs.data, 1)
                         val_total += batch_labels.size(0)
                         val_correct += (predicted == batch_labels).sum().item()
+                        
+                        # Explicitly clear unnecessary tensors to help with memory management
+                        del outputs, loss, predicted
+                        
+                # Periodically clear cache during validation
+                if batch_idx % 20 == 0 and self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
                 
                 # Calculate epoch validation metrics
                 avg_val_loss = total_val_loss / len(val_loader)

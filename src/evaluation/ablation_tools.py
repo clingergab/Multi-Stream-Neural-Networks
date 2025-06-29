@@ -24,19 +24,19 @@ class AblationStudy:
         
         results = {'baseline': baseline_acc}
         
-        # Test without color pathway
-        color_only_acc = self._evaluate_with_pathway_ablation('brightness')
-        results['color_only'] = color_only_acc
-        print(f"Color pathway only: {color_only_acc:.2f}%")
-        
         # Test without brightness pathway
-        brightness_only_acc = self._evaluate_with_pathway_ablation('color')
+        rgb_only_acc = self._evaluate_with_pathway_ablation('brightness')
+        results['rgb_only'] = rgb_only_acc
+        print(f"RGB pathway only: {rgb_only_acc:.2f}%")
+        
+        # Test without RGB pathway
+        brightness_only_acc = self._evaluate_with_pathway_ablation('rgb')
         results['brightness_only'] = brightness_only_acc
         print(f"Brightness pathway only: {brightness_only_acc:.2f}%")
         
         # Compute importance scores
-        results['color_importance'] = baseline_acc - brightness_only_acc
-        results['brightness_importance'] = baseline_acc - color_only_acc
+        results['rgb_importance'] = baseline_acc - brightness_only_acc
+        results['brightness_importance'] = baseline_acc - rgb_only_acc
         
         return results
     
@@ -101,16 +101,16 @@ class AblationStudy:
         
         with torch.no_grad():
             for batch in self.dataloader:
-                color_input = batch['color']
+                rgb_input = batch['rgb']
                 brightness_input = batch['brightness']
                 targets = batch['target']
                 
                 if torch.cuda.is_available():
-                    color_input = color_input.cuda()
+                    rgb_input = rgb_input.cuda()
                     brightness_input = brightness_input.cuda()
                     targets = targets.cuda()
                 
-                outputs = model(color_input, brightness_input)
+                outputs = model(rgb_input, brightness_input)
                 _, predicted = torch.max(outputs, 1)
                 total += targets.size(0)
                 correct += (predicted == targets).sum().item()
@@ -122,10 +122,10 @@ class AblationStudy:
         model_copy = deepcopy(self.model)
         
         # Zero out the specified pathway
-        if ablate_pathway == 'color':
-            # Set color pathway to return zeros
-            original_forward = model_copy.color_pathway.forward
-            model_copy.color_pathway.forward = lambda x: torch.zeros_like(original_forward(x))
+        if ablate_pathway == 'rgb':
+            # Set RGB pathway to return zeros
+            original_forward = model_copy.rgb_pathway.forward
+            model_copy.rgb_pathway.forward = lambda x: torch.zeros_like(original_forward(x))
         elif ablate_pathway == 'brightness':
             # Set brightness pathway to return zeros
             original_forward = model_copy.brightness_pathway.forward

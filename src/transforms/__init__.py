@@ -5,6 +5,7 @@ from .spatial_transforms import SpatialConsistentTransform, RandomCropBoth, Rand
 from .augmentation import BaseAugmentation, CIFAR100Augmentation, ImageNetAugmentation, MixUp
 from .augmentation import AugmentedMultiStreamDataset, create_augmented_dataloaders, create_test_dataloader
 from .augmentation import ColorJitter, BrightnessNoise, MultiStreamAugmentation
+from .dataset_utils import process_dataset_to_streams, create_dataloader_with_streams, collate_with_streams
 
 __all__ = [
     # Core transforms
@@ -23,6 +24,11 @@ __all__ = [
     'AugmentedMultiStreamDataset',
     'create_augmented_dataloaders',
     'create_test_dataloader',
+    
+    # Dataset utilities
+    'process_dataset_to_streams',
+    'create_dataloader_with_streams',
+    'collate_with_streams',
     
     # Deprecated - For backward compatibility
     'ColorJitter',

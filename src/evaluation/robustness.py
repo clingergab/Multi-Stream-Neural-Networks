@@ -20,19 +20,19 @@ class RobustnessEvaluator:
             accuracies = []
             
             for batch in dataloader:
-                color_input = batch['color'].to(self.device)
+                rgb_input = batch['rgb'].to(self.device)
                 brightness_input = batch['brightness'].to(self.device)
                 targets = batch['target'].to(self.device)
                 
                 # Add noise
-                color_noise = torch.randn_like(color_input) * noise_level
+                rgb_noise = torch.randn_like(rgb_input) * noise_level
                 brightness_noise = torch.randn_like(brightness_input) * noise_level
                 
-                noisy_color = torch.clamp(color_input + color_noise, 0, 1)
+                noisy_rgb = torch.clamp(rgb_input + rgb_noise, 0, 1)
                 noisy_brightness = torch.clamp(brightness_input + brightness_noise, 0, 1)
                 
                 with torch.no_grad():
-                    outputs = self.model(noisy_color, noisy_brightness)
+                    outputs = self.model(noisy_rgb, noisy_brightness)
                     predictions = torch.argmax(outputs, dim=1)
                     accuracy = (predictions == targets).float().mean().item()
                     accuracies.append(accuracy)
@@ -48,47 +48,47 @@ class RobustnessEvaluator:
         total_samples = 0
         
         for batch in dataloader:
-            color_input = batch['color'].to(self.device)
+            rgb_input = batch['rgb'].to(self.device)
             brightness_input = batch['brightness'].to(self.device)
             targets = batch['target'].to(self.device)
             
             # Generate adversarial examples
-            adv_color, adv_brightness = self._pgd_attack(
-                color_input, brightness_input, targets, epsilon, steps
+            adv_rgb, adv_brightness = self._pgd_attack(
+                rgb_input, brightness_input, targets, epsilon, steps
             )
             
             with torch.no_grad():
-                outputs = self.model(adv_color, adv_brightness)
+                outputs = self.model(adv_rgb, adv_brightness)
                 predictions = torch.argmax(outputs, dim=1)
                 total_correct += (predictions == targets).sum().item()
                 total_samples += targets.size(0)
         
         return (total_correct / total_samples) * 100
     
-    def _pgd_attack(self, color_input, brightness_input, targets, epsilon, steps):
+    def _pgd_attack(self, rgb_input, brightness_input, targets, epsilon, steps):
         """Projected Gradient Descent attack."""
         alpha = epsilon / steps
         
         # Initialize adversarial examples
-        adv_color = color_input.clone().detach().requires_grad_(True)
+        adv_rgb = rgb_input.clone().detach().requires_grad_(True)
         adv_brightness = brightness_input.clone().detach().requires_grad_(True)
         
         for _ in range(steps):
-            outputs = self.model(adv_color, adv_brightness)
+            outputs = self.model(adv_rgb, adv_brightness)
             loss = F.cross_entropy(outputs, targets)
             
             loss.backward()
             
             # Update adversarial examples
-            adv_color = adv_color.detach() + alpha * adv_color.grad.sign()
+            adv_rgb = adv_rgb.detach() + alpha * adv_rgb.grad.sign()
             adv_brightness = adv_brightness.detach() + alpha * adv_brightness.grad.sign()
             
             # Project back to valid range
-            adv_color = torch.clamp(adv_color, 0, 1)
+            adv_rgb = torch.clamp(adv_rgb, 0, 1)
             adv_brightness = torch.clamp(adv_brightness, 0, 1)
             
             # Reset gradients
-            adv_color.requires_grad_(True)
+            adv_rgb.requires_grad_(True)
             adv_brightness.requires_grad_(True)
         
-        return adv_color.detach(), adv_brightness.detach()
+        return adv_rgb.detach(), adv_brightness.detach()
