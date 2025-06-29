@@ -556,12 +556,12 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         else:
             scheduler = None
         
-        # Training loop with mixed precision
+        # Training loop
         best_val_loss = float('inf')
         patience_counter = 0
         
         for epoch in range(epochs):
-            # Clear any existing tqdm instances to avoid duplicate progress bars
+            # Clear any existing tqdm instances
             try:
                 for inst in list(getattr(tqdm, '_instances', [])):
                     try:
@@ -583,10 +583,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 epoch_pbar = tqdm(
                     total=len(train_loader), 
                     desc=f"Epoch {epoch+1}/{epochs}", 
-                    leave=True,
-                    dynamic_ncols=True,
-                    position=0,
-                    smoothing=0.3
+                    leave=True
                 )
             
             # Training loop
@@ -639,15 +636,13 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 if self.use_mixed_precision and self.scaler is not None:
                     torch.cuda.empty_cache()  # Periodic cache clearing for large datasets
                 
-                # Update progress bar with current training metrics
+                # Update progress bar
                 if verbose == 1 and epoch_pbar is not None:
-                    train_acc = train_correct / train_total
                     epoch_pbar.set_postfix({
-                        'Loss': f'{total_loss/(batch_idx+1):.4f}',
-                        'Acc': f'{train_acc:.4f}'
+                        'loss': total_loss / (batch_idx + 1), 
+                        'acc': 100. * train_correct / train_total
                     })
                     epoch_pbar.update(1)
-                    epoch_pbar.refresh()
             
             # Update learning rate scheduler
             if scheduler is not None:
@@ -684,7 +679,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                         if batch_labels.device != self.device:
                             batch_labels = batch_labels.to(self.device, non_blocking=True)
                         
-                        # Forward pass with mixed precision if available
+                        # Forward pass
                         if self.use_mixed_precision and self.scaler is not None:
                             with autocast("cuda" if torch.cuda.is_available() else "cpu"):
                                 outputs = self(batch_color, batch_brightness)
@@ -716,33 +711,51 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 history['val_loss'].append(avg_val_loss)
                 history['val_accuracy'].append(val_accuracy)
                 
-                # Update progress bar with final validation metrics
+                # Prepare summary for the final epoch progress bar update
+                summary = {
+                    'Loss': f'{avg_train_loss:.4f}',
+                    'Acc': f'{train_accuracy:.4f}',
+                    'Val_Loss': f'{avg_val_loss:.4f}',
+                    'Val_Acc': f'{val_accuracy:.4f}',
+                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                }
+                
+                # Update progress bar with all metrics in one line
                 if verbose == 1 and epoch_pbar is not None:
-                    epoch_pbar.set_postfix({
-                        'Loss': f'{avg_train_loss:.4f}',
-                        'Acc': f'{train_accuracy:.4f}',
-                        'Val_Loss': f'{avg_val_loss:.4f}',
-                        'Val_Acc': f'{val_accuracy:.4f}'
-                    })
+                    epoch_pbar.set_postfix(summary)
                     epoch_pbar.refresh()
+                    epoch_pbar.close()
+                    print("\r\033[K", end="")  # Clear the current line
+                elif verbose > 0:
+                    # If no progress bar but verbose, print a summary line
+                    print(f"Epoch {epoch+1}/{epochs} - "
+                          f"Loss: {avg_train_loss:.4f}, Acc: {train_accuracy:.4f}, "
+                          f"Val_Loss: {avg_val_loss:.4f}, Val_Acc: {val_accuracy:.4f}, "
+                          f"LR: {optimizer.param_groups[0]['lr']:.6f}")
             else:
-                # Training only - final update
+                # Prepare summary for training-only progress bar update
+                summary = {
+                    'Loss': f'{avg_train_loss:.4f}',
+                    'Acc': f'{train_accuracy:.4f}',
+                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                }
+                
+                # Update progress bar with training metrics in one line
                 if verbose == 1 and epoch_pbar is not None:
-                    epoch_pbar.set_postfix({
-                        'Loss': f'{avg_train_loss:.4f}',
-                        'Acc': f'{train_accuracy:.4f}'
-                    })
+                    epoch_pbar.set_postfix(summary)
                     epoch_pbar.refresh()
+                    epoch_pbar.close()
+                    print("\r\033[K", end="")  # Clear the current line
+                elif verbose > 0:
+                    # If no progress bar but verbose, print a summary line
+                    print(f"Epoch {epoch+1}/{epochs} - "
+                          f"Loss: {avg_train_loss:.4f}, Acc: {train_accuracy:.4f}, "
+                          f"LR: {optimizer.param_groups[0]['lr']:.6f}")
                 
                 # Store empty validation metrics for consistency
                 history['val_loss'].append(None)
                 history['val_accuracy'].append(None)
                 avg_val_loss = float('inf')  # For early stopping logic
-            
-            # Close progress bar and clear line to prevent duplication
-            if verbose == 1 and epoch_pbar is not None:
-                epoch_pbar.close()
-                print("\r\033[K", end="")  # Clear the current line
             
             # Early stopping check (only if validation data provided)
             if val_loader is not None:
@@ -758,25 +771,6 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     if verbose > 0:
                         print(f"Early stopping triggered. Stopping training at epoch {epoch + 1}.")
                     break
-            
-            # Print epoch summary
-            if verbose > 0:
-                if val_loader is not None:
-                    # Get the most recent validation metrics
-                    if history['val_accuracy'][-1] is not None:
-                        val_acc = history['val_accuracy'][-1]
-                        print(f"Epoch {epoch + 1}/{epochs} - "
-                              f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
-                              f"Val Loss: {avg_val_loss:.4f} - Val Acc: {val_acc:.4f} - "
-                              f"LR: {optimizer.param_groups[0]['lr']:.6f}")
-                    else:
-                        print(f"Epoch {epoch + 1}/{epochs} - "
-                              f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
-                              f"LR: {optimizer.param_groups[0]['lr']:.6f}")
-                else:
-                    print(f"Epoch {epoch + 1}/{epochs} - "
-                          f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
-                          f"LR: {optimizer.param_groups[0]['lr']:.6f}")
         
         # Load best model if validation was performed and we have saved a best state
         if val_loader is not None and hasattr(self, 'best_model_state'):

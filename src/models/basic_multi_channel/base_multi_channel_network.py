@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import GradScaler, autocast
-import numpy as np
 from typing import Tuple, Dict, List, Union, Optional
 from tqdm import tqdm
 from ..base import BaseMultiStreamModel
@@ -490,7 +489,7 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         # Auto-detect optimal number of workers
         if num_workers is None:
             import os
-            num_workers = min(4, os.cpu_count() or 1)
+            num_workers = min(8, os.cpu_count() or 1)
         
         # Auto-detect pin_memory
         if pin_memory is None:
@@ -575,19 +574,20 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
             
             # Training phase
             self.train()
-            train_loss = 0.0
+            total_loss = 0.0
             train_correct = 0
             train_total = 0
             
             # Create progress bar for training
-            train_pbar = None
+            epoch_pbar = None
             if verbose == 1:
-                train_pbar = tqdm(
+                epoch_pbar = tqdm(
                     total=len(train_loader), 
                     desc=f"Epoch {epoch+1}/{epochs}", 
                     leave=True
                 )
             
+            # Training loop
             for batch_idx, data in enumerate(train_loader):
                 # Unpack data - handle different formats
                 if isinstance(data, (list, tuple)) and len(data) == 3:
@@ -595,10 +595,13 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                 else:
                     raise ValueError("DataLoader must provide (color, brightness, labels) tuples")
                 
-                # Move data to device
-                color_batch = color_batch.to(self.device, non_blocking=True)
-                brightness_batch = brightness_batch.to(self.device, non_blocking=True)
-                labels_batch = labels_batch.to(self.device, non_blocking=True)
+                # Move data to device if not already there
+                if color_batch.device != self.device:
+                    color_batch = color_batch.to(self.device, non_blocking=True)
+                if brightness_batch.device != self.device:
+                    brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+                if labels_batch.device != self.device:
+                    labels_batch = labels_batch.to(self.device, non_blocking=True)
                 
                 # For BaseMultiChannelNetwork, we need to reshape the data from (N, C, H, W) to (N, C*H*W)
                 if len(color_batch.shape) > 2:  # If data is in image format (N, C, H, W)
@@ -613,57 +616,57 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                         outputs = self(color_batch, brightness_batch)
                         loss = criterion(outputs, labels_batch)
                     
+                    # Backward pass with scaler
                     self.scaler.scale(loss).backward()
                     self.scaler.step(optimizer)
                     self.scaler.update()
                 else:
+                    # Standard forward and backward pass
                     outputs = self(color_batch, brightness_batch)
                     loss = criterion(outputs, labels_batch)
                     loss.backward()
                     optimizer.step()
                 
-                # Calculate metrics
-                train_loss += loss.item()
-                _, predicted = outputs.max(1)
-                train_total += labels_batch.size(0)
-                train_correct += predicted.eq(labels_batch).sum().item()
+                # Track metrics
+                total_loss += loss.item()
+                
+                # Calculate training accuracy
+                with torch.no_grad():  # Ensure no unnecessary memory is retained for gradient calculation
+                    _, predicted = outputs.max(1)
+                    train_total += labels_batch.size(0)
+                    train_correct += predicted.eq(labels_batch).sum().item()
+                
+                # Explicitly clear unnecessary tensors to help with memory management
+                del outputs, loss, predicted
+                if self.use_mixed_precision and self.scaler is not None:
+                    torch.cuda.empty_cache()  # Periodic cache clearing for large datasets
                 
                 # Update progress bar
-                if train_pbar is not None:
-                    train_pbar.set_postfix({
-                        'loss': train_loss / (batch_idx + 1), 
+                if verbose == 1 and epoch_pbar is not None:
+                    epoch_pbar.set_postfix({
+                        'loss': total_loss / (batch_idx + 1), 
                         'acc': 100. * train_correct / train_total
                     })
-                    train_pbar.update(1)
-            
-            # Close progress bar
-            if train_pbar is not None:
-                train_pbar.close()
-            
-            # Calculate epoch metrics
-            train_loss = train_loss / len(train_loader)
-            train_accuracy = train_correct / train_total
-            history['loss'].append(train_loss)
-            history['accuracy'].append(train_accuracy)
+                    epoch_pbar.update(1)
             
             # Update learning rate scheduler
             if scheduler is not None:
                 scheduler.step()
             
+            # Calculate epoch metrics
+            avg_train_loss = total_loss / len(train_loader)
+            train_accuracy = train_correct / train_total
+            
+            # Store training metrics in history
+            history['loss'].append(avg_train_loss)
+            history['accuracy'].append(train_accuracy)
+            
             # Validation phase
             if val_loader is not None:
-                val_loss = 0.0
+                self.eval()
+                total_val_loss = 0.0
                 val_correct = 0
                 val_total = 0
-                
-                self.eval()
-                val_pbar = None
-                if verbose == 1:
-                    val_pbar = tqdm(
-                        total=len(val_loader),
-                        desc="Validation",
-                        leave=False
-                    )
                 
                 with torch.no_grad():
                     for batch_idx, data in enumerate(val_loader):
@@ -673,10 +676,13 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                         else:
                             raise ValueError("DataLoader must provide (color, brightness, labels) tuples")
                         
-                        # Move data to device
-                        color_batch = color_batch.to(self.device, non_blocking=True)
-                        brightness_batch = brightness_batch.to(self.device, non_blocking=True)
-                        labels_batch = labels_batch.to(self.device, non_blocking=True)
+                        # Move data to device if not already there
+                        if color_batch.device != self.device:
+                            color_batch = color_batch.to(self.device, non_blocking=True)
+                        if brightness_batch.device != self.device:
+                            brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+                        if labels_batch.device != self.device:
+                            labels_batch = labels_batch.to(self.device, non_blocking=True)
                         
                         # For BaseMultiChannelNetwork, we need to reshape the data from (N, C, H, W) to (N, C*H*W)
                         if len(color_batch.shape) > 2:  # If data is in image format (N, C, H, W)
@@ -692,61 +698,98 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                             outputs = self(color_batch, brightness_batch)
                             loss = criterion(outputs, labels_batch)
                         
-                        # Calculate metrics
-                        val_loss += loss.item()
+                        # Track metrics
+                        total_val_loss += loss.item()
+                        
+                        # Calculate validation accuracy
                         _, predicted = outputs.max(1)
                         val_total += labels_batch.size(0)
                         val_correct += predicted.eq(labels_batch).sum().item()
                         
-                        # Update progress bar
-                        if val_pbar is not None:
-                            val_pbar.set_postfix({
-                                'loss': val_loss / (batch_idx + 1), 
-                                'acc': 100. * val_correct / val_total
-                            })
-                            val_pbar.update(1)
+                        # Explicitly clear unnecessary tensors to help with memory management
+                        del outputs, loss, predicted
                 
-                # Close progress bar
-                if val_pbar is not None:
-                    val_pbar.close()
+                # Periodically clear cache during validation
+                if batch_idx % 20 == 0 and self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
                 
                 # Calculate epoch validation metrics
-                val_loss = val_loss / len(val_loader)
+                avg_val_loss = total_val_loss / len(val_loader)
                 val_accuracy = val_correct / val_total
-                history['val_loss'].append(val_loss)
+                
+                # Store validation metrics in history
+                history['val_loss'].append(avg_val_loss)
                 history['val_accuracy'].append(val_accuracy)
                 
-                # Early stopping check
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                # Prepare summary for the final epoch progress bar update
+                summary = {
+                    'Loss': f'{avg_train_loss:.4f}',
+                    'Acc': f'{train_accuracy:.4f}',
+                    'Val_Loss': f'{avg_val_loss:.4f}',
+                    'Val_Acc': f'{val_accuracy:.4f}',
+                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                }
+                
+                # Update progress bar with all metrics in one line
+                if verbose == 1 and epoch_pbar is not None:
+                    epoch_pbar.set_postfix(summary)
+                    epoch_pbar.refresh()
+                    epoch_pbar.close()
+                    print("\r\033[K", end="")  # Clear the current line
+                elif verbose > 0:
+                    # If no progress bar but verbose, print a summary line
+                    print(f"Epoch {epoch+1}/{epochs} - "
+                          f"Loss: {avg_train_loss:.4f}, Acc: {train_accuracy:.4f}, "
+                          f"Val_Loss: {avg_val_loss:.4f}, Val_Acc: {val_accuracy:.4f}, "
+                          f"LR: {optimizer.param_groups[0]['lr']:.6f}")
+            else:
+                # Prepare summary for training-only progress bar update
+                summary = {
+                    'Loss': f'{avg_train_loss:.4f}',
+                    'Acc': f'{train_accuracy:.4f}',
+                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                }
+                
+                # Update progress bar with training metrics in one line
+                if verbose == 1 and epoch_pbar is not None:
+                    epoch_pbar.set_postfix(summary)
+                    epoch_pbar.refresh()
+                    epoch_pbar.close()
+                    print("\r\033[K", end="")  # Clear the current line
+                elif verbose > 0:
+                    # If no progress bar but verbose, print a summary line
+                    print(f"Epoch {epoch+1}/{epochs} - "
+                          f"Loss: {avg_train_loss:.4f}, Acc: {train_accuracy:.4f}, "
+                          f"LR: {optimizer.param_groups[0]['lr']:.6f}")
+                
+                # Store empty validation metrics for consistency
+                history['val_loss'].append(None)
+                history['val_accuracy'].append(None)
+                avg_val_loss = float('inf')  # For early stopping logic
+            
+            # Early stopping check (only if validation data provided)
+            if val_loader is not None:
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
                     # Save best model state
                     self.best_model_state = self.state_dict().copy()
                     patience_counter = 0
                 else:
                     patience_counter += 1
                 
-                # Print epoch summary
-                if verbose > 0:
-                    print(f"Epoch {epoch+1}/{epochs} - "
-                          f"Loss: {train_loss:.4f}, Acc: {train_accuracy:.4f}, "
-                          f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
-                
-                # Early stopping
                 if patience_counter >= early_stopping_patience:
                     if verbose > 0:
                         print(f"Early stopping triggered after {epoch+1} epochs")
                     break
-            else:
-                # Print epoch summary without validation
-                if verbose > 0:
-                    print(f"Epoch {epoch+1}/{epochs} - "
-                          f"Loss: {train_loss:.4f}, Acc: {train_accuracy:.4f}")
         
         # Load best model if validation was performed
         if val_loader is not None and hasattr(self, 'best_model_state'):
             self.load_state_dict(self.best_model_state)
             if verbose > 0:
                 print("Loaded best model state from early stopping")
+        
+        # Clear cache after training
+        self.device_manager.clear_cache()
         
         return history
     
