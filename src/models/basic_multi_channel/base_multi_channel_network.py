@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from torch import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import numpy as np
 from typing import Tuple, Dict, List, Union, Optional
 from tqdm import tqdm
@@ -60,9 +60,9 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
     
     def __init__(
         self,
-        input_size: int = None,
-        color_input_size: int = None, 
-        brightness_input_size: int = None,
+        input_size: Optional[int] = None,
+        color_input_size: Optional[int] = None, 
+        brightness_input_size: Optional[int] = None,
         hidden_sizes: List[int] = [512, 256, 128],
         num_classes: int = 10,
         activation: str = 'relu',
@@ -115,7 +115,7 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         
         # Mixed precision support
         self.use_mixed_precision = self.device_manager.enable_mixed_precision()
-        self.scaler = GradScaler('cuda') if self.use_mixed_precision else None
+        self.scaler = GradScaler() if self.use_mixed_precision else None
         
         # Build network layers
         self._build_network()
@@ -404,274 +404,340 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         
     def fit(
         self,
-        train_color_data: np.ndarray,
-        train_brightness_data: np.ndarray,
-        train_labels: np.ndarray,
-        val_color_data: Optional[np.ndarray] = None,
-        val_brightness_data: Optional[np.ndarray] = None,
-        val_labels: Optional[np.ndarray] = None,
-        batch_size: int = None,  # Auto-detect optimal batch size
+        train_color_data=None,
+        train_brightness_data=None,
+        train_labels=None,
+        val_color_data=None,
+        val_brightness_data=None,
+        val_labels=None,
+        train_loader=None,
+        val_loader=None,
+        batch_size=None,
         epochs: int = 10,
         learning_rate: float = 0.001,
         weight_decay: float = 0.0,
         early_stopping_patience: int = 5,
+        scheduler_type: str = 'cosine',
+        min_lr: float = 1e-6,
         verbose: int = 1,
-        num_workers: int = None,  # Auto-detect optimal workers
-        pin_memory: bool = None   # Auto-detect based on device
-    ):
+        num_workers: Optional[int] = None,  # Auto-detect optimal workers
+        pin_memory: Optional[bool] = None   # Auto-detect based on device
+    ) -> Dict[str, List[float]]:
         """
-        Fit the model to the data using Keras-like training API with GPU optimizations.
+        Unified fit method that handles both direct data arrays and DataLoaders with on-the-fly augmentation.
+        
+        This enhanced method supports two modes of operation:
+        1. Direct data array input (original behavior): Provide train_color_data, train_brightness_data, train_labels
+        2. DataLoader input (for on-the-fly augmentation): Provide train_loader directly
         
         Args:
-            train_color_data: Training data for color stream
-            train_brightness_data: Training data for brightness stream
-            train_labels: Training labels
-            val_color_data: Validation data for color stream
-            val_brightness_data: Validation data for brightness stream
-            val_labels: Validation labels
-            batch_size: Batch size for training (auto-detected if None)
+            train_color_data: Training data for color stream [N, features] (used if train_loader not provided)
+            train_brightness_data: Training data for brightness stream [N, features] (used if train_loader not provided)
+            train_labels: Training labels (used if train_loader not provided)
+            val_color_data: Validation data for color stream (used if val_loader not provided)
+            val_brightness_data: Validation data for brightness stream (used if val_loader not provided)
+            val_labels: Validation labels (used if val_loader not provided)
+            train_loader: Optional DataLoader for training (will be used instead of direct data if provided)
+            val_loader: Optional DataLoader for validation (will be used instead of direct data if provided)
+            batch_size: Batch size for training when using direct data (auto-detected if None)
             epochs: Number of epochs to train
             learning_rate: Learning rate for the optimizer
             weight_decay: Weight decay (L2 regularization)
             early_stopping_patience: Patience for early stopping
+            scheduler_type: Learning rate scheduler type ('cosine', 'step', 'none')
+            min_lr: Minimum learning rate for cosine annealing
             verbose: Verbosity level (0: silent, 1: progress bar, 2: one line per epoch)
             num_workers: Number of workers for data loading (auto-detected if None)
             pin_memory: Whether to pin memory for faster GPU transfer (auto-detected if None)
+            
+        Returns:
+            history: Dictionary containing training and validation metrics
         """
-        # Auto-detect optimal batch size for GPU
-        if batch_size is None:
-            if self.device.type == 'cuda':
-                # For A100/V100 GPUs, use larger batch sizes
-                memory_gb = torch.cuda.get_device_properties(self.device).total_memory / 1e9
-                if memory_gb >= 40:  # A100
-                    batch_size = 256
-                elif memory_gb >= 16:  # V100
-                    batch_size = 128
-                else:
-                    batch_size = 64
-            else:
-                batch_size = 32
+        # Initialize history dictionary to track metrics
+        history = {
+            'loss': [],
+            'accuracy': [],
+            'val_loss': [],
+            'val_accuracy': []
+        }
+        
+        # Determine if we're using DataLoaders or direct data
+        using_dataloaders = train_loader is not None
+        
+        # Auto-detect batch size if not provided
+        if batch_size is None and not using_dataloaders:
+            batch_size = 32  # Default for tabular data
         
         # Auto-detect optimal number of workers
         if num_workers is None:
             import os
-            num_workers = min(8, os.cpu_count() or 1)
+            num_workers = min(4, os.cpu_count() or 1)
         
         # Auto-detect pin_memory
         if pin_memory is None:
             pin_memory = self.device.type == 'cuda'
         
         if verbose > 0:
-            print("🚀 Training with optimized settings:")
+            print(f"🚀 Training {self.__class__.__name__} with {'DataLoader pipeline' if using_dataloaders else 'direct data'}:")
             print(f"   Device: {self.device}")
-            print(f"   Batch size: {batch_size}")
+            if using_dataloaders:
+                print(f"   Train batches: {len(train_loader)}")
+                if val_loader:
+                    print(f"   Val batches: {len(val_loader)}")
+            else:
+                print(f"   Batch size: {batch_size}")
             print(f"   Mixed precision: {self.use_mixed_precision}")
             print(f"   Workers: {num_workers}")
             print(f"   Pin memory: {pin_memory}")
         
-        # Move data to device efficiently
-        train_color_tensor = torch.tensor(train_color_data, dtype=torch.float32).to(self.device, non_blocking=True)
-        train_brightness_tensor = torch.tensor(train_brightness_data, dtype=torch.float32).to(self.device, non_blocking=True)
-        train_labels_tensor = torch.tensor(train_labels, dtype=torch.long).to(self.device, non_blocking=True)
-        
-        train_dataset = TensorDataset(train_color_tensor, train_brightness_tensor, train_labels_tensor)
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            shuffle=True,
-            num_workers=num_workers if self.device.type != 'mps' else 0,  # MPS doesn't support multiprocessing
-            pin_memory=pin_memory,
-            persistent_workers=num_workers > 0 and self.device.type != 'mps'
-        )
-        
-        if val_color_data is not None and val_brightness_data is not None and val_labels is not None:
-            val_color_tensor = torch.tensor(val_color_data, dtype=torch.float32).to(self.device, non_blocking=True)
-            val_brightness_tensor = torch.tensor(val_brightness_data, dtype=torch.float32).to(self.device, non_blocking=True)
-            val_labels_tensor = torch.tensor(val_labels, dtype=torch.long).to(self.device, non_blocking=True)
+        # Set up train and validation loaders based on input mode
+        if not using_dataloaders:
+            # Check that required data is provided when not using DataLoaders
+            if train_color_data is None or train_brightness_data is None or train_labels is None:
+                raise ValueError("When train_loader is not provided, you must provide train_color_data, train_brightness_data, and train_labels")
             
-            val_dataset = TensorDataset(val_color_tensor, val_brightness_tensor, val_labels_tensor)
-            val_loader = DataLoader(
-                val_dataset, 
+            # Create DataLoaders from direct data
+            train_color_tensor = torch.tensor(train_color_data, dtype=torch.float32)
+            train_brightness_tensor = torch.tensor(train_brightness_data, dtype=torch.float32)
+            train_labels_tensor = torch.tensor(train_labels, dtype=torch.long)
+            
+            train_dataset = TensorDataset(train_color_tensor, train_brightness_tensor, train_labels_tensor)
+            train_loader = DataLoader(
+                train_dataset, 
                 batch_size=batch_size, 
-                shuffle=False,
-                num_workers=num_workers if self.device.type != 'mps' else 0,  # MPS doesn't support multiprocessing
+                shuffle=True,
+                num_workers=num_workers if self.device.type != 'mps' else 0,
                 pin_memory=pin_memory,
                 persistent_workers=num_workers > 0 and self.device.type != 'mps'
             )
-        else:
-            val_loader = None
+            
+            # Set up validation loader if validation data is provided
+            if val_color_data is not None and val_brightness_data is not None and val_labels is not None:
+                val_color_tensor = torch.tensor(val_color_data, dtype=torch.float32)
+                val_brightness_tensor = torch.tensor(val_brightness_data, dtype=torch.float32)
+                val_labels_tensor = torch.tensor(val_labels, dtype=torch.long)
+                
+                val_dataset = TensorDataset(val_color_tensor, val_brightness_tensor, val_labels_tensor)
+                val_loader = DataLoader(
+                    val_dataset, 
+                    batch_size=batch_size, 
+                    shuffle=False,
+                    num_workers=num_workers if self.device.type != 'mps' else 0,
+                    pin_memory=pin_memory,
+                    persistent_workers=num_workers > 0 and self.device.type != 'mps'
+                )
         
-        # Optimizer and loss function
+        # Optimizer and loss function - use AdamW for better generalization
         optimizer = optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
         criterion = nn.CrossEntropyLoss()
         
-        # Learning rate scheduler for better convergence
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        # Learning rate scheduler setup
+        if scheduler_type.lower() == 'cosine':
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
+        elif scheduler_type.lower() == 'step':
+            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+        else:
+            scheduler = None
         
-        # Training loop with mixed precision
+        # Training loop
         best_val_loss = float('inf')
         patience_counter = 0
         
         for epoch in range(epochs):
-            # Single progress bar for training batches only
-            epoch_pbar = None
-            if verbose == 1:
-                # Clear any existing tqdm instances to avoid duplicate progress bars
-                try:
-                    # Force clear any existing progress bars to prevent duplication
-                    # Check if any existing progress bars are in the tqdm instances list
-                    for inst in list(getattr(tqdm, '_instances', [])):
-                        try:
-                            inst.close()
-                        except Exception:
-                            pass  # Ignore if we can't close an instance
-                except Exception:
-                    pass  # Ignore any errors in cleaning up tqdm instances
-                
-                # Create a new progress bar with appropriate settings to prevent duplication
-                epoch_pbar = tqdm(
-                    total=len(train_loader), 
-                    desc=f"Epoch {epoch+1}/{epochs}", 
-                    leave=True,  # Leave this progress bar after completion
-                    dynamic_ncols=True,  # Adapt to terminal width
-                    position=0,  # Keep it at position 0 (top)
-                    smoothing=0.3  # Smooth updates for better display
-                )
+            # Clear any existing tqdm instances
+            try:
+                for inst in list(getattr(tqdm, '_instances', [])):
+                    try:
+                        inst.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             
             # Training phase
             self.train()
-            total_loss = 0.0
+            train_loss = 0.0
             train_correct = 0
             train_total = 0
             
-            for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(train_loader):
+            # Create progress bar for training
+            train_pbar = None
+            if verbose == 1:
+                train_pbar = tqdm(
+                    total=len(train_loader), 
+                    desc=f"Epoch {epoch+1}/{epochs}", 
+                    leave=True
+                )
+            
+            for batch_idx, data in enumerate(train_loader):
+                # Unpack data - handle different formats
+                if isinstance(data, (list, tuple)) and len(data) == 3:
+                    color_batch, brightness_batch, labels_batch = data
+                else:
+                    raise ValueError("DataLoader must provide (color, brightness, labels) tuples")
+                
+                # Move data to device
+                color_batch = color_batch.to(self.device, non_blocking=True)
+                brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+                labels_batch = labels_batch.to(self.device, non_blocking=True)
+                
+                # For BaseMultiChannelNetwork, we need to reshape the data from (N, C, H, W) to (N, C*H*W)
+                if len(color_batch.shape) > 2:  # If data is in image format (N, C, H, W)
+                    color_batch = color_batch.reshape(color_batch.size(0), -1)
+                    brightness_batch = brightness_batch.reshape(brightness_batch.size(0), -1)
+                
+                # Forward pass
                 optimizer.zero_grad()
                 
                 if self.use_mixed_precision and self.scaler is not None:
-                    with autocast('cuda'):
-                        outputs = self(batch_color, batch_brightness)
-                        loss = criterion(outputs, batch_labels)
+                    with autocast("cuda" if torch.cuda.is_available() else "cpu"):
+                        outputs = self(color_batch, brightness_batch)
+                        loss = criterion(outputs, labels_batch)
                     
                     self.scaler.scale(loss).backward()
                     self.scaler.step(optimizer)
                     self.scaler.update()
                 else:
-                    outputs = self(batch_color, batch_brightness)
-                    loss = criterion(outputs, batch_labels)
+                    outputs = self(color_batch, brightness_batch)
+                    loss = criterion(outputs, labels_batch)
                     loss.backward()
                     optimizer.step()
                 
-                total_loss += loss.item()
+                # Calculate metrics
+                train_loss += loss.item()
+                _, predicted = outputs.max(1)
+                train_total += labels_batch.size(0)
+                train_correct += predicted.eq(labels_batch).sum().item()
                 
-                # Calculate training accuracy
-                _, predicted = torch.max(outputs.data, 1)
-                train_total += batch_labels.size(0)
-                train_correct += (predicted == batch_labels).sum().item()
-                
-                # Update progress bar with current training metrics
-                if verbose == 1 and epoch_pbar is not None:
-                    train_acc = train_correct / train_total
-                    epoch_pbar.set_postfix({
-                        'Loss': f'{total_loss/(batch_idx+1):.4f}',
-                        'Acc': f'{train_acc:.4f}'
+                # Update progress bar
+                if train_pbar is not None:
+                    train_pbar.set_postfix({
+                        'loss': train_loss / (batch_idx + 1), 
+                        'acc': 100. * train_correct / train_total
                     })
-                    epoch_pbar.update(1)
-                    # Force refresh the display
-                    epoch_pbar.refresh()
+                    train_pbar.update(1)
             
-            scheduler.step()
-            avg_train_loss = total_loss / len(train_loader)
+            # Close progress bar
+            if train_pbar is not None:
+                train_pbar.close()
+            
+            # Calculate epoch metrics
+            train_loss = train_loss / len(train_loader)
             train_accuracy = train_correct / train_total
+            history['loss'].append(train_loss)
+            history['accuracy'].append(train_accuracy)
+            
+            # Update learning rate scheduler
+            if scheduler is not None:
+                scheduler.step()
             
             # Validation phase
             if val_loader is not None:
-                self.eval()
-                total_val_loss = 0.0
+                val_loss = 0.0
                 val_correct = 0
                 val_total = 0
                 
+                self.eval()
+                val_pbar = None
+                if verbose == 1:
+                    val_pbar = tqdm(
+                        total=len(val_loader),
+                        desc="Validation",
+                        leave=False
+                    )
+                
                 with torch.no_grad():
-                    for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(val_loader):
-                        if self.use_mixed_precision and self.scaler is not None:
-                            with autocast('cuda'):
-                                outputs = self(batch_color, batch_brightness)
-                                loss = criterion(outputs, batch_labels)
+                    for batch_idx, data in enumerate(val_loader):
+                        # Unpack data - handle different formats
+                        if isinstance(data, (list, tuple)) and len(data) == 3:
+                            color_batch, brightness_batch, labels_batch = data
                         else:
-                            outputs = self(batch_color, batch_brightness)
-                            loss = criterion(outputs, batch_labels)
-                        total_val_loss += loss.item()
+                            raise ValueError("DataLoader must provide (color, brightness, labels) tuples")
                         
-                        # Calculate validation accuracy
-                        _, predicted = torch.max(outputs.data, 1)
-                        val_total += batch_labels.size(0)
-                        val_correct += (predicted == batch_labels).sum().item()
+                        # Move data to device
+                        color_batch = color_batch.to(self.device, non_blocking=True)
+                        brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+                        labels_batch = labels_batch.to(self.device, non_blocking=True)
+                        
+                        # For BaseMultiChannelNetwork, we need to reshape the data from (N, C, H, W) to (N, C*H*W)
+                        if len(color_batch.shape) > 2:  # If data is in image format (N, C, H, W)
+                            color_batch = color_batch.reshape(color_batch.size(0), -1)
+                            brightness_batch = brightness_batch.reshape(brightness_batch.size(0), -1)
+                        
+                        # Forward pass
+                        if self.use_mixed_precision and self.scaler is not None:
+                            with autocast("cuda" if torch.cuda.is_available() else "cpu"):
+                                outputs = self(color_batch, brightness_batch)
+                                loss = criterion(outputs, labels_batch)
+                        else:
+                            outputs = self(color_batch, brightness_batch)
+                            loss = criterion(outputs, labels_batch)
+                        
+                        # Calculate metrics
+                        val_loss += loss.item()
+                        _, predicted = outputs.max(1)
+                        val_total += labels_batch.size(0)
+                        val_correct += predicted.eq(labels_batch).sum().item()
+                        
+                        # Update progress bar
+                        if val_pbar is not None:
+                            val_pbar.set_postfix({
+                                'loss': val_loss / (batch_idx + 1), 
+                                'acc': 100. * val_correct / val_total
+                            })
+                            val_pbar.update(1)
                 
-                avg_val_loss = total_val_loss / len(val_loader)
+                # Close progress bar
+                if val_pbar is not None:
+                    val_pbar.close()
+                
+                # Calculate epoch validation metrics
+                val_loss = val_loss / len(val_loader)
                 val_accuracy = val_correct / val_total
+                history['val_loss'].append(val_loss)
+                history['val_accuracy'].append(val_accuracy)
                 
-                # Update progress bar with final validation metrics
-                if verbose == 1 and epoch_pbar is not None:
-                    epoch_pbar.set_postfix({
-                        'Loss': f'{avg_train_loss:.4f}',
-                        'Acc': f'{train_accuracy:.4f}',
-                        'Val_Loss': f'{avg_val_loss:.4f}',
-                        'Val_Acc': f'{val_accuracy:.4f}'
-                    })
-                    # Make sure to display the final metrics before closing
-                    epoch_pbar.refresh()
-            else:
-                # Training only - final update
-                if verbose == 1 and epoch_pbar is not None:
-                    epoch_pbar.set_postfix({
-                        'Loss': f'{avg_train_loss:.4f}',
-                        'Acc': f'{train_accuracy:.4f}'
-                    })
-                    # Make sure to display the final metrics
-                    epoch_pbar.refresh()
-                avg_val_loss = float('inf')  # For early stopping logic
-            
-            # Close progress bar and clear line to prevent duplication
-            if verbose == 1 and epoch_pbar is not None:
-                epoch_pbar.close()
-                print("\r\033[K", end="")  # Clear the current line
-            
-            # Early stopping check (only if validation data provided)
-            if val_loader is not None:
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
+                # Early stopping check
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    # Save best model state
+                    self.best_model_state = self.state_dict().copy()
                     patience_counter = 0
-                    # Save the best model
-                    self.save_model()
                 else:
                     patience_counter += 1
                 
+                # Print epoch summary
+                if verbose > 0:
+                    print(f"Epoch {epoch+1}/{epochs} - "
+                          f"Loss: {train_loss:.4f}, Acc: {train_accuracy:.4f}, "
+                          f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
+                
+                # Early stopping
                 if patience_counter >= early_stopping_patience:
                     if verbose > 0:
-                        print(f"Early stopping triggered. Stopping training at epoch {epoch + 1}.")
+                        print(f"Early stopping triggered after {epoch+1} epochs")
                     break
-            
-            # Print epoch summary
-            if verbose > 0:
-                if val_loader is not None:
-                    print(f"Epoch {epoch + 1}/{epochs} - "
-                          f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
-                          f"Val Loss: {avg_val_loss:.4f} - Val Acc: {val_accuracy:.4f} - "
-                          f"LR: {optimizer.param_groups[0]['lr']:.6f}")
-                else:
-                    print(f"Epoch {epoch + 1}/{epochs} - "
-                          f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
-                          f"LR: {optimizer.param_groups[0]['lr']:.6f}")
+            else:
+                # Print epoch summary without validation
+                if verbose > 0:
+                    print(f"Epoch {epoch+1}/{epochs} - "
+                          f"Loss: {train_loss:.4f}, Acc: {train_accuracy:.4f}")
         
-        # Clear cache after training
-        self.device_manager.clear_cache()
+        # Load best model if validation was performed
+        if val_loader is not None and hasattr(self, 'best_model_state'):
+            self.load_state_dict(self.best_model_state)
+            if verbose > 0:
+                print("Loaded best model state from early stopping")
+        
+        return history
     
 
 # Factory functions
 def base_multi_channel_small(
     *,  # Force keyword-only arguments for clarity
-    input_size: int = None, 
-    color_input_size: int = None,
-    brightness_input_size: int = None,
+    input_size: Optional[int] = None, 
+    color_input_size: Optional[int] = None,
+    brightness_input_size: Optional[int] = None,
     num_classes: int = 10, 
     **kwargs
 ) -> BaseMultiChannelNetwork:
@@ -708,12 +774,30 @@ def base_multi_channel_small(
 
 def base_multi_channel_medium(
     *,  # Force keyword-only arguments for clarity
-    input_size: int = None,
-    color_input_size: int = None,
-    brightness_input_size: int = None,
+    input_size: Optional[int] = None,
+    color_input_size: Optional[int] = None,
+    brightness_input_size: Optional[int] = None,
     num_classes: int = 10,
     **kwargs
 ) -> BaseMultiChannelNetwork:
+    """
+    Create a medium BaseMultiChannelNetwork.
+    
+    Args:
+        input_size: For backward compatibility - both streams use same input size
+        color_input_size: Input size for color stream
+        brightness_input_size: Input size for brightness stream
+        num_classes: Number of output classes
+        **kwargs: Additional arguments passed to BaseMultiChannelNetwork
+    """
+    return BaseMultiChannelNetwork(
+        input_size=input_size,
+        color_input_size=color_input_size,
+        brightness_input_size=brightness_input_size,
+        hidden_sizes=[512, 256, 128],
+        num_classes=num_classes,
+        **kwargs
+    )
     """
     Create a medium BaseMultiChannelNetwork.
     
@@ -747,9 +831,9 @@ def base_multi_channel_medium(
 
 def base_multi_channel_large(
     *,  # Force keyword-only arguments for clarity
-    input_size: int = None,
-    color_input_size: int = None,
-    brightness_input_size: int = None,
+    input_size: Optional[int] = None,
+    color_input_size: Optional[int] = None,
+    brightness_input_size: Optional[int] = None,
     num_classes: int = 10,
     **kwargs
 ) -> BaseMultiChannelNetwork:

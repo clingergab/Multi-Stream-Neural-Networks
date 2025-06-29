@@ -5,7 +5,7 @@ Base classes for Multi-Stream Neural Networks
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
-from torch import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch import optim
 from tqdm import tqdm
 import torch.nn as nn
@@ -206,7 +206,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
         
         # Mixed precision support
         use_mixed_precision = getattr(self, 'use_mixed_precision', False)
-        scaler = GradScaler('cuda') if use_mixed_precision else None
+        scaler = GradScaler() if use_mixed_precision else None
         
         # Training history
         history = {
@@ -241,7 +241,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
                 self.optimizer.zero_grad()
                 
                 if use_mixed_precision and scaler:
-                    with autocast('cuda'):
+                    with autocast("cuda" if torch.cuda.is_available() else "cpu"):
                         outputs = self(batch_color, batch_brightness)
                         loss = self.criterion(outputs, batch_labels)
                     
@@ -295,7 +295,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
                         batch_labels = batch_labels.to(device, non_blocking=True)
                         
                         if use_mixed_precision:
-                            with autocast('cuda'):
+                            with autocast("cuda" if torch.cuda.is_available() else "cpu"):
                                 outputs = self(batch_color, batch_brightness)
                                 loss = self.criterion(outputs, batch_labels)
                         else:
@@ -443,7 +443,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
         with torch.no_grad():
             for batch_color, batch_brightness in loader:
                 if self.use_mixed_precision:
-                    with autocast('cuda'):
+                    with autocast("cuda" if torch.cuda.is_available() else "cpu"):
                         outputs = self(batch_color, batch_brightness)
                 else:
                     outputs = self(batch_color, batch_brightness)

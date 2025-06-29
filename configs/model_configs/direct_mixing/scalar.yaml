@@ -1,0 +1,44 @@
+# Direct Mixing - Scalar Configuration
+# This configuration extends the base configuration for scalar mixing variant
+
+# Extend the base configuration
+extends: "configs/base_config.yaml"
+
+# Model-specific overrides
+model:
+  model_type: "direct_mixing"
+  variant: "scalar"
+  hidden_size: 512
+  num_classes: 100  # For CIFAR-100
+  
+  # Integration parameters
+  alpha_init: 1.0
+  beta_init: 1.0
+  gamma_init: 0.2
+  
+  # Scalar mixing specific parameters
+  use_learnable_weights: true
+  normalize_weights: true
+  fusion_activation: "sigmoid"
+
+# Training configuration
+training:
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  epochs: 100
+  optimizer: "adam"
+  scheduler: "cosine"
+
+# Data configuration override
+data:
+  dataset: "cifar100"
+  augmentation: true
+  
+  # CIFAR-100 specific preprocessing
+  cifar_brightness_mode: "luminance"  # Options: luminance, grayscale, value
+  
+# Evaluation settings
+evaluation:
+  metrics: ["accuracy", "top5_accuracy", "loss"]
+  compute_pathway_importance: true

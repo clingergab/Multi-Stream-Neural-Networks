@@ -29,7 +29,8 @@ class BaseAugmentation:
         gaussian_noise_std: float = 0.02,
         cutout_prob: float = 0.5,
         cutout_size: int = 8,
-        enabled: bool = True
+        enabled: bool = True,
+        apply_to_brightness: bool = False
     ):
         """
         Initialize base augmentation parameters.
@@ -44,6 +45,7 @@ class BaseAugmentation:
             cutout_prob: Probability of applying cutout
             cutout_size: Size of cutout square
             enabled: Whether augmentation is enabled
+            apply_to_brightness: Whether to apply same transformations to brightness channel
         """
         self.horizontal_flip_prob = horizontal_flip_prob
         self.rotation_degrees = rotation_degrees
@@ -54,6 +56,7 @@ class BaseAugmentation:
         self.cutout_prob = cutout_prob
         self.cutout_size = cutout_size
         self.enabled = enabled
+        self.apply_to_brightness = apply_to_brightness
         
         # Create torchvision transforms for color jittering
         self.color_jitter = transforms.ColorJitter(
@@ -73,19 +76,37 @@ class BaseAugmentation:
         print(f"   Cutout: {cutout_prob} prob, {cutout_size}px")
         print(f"   Enabled: {enabled}")
     
-    def __call__(self, image: torch.Tensor) -> torch.Tensor:
+    def __call__(self, image: torch.Tensor, brightness: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Apply augmentation to a single image.
+        Apply augmentation to an image or a pair of color and brightness images.
         
         Args:
             image: Input image tensor [C, H, W] or [B, C, H, W]
+            brightness: Optional brightness tensor with same shape as image
             
         Returns:
-            Augmented image tensor with same shape
+            Augmented image tensor, or a tuple of (augmented_image, augmented_brightness)
         """
         if not self.enabled:
+            if brightness is not None:
+                return image, brightness
             return image
         
+        # Transform color image
+        augmented_image = self._transform_single_image(image)
+        
+        # If brightness is provided and apply_to_brightness is True, transform it as well
+        if brightness is not None:
+            if self.apply_to_brightness:
+                augmented_brightness = self._transform_single_image(brightness)
+            else:
+                augmented_brightness = brightness
+            return augmented_image, augmented_brightness
+        
+        return augmented_image
+        
+    def _transform_single_image(self, image: torch.Tensor) -> torch.Tensor:
+        """Internal method to transform a single image tensor."""
         # Handle batch dimension
         is_batch = len(image.shape) == 4
         if not is_batch:
@@ -221,17 +242,22 @@ class CIFAR100Augmentation(BaseAugmentation):
     specifically tuned for CIFAR-100's 32x32 image resolution.
     """
     
-    def __init__(self, **kwargs):
+    def __init__(self, apply_to_brightness=False, **kwargs):
         """
         Initialize CIFAR-100 specific augmentation.
         
         Default values are tuned for CIFAR-100's 32x32 images.
+        
+        Args:
+            apply_to_brightness: Whether to apply same transformations to brightness channel
+            **kwargs: Additional arguments passed to BaseAugmentation
         """
         # CIFAR-100 specific defaults
         cifar_defaults = {
             'rotation_degrees': 15.0,  # Limited rotation for small images
             'translate_range': 0.1,    # Small translation (3-4 pixels)
             'cutout_size': 8,          # 8x8 pixel cutout (25% of image)
+            'apply_to_brightness': apply_to_brightness,  # Explicitly pass this parameter
         }
         
         # Update with CIFAR-100 defaults if not specified
@@ -241,6 +267,8 @@ class CIFAR100Augmentation(BaseAugmentation):
                 
         super().__init__(**kwargs)
         print("   Dataset: CIFAR-100 (32x32 images)")
+        if apply_to_brightness:
+            print("   Applying transformations to brightness channel")
 
 
 class ImageNetAugmentation(BaseAugmentation):
@@ -251,18 +279,23 @@ class ImageNetAugmentation(BaseAugmentation):
     tuned for ImageNet's larger resolution images.
     """
     
-    def __init__(self, **kwargs):
+    def __init__(self, apply_to_brightness=False, **kwargs):
         """
         Initialize ImageNet specific augmentation.
         
         Default values are tuned for ImageNet's larger images.
+        
+        Args:
+            apply_to_brightness: Whether to apply same transformations to brightness channel
+            **kwargs: Additional arguments passed to BaseAugmentation
         """
         # ImageNet specific defaults
         imagenet_defaults = {
             'rotation_degrees': 20.0,    # More rotation for larger images
             'translate_range': 0.05,     # Smaller relative translation
             'cutout_size': 56,           # Larger cutout for higher resolution
-            'color_jitter_strength': 0.5  # Stronger color augmentation
+            'color_jitter_strength': 0.5,  # Stronger color augmentation
+            'apply_to_brightness': apply_to_brightness,  # Explicitly pass this parameter
         }
         
         # Update with ImageNet defaults if not specified
@@ -272,6 +305,8 @@ class ImageNetAugmentation(BaseAugmentation):
                 
         super().__init__(**kwargs)
         print("   Dataset: ImageNet (224x224 images)")
+        if apply_to_brightness:
+            print("   Applying transformations to brightness channel")
 
 
 class MixUp:
