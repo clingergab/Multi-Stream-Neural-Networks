@@ -3,7 +3,7 @@ Simple test script for autocast and GradScaler usage
 """
 
 import torch
-from torch import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # Create a small model
 model = torch.nn.Linear(10, 1)
