@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from torch import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Union
