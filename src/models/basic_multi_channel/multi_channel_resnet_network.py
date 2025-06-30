@@ -708,14 +708,14 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     # Track gradient norm for debugging
                     if self.debug_mode:
                         self.scaler.unscale_(optimizer)
-                        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=float('inf'))
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), float('inf'))
                         epoch_grad_norm += grad_norm.item()
                         num_batches += 1
                     
                     # Apply gradient clipping
                     if max_grad_norm > 0:
                         self.scaler.unscale_(optimizer)  # Unscale before clipping
-                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
                     
                     # Step optimizer with scaler
                     self.scaler.step(optimizer)
@@ -728,13 +728,13 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     
                     # Track gradient norm for debugging
                     if self.debug_mode:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=float('inf'))
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), float('inf'))
                         epoch_grad_norm += grad_norm.item()
                         num_batches += 1
                     
                     # Apply gradient clipping
                     if max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
                     
                     # Step optimizer
                     optimizer.step()
