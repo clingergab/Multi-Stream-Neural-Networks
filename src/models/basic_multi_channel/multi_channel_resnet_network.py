@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import GradScaler, autocast
-import numpy as np
 import os
 from typing import List, Tuple, Dict
 from tqdm import tqdm
@@ -86,6 +85,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         dropout: float = 0.0,  
         use_shared_classifier: bool = True,
         device: str = 'auto',
+        reduce_architecture: bool = True,  # For small datasets like CIFAR, reduce architecture complexity
         **kwargs
     ):
         
@@ -104,6 +104,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         self.activation = activation
         self.dropout = dropout
         self.use_shared_classifier = use_shared_classifier
+        self.reduce_architecture = reduce_architecture
         
         # Setup device management with proper detection
         self.device_manager = DeviceManager(preferred_device=device if device != 'auto' else None)
@@ -148,15 +149,18 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
     def _build_network(self):
         """Build the ResNet network with optimized architecture for different input channels."""
         # Initial layers (stem) - OPTIMIZED: use different input channels!
+        # For CIFAR-100, a smaller kernel and stride works better than ImageNet-style (7x7, stride 2)
         self.conv1 = MultiChannelConv2d(
             color_in_channels=self.color_input_channels,        # 3 for RGB
             brightness_in_channels=self.brightness_input_channels,  # 1 for brightness - efficient!
             out_channels=64, 
-            kernel_size=7, stride=2, padding=3, bias=False
+            kernel_size=3, stride=1, padding=1, bias=False  # Smaller kernel and no stride for small images
         )
         self.bn1 = MultiChannelBatchNorm2d(64)
         self.activation_initial = MultiChannelActivation(self.activation, inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        # Optional maxpool - for CIFAR, sometimes skipping initial maxpool helps
+        # Since CIFAR images are only 32x32, aggressive downsampling can hurt performance
+        self.maxpool = nn.Identity() if self.reduce_architecture else nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         
         # ResNet layers with proper channel progression
         self.layer1 = self._make_layer(64, self.num_blocks[0], stride=1)
@@ -189,11 +193,11 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             self.brightness_classifier = nn.Linear(final_features, self.num_classes)
             
         # Adjust batch normalization momentum for all BatchNorm layers
-        # Use a smaller momentum value for more stable updates
+        # Use a standard momentum value for more predictable updates
         for module in self.modules():
             if isinstance(module, MultiChannelBatchNorm2d):
-                module.color_bn.momentum = 0.05  # Lower momentum for more stable updates
-                module.brightness_bn.momentum = 0.05  # Lower momentum for more stable updates
+                module.color_bn.momentum = 0.1  # Standard PyTorch default
+                module.brightness_bn.momentum = 0.1  # Standard PyTorch default
     
     def _make_layer(self, planes: int, blocks: int, stride: int = 1) -> MultiChannelSequential:
         """
@@ -257,9 +261,9 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             elif isinstance(module, MultiChannelBatchNorm2d):
                 # Initialize both color and brightness batch norm with slightly higher initial values
                 # for better gradient flow in early training
-                nn.init.constant_(module.color_bn.weight, 1.1)
+                nn.init.constant_(module.color_bn.weight, 1.0)  # Standard value is more stable
                 nn.init.constant_(module.color_bn.bias, 0.0)
-                nn.init.constant_(module.brightness_bn.weight, 1.1)
+                nn.init.constant_(module.brightness_bn.weight, 1.0)
                 nn.init.constant_(module.brightness_bn.bias, 0.0)
             elif isinstance(module, nn.Linear):
                 # Use Xavier initialization for fully connected layers
@@ -530,7 +534,8 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             train_loader=None, val_loader=None, batch_size=None, epochs=10,
             learning_rate=None, weight_decay=0.0001, early_stopping_patience=5,
             scheduler_type='cosine', min_lr=1e-6, verbose=1, 
-            num_workers=None, pin_memory=None, max_grad_norm=1.0) -> Dict[str, List[float]]:
+            num_workers=None, pin_memory=None, max_grad_norm=1.0,
+            weight_decay_strategy='constant', final_weight_decay=0.01) -> Dict[str, List[float]]:
         """
         Unified fit method that handles both direct data arrays and DataLoaders with on-the-fly augmentation.
         
@@ -616,7 +621,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         # Auto-detect pin_memory
         if pin_memory is None:
             pin_memory = self.device.type == 'cuda'
-        
+            
         if verbose > 0:
             print(f"🚀 Training {self.__class__.__name__} with {'DataLoader pipeline' if using_dataloaders else 'direct data'}:")
             print(f"   Device: {self.device}")
@@ -630,8 +635,9 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             print(f"   Workers: {num_workers}")
             print(f"   Pin memory: {pin_memory}")
             print(f"   Gradient clipping: {max_grad_norm}")
-            print(f"   Weight decay: {weight_decay}")
+            print(f"   Initial weight decay: {weight_decay} (strategy: {weight_decay_strategy})")
             print(f"   Learning rate: {learning_rate}")
+            print(f"   Reduced architecture: {self.reduce_architecture}")
         
         # Set up train and validation loaders based on input mode
         if not using_dataloaders:
@@ -727,6 +733,18 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         patience_counter = 0
         
         for epoch in range(epochs):
+            # Update weight decay for better regularization
+            current_weight_decay = self._update_weight_decay(
+                optimizer, epoch, epochs, 
+                initial_weight_decay=weight_decay,
+                final_weight_decay=final_weight_decay, 
+                strategy=weight_decay_strategy
+            )
+            
+            # Apply updated weight decay
+            for param_group in optimizer.param_groups:
+                param_group['weight_decay'] = current_weight_decay
+                
             # Clear any existing tqdm instances
             try:
                 for inst in list(getattr(tqdm, '_instances', [])):
@@ -1031,6 +1049,140 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         
         # Return the history dictionary with training metrics
         return history
+    
+    def find_learning_rate(self, train_loader, start_lr=1e-7, end_lr=10, num_iter=100, 
+                        smoothing=0.05, plot=True):
+        """
+        Learning rate finder to determine optimal learning rate.
+        Uses the technique described in the 2015 paper "Cyclical Learning Rates for Training Neural Networks"
+        by Leslie N. Smith and implemented in the fastai library.
+        
+        Args:
+            train_loader: DataLoader for training data
+            start_lr: Starting learning rate
+            end_lr: Ending learning rate
+            num_iter: Number of iterations to run
+            smoothing: Amount of smoothing to apply to the loss curve
+            plot: Whether to generate and display a plot
+            
+        Returns:
+            Dictionary with learning rates and corresponding losses
+        """
+        import matplotlib.pyplot as plt
+        
+        # Initialize optimizer with start_lr
+        optimizer = optim.AdamW(self.parameters(), lr=start_lr)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Calculate the multiplication factor for each update
+        mult = (end_lr / start_lr) ** (1 / num_iter)
+        
+        # Lists to store learning rates and losses
+        lrs = []
+        losses = []
+        best_loss = float('inf')
+        avg_loss = 0.0
+        beta = smoothing  # Smoothing factor
+        
+        # Set model to training mode
+        self.train()
+        
+        # Run the learning rate finder
+        batch_num = 0
+        for data in train_loader:
+            if len(data) == 3:
+                batch_color, batch_brightness, batch_labels = data
+            else:
+                raise ValueError("DataLoader must provide (color, brightness, labels) tuples")
+            
+            # Move data to device
+            batch_color = batch_color.to(self.device)
+            batch_brightness = batch_brightness.to(self.device)
+            batch_labels = batch_labels.to(self.device)
+            
+            # Get the current learning rate
+            lr = optimizer.param_groups[0]['lr']
+            lrs.append(lr)
+            
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            # Forward pass
+            outputs = self(batch_color, batch_brightness)
+            loss = criterion(outputs, batch_labels)
+            
+            # Calculate smoothed loss
+            if batch_num == 0:
+                avg_loss = loss.item()
+            else:
+                avg_loss = beta * loss.item() + (1 - beta) * avg_loss
+                
+            # Record the loss
+            losses.append(avg_loss / (1 - beta ** (batch_num + 1)))
+            
+            # Check if loss is getting too large
+            if batch_num > 0 and loss.item() > 4 * best_loss:
+                break
+                
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                
+            # Backward pass
+            loss.backward()
+            
+            # Step optimizer
+            optimizer.step()
+            
+            # Update learning rate
+            optimizer.param_groups[0]['lr'] *= mult
+            
+            batch_num += 1
+            if batch_num >= num_iter:
+                break
+                
+        # Plot the learning rate vs loss
+        if plot:
+            plt.figure(figsize=(10, 6))
+            plt.semilogx(lrs, losses)
+            plt.xlabel('Learning rate')
+            plt.ylabel('Loss')
+            plt.title('Learning rate finder')
+            plt.grid(True, alpha=0.3)
+            plt.show()
+            
+        return {'lr': lrs, 'loss': losses}
+    
+    def _update_weight_decay(self, optimizer, epoch, max_epochs, initial_weight_decay=0.0001, 
+                        final_weight_decay=0.01, strategy='linear'):
+        """
+        Update weight decay during training to provide better regularization.
+        
+        Args:
+            optimizer: Optimizer instance (usually AdamW)
+            epoch: Current epoch number
+            max_epochs: Total number of epochs
+            initial_weight_decay: Starting weight decay value
+            final_weight_decay: Ending weight decay value
+            strategy: How to schedule the weight decay ('linear', 'cosine', or 'constant')
+            
+        Returns:
+            Current weight decay value
+        """
+        if strategy == 'constant':
+            return initial_weight_decay
+        
+        if strategy == 'linear':
+            # Linear increase in weight decay
+            return initial_weight_decay + (final_weight_decay - initial_weight_decay) * (epoch / max_epochs)
+        
+        if strategy == 'cosine':
+            # Cosine schedule (slower increase at beginning and end, faster in middle)
+            import math
+            cos_out = math.cos(math.pi * epoch / max_epochs) + 1
+            return final_weight_decay - (final_weight_decay - initial_weight_decay) / 2 * cos_out
+            
+        # Default to constant if unknown strategy
+        return initial_weight_decay
 
 
 # Factory functions following ResNet naming conventions
@@ -1080,6 +1232,18 @@ def multi_channel_resnet152(num_classes: int = 10, **kwargs) -> MultiChannelResN
         num_classes=num_classes,
         num_blocks=[3, 8, 36, 3],
         block_type='bottleneck',
+        **kwargs
+    )
+
+
+def multi_channel_resnet18_cifar(num_classes: int = 100, **kwargs) -> MultiChannelResNetNetwork:
+    """Create a Multi-Channel ResNet-18 optimized for CIFAR-100."""
+    return MultiChannelResNetNetwork(
+        num_classes=num_classes,
+        num_blocks=[2, 2, 2, 2],
+        block_type='basic',
+        reduce_architecture=True,
+        dropout=0.3,  # Add dropout for CIFAR to prevent overfitting
         **kwargs
     )
 
