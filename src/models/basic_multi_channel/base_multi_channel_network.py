@@ -612,7 +612,7 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                 optimizer.zero_grad()
                 
                 if self.use_mixed_precision and self.scaler is not None:
-                    with autocast():
+                    with torch.cuda.amp.autocast():
                         outputs = self(color_batch, brightness_batch)
                         loss = criterion(outputs, labels_batch)
                     
@@ -691,7 +691,7 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                         
                         # Forward pass
                         if self.use_mixed_precision and self.scaler is not None:
-                            with autocast():
+                            with torch.cuda.amp.autocast():
                                 outputs = self(color_batch, brightness_batch)
                                 loss = criterion(outputs, labels_batch)
                         else:

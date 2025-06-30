@@ -241,7 +241,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
                 self.optimizer.zero_grad()
                 
                 if use_mixed_precision and scaler:
-                    with autocast():
+                    with torch.cuda.amp.autocast():
                         outputs = self(batch_color, batch_brightness)
                         loss = self.criterion(outputs, batch_labels)
                     
@@ -295,7 +295,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
                         batch_labels = batch_labels.to(device, non_blocking=True)
                         
                         if use_mixed_precision:
-                            with autocast():
+                            with torch.cuda.amp.autocast():
                                 outputs = self(batch_color, batch_brightness)
                                 loss = self.criterion(outputs, batch_labels)
                         else:
@@ -443,7 +443,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
         with torch.no_grad():
             for batch_color, batch_brightness in loader:
                 if self.use_mixed_precision:
-                    with autocast():
+                    with torch.cuda.amp.autocast():
                         outputs = self(batch_color, batch_brightness)
                 else:
                     outputs = self(batch_color, batch_brightness)
