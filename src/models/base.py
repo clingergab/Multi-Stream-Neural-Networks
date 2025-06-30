@@ -5,7 +5,7 @@ Base classes for Multi-Stream Neural Networks
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch import optim
 from tqdm import tqdm
 import torch.nn as nn
@@ -155,222 +155,222 @@ class BaseMultiStreamModel(nn.Module, ABC):
         """
         raise NotImplementedError("Subclasses must implement fit() method.")
     
-    def fit_dataloader(
-        self,
-        train_loader: "DataLoader",
-        val_loader: Optional["DataLoader"] = None,
-        epochs: int = 10,
-        early_stopping_patience: int = 5,
-        scheduler_type: str = 'cosine',
-        min_lr: float = 1e-6,
-        verbose: int = 1
-    ) -> Dict[str, List[float]]:
-        """
-        Fit the model using pre-configured DataLoaders (for augmented training).
+    # def fit_dataloader(
+    #     self,
+    #     train_loader: "DataLoader",
+    #     val_loader: Optional["DataLoader"] = None,
+    #     epochs: int = 10,
+    #     early_stopping_patience: int = 5,
+    #     scheduler_type: str = 'cosine',
+    #     min_lr: float = 1e-6,
+    #     verbose: int = 1
+    # ) -> Dict[str, List[float]]:
+    #     """
+    #     Fit the model using pre-configured DataLoaders (for augmented training).
         
-        This method provides a unified training interface for all model types
-        and handles augmented DataLoaders seamlessly.
+    #     This method provides a unified training interface for all model types
+    #     and handles augmented DataLoaders seamlessly.
         
-        Args:
-            train_loader: Training DataLoader (with optional augmentation)
-            val_loader: Validation DataLoader (optional)
-            epochs: Number of epochs to train
-            early_stopping_patience: Patience for early stopping
-            scheduler_type: Learning rate scheduler type ('cosine', 'step', 'none')
-            min_lr: Minimum learning rate for cosine annealing
-            verbose: Verbosity level (0: silent, 1: progress bar, 2: detailed)
+    #     Args:
+    #         train_loader: Training DataLoader (with optional augmentation)
+    #         val_loader: Validation DataLoader (optional)
+    #         epochs: Number of epochs to train
+    #         early_stopping_patience: Patience for early stopping
+    #         scheduler_type: Learning rate scheduler type ('cosine', 'step', 'none')
+    #         min_lr: Minimum learning rate for cosine annealing
+    #         verbose: Verbosity level (0: silent, 1: progress bar, 2: detailed)
             
-        Returns:
-            Training history dictionary with losses and accuracies
-        """
-        if not self.is_compiled:
-            raise RuntimeError("Model must be compiled before training. Call model.compile() first.")
+    #     Returns:
+    #         Training history dictionary with losses and accuracies
+    #     """
+    #     if not self.is_compiled:
+    #         raise RuntimeError("Model must be compiled before training. Call model.compile() first.")
                 
-        if verbose > 0:
-            model_name = self.__class__.__name__
-            print(f"🚀 Training {model_name} with enhanced DataLoader pipeline:")
-            print(f"   Device: {getattr(self, 'device', 'cpu')}")
-            print(f"   Mixed precision: {getattr(self, 'use_mixed_precision', False)}")
-            print(f"   Train batches: {len(train_loader)}")
-            if val_loader:
-                print(f"   Val batches: {len(val_loader)}")
-            print(f"   Scheduler: {scheduler_type}")
+    #     if verbose > 0:
+    #         model_name = self.__class__.__name__
+    #         print(f"🚀 Training {model_name} with enhanced DataLoader pipeline:")
+    #         print(f"   Device: {getattr(self, 'device', 'cpu')}")
+    #         print(f"   Mixed precision: {getattr(self, 'use_mixed_precision', False)}")
+    #         print(f"   Train batches: {len(train_loader)}")
+    #         if val_loader:
+    #             print(f"   Val batches: {len(val_loader)}")
+    #         print(f"   Scheduler: {scheduler_type}")
         
-        # Setup learning rate scheduler
-        if scheduler_type.lower() == 'cosine':
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=min_lr)
-        elif scheduler_type.lower() == 'step':
-            scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=epochs//3, gamma=0.1)
-        else:
-            scheduler = None
+    #     # Setup learning rate scheduler
+    #     if scheduler_type.lower() == 'cosine':
+    #         scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=min_lr)
+    #     elif scheduler_type.lower() == 'step':
+    #         scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=epochs//3, gamma=0.1)
+    #     else:
+    #         scheduler = None
         
-        # Mixed precision support
-        use_mixed_precision = getattr(self, 'use_mixed_precision', False)
-        scaler = GradScaler() if use_mixed_precision else None
+    #     # Mixed precision support
+    #     use_mixed_precision = getattr(self, 'use_mixed_precision', False)
+    #     scaler = GradScaler() if use_mixed_precision else None
         
-        # Training history
-        history = {
-            'train_loss': [],
-            'train_accuracy': [],
-            'val_loss': [],
-            'val_accuracy': []
-        }
+    #     # Training history
+    #     history = {
+    #         'train_loss': [],
+    #         'train_accuracy': [],
+    #         'val_loss': [],
+    #         'val_accuracy': []
+    #     }
         
-        # Training loop with enhanced tracking
-        best_val_loss = float('inf')
-        patience_counter = 0
-        device = getattr(self, 'device', torch.device('cpu'))
+    #     # Training loop with enhanced tracking
+    #     best_val_loss = float('inf')
+    #     patience_counter = 0
+    #     device = getattr(self, 'device', torch.device('cpu'))
         
-        for epoch in range(epochs):
-            # Single progress bar for training batches only
-            if verbose == 1:
-                epoch_pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+    #     for epoch in range(epochs):
+    #         # Single progress bar for training batches only
+    #         if verbose == 1:
+    #             epoch_pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}", leave=False)
             
-            # Training phase
-            self.train()
-            total_loss = 0.0
-            train_correct = 0
-            train_total = 0
+    #         # Training phase
+    #         self.train()
+    #         total_loss = 0.0
+    #         train_correct = 0
+    #         train_total = 0
             
-            for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(train_loader):
-                # Move data to device
-                batch_color = batch_color.to(device, non_blocking=True)
-                batch_brightness = batch_brightness.to(device, non_blocking=True)
-                batch_labels = batch_labels.to(device, non_blocking=True)
+    #         for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(train_loader):
+    #             # Move data to device
+    #             batch_color = batch_color.to(device, non_blocking=True)
+    #             batch_brightness = batch_brightness.to(device, non_blocking=True)
+    #             batch_labels = batch_labels.to(device, non_blocking=True)
                 
-                self.optimizer.zero_grad()
+    #             self.optimizer.zero_grad()
                 
-                if use_mixed_precision and scaler:
-                    with torch.cuda.amp.autocast():
-                        outputs = self(batch_color, batch_brightness)
-                        loss = self.criterion(outputs, batch_labels)
+    #             if use_mixed_precision and scaler:
+    #                 with torch.cuda.amp.autocast():
+    #                     outputs = self(batch_color, batch_brightness)
+    #                     loss = self.criterion(outputs, batch_labels)
                     
-                    scaler.scale(loss).backward()
-                    scaler.step(self.optimizer)
-                    scaler.update()
-                else:
-                    outputs = self(batch_color, batch_brightness)
-                    loss = self.criterion(outputs, batch_labels)
-                    loss.backward()
-                    self.optimizer.step()
+    #                 scaler.scale(loss).backward()
+    #                 scaler.step(self.optimizer)
+    #                 scaler.update()
+    #             else:
+    #                 outputs = self(batch_color, batch_brightness)
+    #                 loss = self.criterion(outputs, batch_labels)
+    #                 loss.backward()
+    #                 self.optimizer.step()
                 
-                total_loss += loss.item()
+    #             total_loss += loss.item()
                 
-                # Calculate training accuracy
-                _, predicted = torch.max(outputs.data, 1)
-                train_total += batch_labels.size(0)
-                train_correct += (predicted == batch_labels).sum().item()
+    #             # Calculate training accuracy
+    #             _, predicted = torch.max(outputs.data, 1)
+    #             train_total += batch_labels.size(0)
+    #             train_correct += (predicted == batch_labels).sum().item()
                 
-                # Update progress bar with current training metrics
-                if verbose == 1:
-                    train_acc = train_correct / train_total
-                    epoch_pbar.set_postfix({
-                        'Loss': f'{total_loss/(batch_idx+1):.4f}',
-                        'Acc': f'{train_acc:.4f}'
-                    })
-                    epoch_pbar.update(1)
+    #             # Update progress bar with current training metrics
+    #             if verbose == 1:
+    #                 train_acc = train_correct / train_total
+    #                 epoch_pbar.set_postfix({
+    #                     'Loss': f'{total_loss/(batch_idx+1):.4f}',
+    #                     'Acc': f'{train_acc:.4f}'
+    #                 })
+    #                 epoch_pbar.update(1)
             
-            if scheduler:
-                scheduler.step()
+    #         if scheduler:
+    #             scheduler.step()
             
-            avg_train_loss = total_loss / len(train_loader)
-            train_accuracy = train_correct / train_total
+    #         avg_train_loss = total_loss / len(train_loader)
+    #         train_accuracy = train_correct / train_total
             
-            # Store training metrics
-            history['train_loss'].append(avg_train_loss)
-            history['train_accuracy'].append(train_accuracy)
+    #         # Store training metrics
+    #         history['train_loss'].append(avg_train_loss)
+    #         history['train_accuracy'].append(train_accuracy)
             
-            # Validation phase
-            if val_loader is not None:
-                self.eval()
-                total_val_loss = 0.0
-                val_correct = 0
-                val_total = 0
+    #         # Validation phase
+    #         if val_loader is not None:
+    #             self.eval()
+    #             total_val_loss = 0.0
+    #             val_correct = 0
+    #             val_total = 0
                 
-                with torch.no_grad():
-                    for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(val_loader):
-                        # Move data to device
-                        batch_color = batch_color.to(device, non_blocking=True)
-                        batch_brightness = batch_brightness.to(device, non_blocking=True)
-                        batch_labels = batch_labels.to(device, non_blocking=True)
+    #             with torch.no_grad():
+    #                 for batch_idx, (batch_color, batch_brightness, batch_labels) in enumerate(val_loader):
+    #                     # Move data to device
+    #                     batch_color = batch_color.to(device, non_blocking=True)
+    #                     batch_brightness = batch_brightness.to(device, non_blocking=True)
+    #                     batch_labels = batch_labels.to(device, non_blocking=True)
                         
-                        if use_mixed_precision:
-                            with torch.cuda.amp.autocast():
-                                outputs = self(batch_color, batch_brightness)
-                                loss = self.criterion(outputs, batch_labels)
-                        else:
-                            outputs = self(batch_color, batch_brightness)
-                            loss = self.criterion(outputs, batch_labels)
-                        total_val_loss += loss.item()
+    #                     if use_mixed_precision:
+    #                         with torch.cuda.amp.autocast():
+    #                             outputs = self(batch_color, batch_brightness)
+    #                             loss = self.criterion(outputs, batch_labels)
+    #                     else:
+    #                         outputs = self(batch_color, batch_brightness)
+    #                         loss = self.criterion(outputs, batch_labels)
+    #                     total_val_loss += loss.item()
                         
-                        # Calculate validation accuracy
-                        _, predicted = torch.max(outputs.data, 1)
-                        val_total += batch_labels.size(0)
-                        val_correct += (predicted == batch_labels).sum().item()
+    #                     # Calculate validation accuracy
+    #                     _, predicted = torch.max(outputs.data, 1)
+    #                     val_total += batch_labels.size(0)
+    #                     val_correct += (predicted == batch_labels).sum().item()
                 
-                avg_val_loss = total_val_loss / len(val_loader)
-                val_accuracy = val_correct / val_total
+    #             avg_val_loss = total_val_loss / len(val_loader)
+    #             val_accuracy = val_correct / val_total
                 
-                # Store validation metrics
-                history['val_loss'].append(avg_val_loss)
-                history['val_accuracy'].append(val_accuracy)
+    #             # Store validation metrics
+    #             history['val_loss'].append(avg_val_loss)
+    #             history['val_accuracy'].append(val_accuracy)
                 
-                # Update progress bar with final validation metrics
-                if verbose == 1:
-                    epoch_pbar.set_postfix({
-                        'Loss': f'{avg_train_loss:.4f}',
-                        'Acc': f'{train_accuracy:.4f}',
-                        'Val_Loss': f'{avg_val_loss:.4f}',
-                        'Val_Acc': f'{val_accuracy:.4f}'
-                    })
-            else:
-                # Training only - final update
-                if verbose == 1:
-                    epoch_pbar.set_postfix({
-                        'Loss': f'{avg_train_loss:.4f}',
-                        'Acc': f'{train_accuracy:.4f}'
-                    })
-                avg_val_loss = float('inf')  # For early stopping logic
-                history['val_loss'].append(float('nan'))
-                history['val_accuracy'].append(float('nan'))
+    #             # Update progress bar with final validation metrics
+    #             if verbose == 1:
+    #                 epoch_pbar.set_postfix({
+    #                     'Loss': f'{avg_train_loss:.4f}',
+    #                     'Acc': f'{train_accuracy:.4f}',
+    #                     'Val_Loss': f'{avg_val_loss:.4f}',
+    #                     'Val_Acc': f'{val_accuracy:.4f}'
+    #                 })
+    #         else:
+    #             # Training only - final update
+    #             if verbose == 1:
+    #                 epoch_pbar.set_postfix({
+    #                     'Loss': f'{avg_train_loss:.4f}',
+    #                     'Acc': f'{train_accuracy:.4f}'
+    #                 })
+    #             avg_val_loss = float('inf')  # For early stopping logic
+    #             history['val_loss'].append(float('nan'))
+    #             history['val_accuracy'].append(float('nan'))
             
-            # Close progress bar
-            if verbose == 1:
-                epoch_pbar.close()
+    #         # Close progress bar
+    #         if verbose == 1:
+    #             epoch_pbar.close()
             
-            # Early stopping check (only if validation data provided)
-            if val_loader is not None:
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    patience_counter = 0
-                    # Save the best model
-                    self.save_model()
-                else:
-                    patience_counter += 1
+    #         # Early stopping check (only if validation data provided)
+    #         if val_loader is not None:
+    #             if avg_val_loss < best_val_loss:
+    #                 best_val_loss = avg_val_loss
+    #                 patience_counter = 0
+    #                 # Save the best model
+    #                 self.save_model()
+    #             else:
+    #                 patience_counter += 1
                 
-                if patience_counter >= early_stopping_patience:
-                    if verbose > 0:
-                        print(f"Early stopping triggered. Stopping training at epoch {epoch + 1}.")
-                    break
+    #             if patience_counter >= early_stopping_patience:
+    #                 if verbose > 0:
+    #                     print(f"Early stopping triggered. Stopping training at epoch {epoch + 1}.")
+    #                 break
             
-            # Print epoch summary
-            if verbose > 0:
-                lr = self.optimizer.param_groups[0]['lr']
-                if val_loader is not None:
-                    print(f"Epoch {epoch + 1}/{epochs} - "
-                          f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
-                          f"Val Loss: {avg_val_loss:.4f} - Val Acc: {val_accuracy:.4f} - "
-                          f"LR: {lr:.6f}")
-                else:
-                    print(f"Epoch {epoch + 1}/{epochs} - "
-                          f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
-                          f"LR: {lr:.6f}")
+    #         # Print epoch summary
+    #         if verbose > 0:
+    #             lr = self.optimizer.param_groups[0]['lr']
+    #             if val_loader is not None:
+    #                 print(f"Epoch {epoch + 1}/{epochs} - "
+    #                       f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
+    #                       f"Val Loss: {avg_val_loss:.4f} - Val Acc: {val_accuracy:.4f} - "
+    #                       f"LR: {lr:.6f}")
+    #             else:
+    #                 print(f"Epoch {epoch + 1}/{epochs} - "
+    #                       f"Train Loss: {avg_train_loss:.4f} - Train Acc: {train_accuracy:.4f} - "
+    #                       f"LR: {lr:.6f}")
         
-        # Clear cache after training (if device manager exists)
-        if hasattr(self, 'device_manager'):
-            self.device_manager.clear_cache()
+    #     # Clear cache after training (if device manager exists)
+    #     if hasattr(self, 'device_manager'):
+    #         self.device_manager.clear_cache()
         
-        return history
+    #     return history
 
     def save_model(self, file_path: str = None):
         """Save the model parameters to a file."""
@@ -443,7 +443,7 @@ class BaseMultiStreamModel(nn.Module, ABC):
         with torch.no_grad():
             for batch_color, batch_brightness in loader:
                 if self.use_mixed_precision:
-                    with torch.cuda.amp.autocast():
+                    with autocast(device_type='cuda'):
                         outputs = self(batch_color, batch_brightness)
                 else:
                     outputs = self(batch_color, batch_brightness)

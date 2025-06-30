@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from typing import Tuple, Dict, List, Union, Optional
 from tqdm import tqdm
 from ..base import BaseMultiStreamModel
@@ -612,7 +612,7 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                 optimizer.zero_grad()
                 
                 if self.use_mixed_precision and self.scaler is not None:
-                    with torch.cuda.amp.autocast():
+                    with autocast(device_type='cuda'):
                         outputs = self(color_batch, brightness_batch)
                         loss = criterion(outputs, labels_batch)
                     
@@ -691,7 +691,7 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
                         
                         # Forward pass
                         if self.use_mixed_precision and self.scaler is not None:
-                            with torch.cuda.amp.autocast():
+                            with autocast(device_type='cuda'):
                                 outputs = self(color_batch, brightness_batch)
                                 loss = criterion(outputs, labels_batch)
                         else:
