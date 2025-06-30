@@ -715,7 +715,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     # Apply gradient clipping
                     if max_grad_norm > 0:
                         self.scaler.unscale_(optimizer)  # Unscale before clipping
-                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=max_grad_norm)
                     
                     # Step optimizer with scaler
                     self.scaler.step(optimizer)
@@ -734,7 +734,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     
                     # Apply gradient clipping
                     if max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=max_grad_norm)
                     
                     # Step optimizer
                     optimizer.step()
