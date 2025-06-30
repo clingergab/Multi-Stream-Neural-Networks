@@ -777,7 +777,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 
                 # Forward pass with mixed precision if available
                 if self.use_mixed_precision and self.scaler:
-                    with autocast(self.device.type):
+                    with autocast(device_type=self.device.type):
                         outputs = self(color_input, brightness_input)
                         loss = self.criterion(outputs, labels)
                         
