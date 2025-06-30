@@ -185,6 +185,13 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             self.shared_classifier = None  # Not used in separate mode
             self.color_classifier = nn.Linear(final_features, self.num_classes)
             self.brightness_classifier = nn.Linear(final_features, self.num_classes)
+            
+        # Adjust batch normalization momentum for all BatchNorm layers
+        # Use a smaller momentum value for more stable updates
+        for module in self.modules():
+            if isinstance(module, MultiChannelBatchNorm2d):
+                module.color_bn.momentum = 0.05  # Lower momentum for more stable updates
+                module.brightness_bn.momentum = 0.05  # Lower momentum for more stable updates
     
     def _make_layer(self, planes: int, blocks: int, stride: int = 1) -> MultiChannelSequential:
         """
@@ -237,24 +244,25 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         for module in self.modules():
             if isinstance(module, MultiChannelConv2d):
                 # Initialize both color and brightness conv weights with more stable initialization
-                # Use fan_in mode for stability in deep networks
-                nn.init.kaiming_normal_(module.color_weight, mode='fan_in', nonlinearity='relu')
-                nn.init.kaiming_normal_(module.brightness_weight, mode='fan_in', nonlinearity='relu')
+                # Use fan_out mode for better gradient flow in CNNs (standard for ResNet)
+                nn.init.kaiming_normal_(module.color_weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(module.brightness_weight, mode='fan_out', nonlinearity='relu')
                 # Zero out bias if present (for stability)
                 if module.color_bias is not None:
                     nn.init.zeros_(module.color_bias)
                 if module.brightness_bias is not None:
                     nn.init.zeros_(module.brightness_bias)
             elif isinstance(module, MultiChannelBatchNorm2d):
-                # Initialize both color and brightness batch norm with careful scaling
-                nn.init.constant_(module.color_bn.weight, 1.0)
+                # Initialize both color and brightness batch norm with slightly higher initial values
+                # for better gradient flow in early training
+                nn.init.constant_(module.color_bn.weight, 1.1)
                 nn.init.constant_(module.color_bn.bias, 0.0)
-                nn.init.constant_(module.brightness_bn.weight, 1.0)
+                nn.init.constant_(module.brightness_bn.weight, 1.1)
                 nn.init.constant_(module.brightness_bn.bias, 0.0)
             elif isinstance(module, nn.Linear):
-                # Use more stable initialization for linear layers
-                # Changed to fan_in for consistency with convolutional layers
-                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                # Use Xavier initialization for fully connected layers
+                # This works better for the final classification layers
+                nn.init.xavier_normal_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
@@ -272,11 +280,28 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         Returns:
             Combined classification logits [batch_size, num_classes]
         """
-        # Normalize inputs if needed (helps with stability)
+        # Normalize inputs properly with CIFAR-100 mean and std
         if color_input.max() > 1.0 and color_input.min() >= 0.0:
+            # Scale from [0-255] to [0-1] range
             color_input = color_input / 255.0
+            
+        # Apply CIFAR-100 mean/std normalization for RGB channels (ImageNet-style normalization)
+        # CIFAR-100 approximate mean: [0.5071, 0.4867, 0.4408], std: [0.2675, 0.2565, 0.2761]
+        if color_input.shape[1] == 3:  # Only apply to RGB inputs
+            mean = torch.tensor([0.5071, 0.4867, 0.4408], device=color_input.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.2675, 0.2565, 0.2761], device=color_input.device).view(1, 3, 1, 1)
+            color_input = (color_input - mean) / std
+            
+        # Normalize brightness channel (standardize it for better gradient flow)
         if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
             brightness_input = brightness_input / 255.0
+            
+        # Standardize brightness for better training
+        if brightness_input.shape[1] == 1:  # Brightness channel
+            # Compute batch statistics for standardization
+            batch_mean = brightness_input.mean(dim=(2, 3), keepdim=True)
+            batch_std = brightness_input.std(dim=(2, 3), keepdim=True) + 1e-6  # Avoid division by zero
+            brightness_input = (brightness_input - batch_mean) / batch_std
             
         # Ensure input shapes are compatible
         if color_input.dim() != 4 or brightness_input.dim() != 4:
@@ -360,11 +385,25 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             Tuple of (color_logits, brightness_logits) [batch_size, num_classes] each
             Separate outputs for analyzing individual pathway performance
         """
-        # Normalize inputs if needed (helps with stability)
+        # Apply the same normalization as in forward() for consistency
         if color_input.max() > 1.0 and color_input.min() >= 0.0:
             color_input = color_input / 255.0
+            
+        # Apply CIFAR-100 mean/std normalization for RGB channels
+        if color_input.shape[1] == 3:
+            mean = torch.tensor([0.5071, 0.4867, 0.4408], device=color_input.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.2675, 0.2565, 0.2761], device=color_input.device).view(1, 3, 1, 1)
+            color_input = (color_input - mean) / std
+            
+        # Normalize brightness channel
         if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
             brightness_input = brightness_input / 255.0
+            
+        # Standardize brightness
+        if brightness_input.shape[1] == 1:
+            batch_mean = brightness_input.mean(dim=(2, 3), keepdim=True)
+            batch_std = brightness_input.std(dim=(2, 3), keepdim=True) + 1e-6
+            brightness_input = (brightness_input - batch_mean) / batch_std
             
         # Initial layers
         color_x, brightness_x = self.conv1(color_input, brightness_input)
@@ -393,13 +432,13 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             color_x = self.dropout_layer(color_x)
             brightness_x = self.dropout_layer(brightness_x)
         
-        # Separate classification for each stream (for analysis)
+        # Apply projection/classifier heads to get separate outputs
         if self.use_shared_classifier:
-            # Use individual heads for analysis when shared classifier is used
+            # Use separate heads for research analysis
             color_logits = self.color_head(color_x)
             brightness_logits = self.brightness_head(brightness_x)
         else:
-            # Use separate classifiers when in legacy mode
+            # Legacy: Use separate classifiers
             color_logits = self.color_classifier(color_x)
             brightness_logits = self.brightness_classifier(brightness_x)
         
@@ -407,11 +446,25 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
     
     def extract_features(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Extract features before final classification."""
-        # Normalize inputs if needed (helps with stability)
+        # Apply the same normalization as in forward() for consistency
         if color_input.max() > 1.0 and color_input.min() >= 0.0:
             color_input = color_input / 255.0
+            
+        # Apply CIFAR-100 mean/std normalization for RGB channels
+        if color_input.shape[1] == 3:
+            mean = torch.tensor([0.5071, 0.4867, 0.4408], device=color_input.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.2675, 0.2565, 0.2761], device=color_input.device).view(1, 3, 1, 1)
+            color_input = (color_input - mean) / std
+            
+        # Normalize brightness channel
         if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
             brightness_input = brightness_input / 255.0
+            
+        # Standardize brightness
+        if brightness_input.shape[1] == 1:
+            batch_mean = brightness_input.mean(dim=(2, 3), keepdim=True)
+            batch_std = brightness_input.std(dim=(2, 3), keepdim=True) + 1e-6
+            brightness_input = (brightness_input - batch_mean) / batch_std
             
         # Process through all layers except classifier
         color_x, brightness_x = self.conv1(color_input, brightness_input)
@@ -627,18 +680,45 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         criterion = nn.CrossEntropyLoss()
         
         # Learning rate scheduler setup based on scheduler type
-        if scheduler_type.lower() == 'cosine':
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
+        if scheduler_type.lower() == 'onecycle':
+            # OneCycleLR is often more effective than standard schedulers
+            # It implements a cyclical learning rate policy with warmup
+            steps_per_epoch = len(train_loader)
+            total_steps = steps_per_epoch * epochs
+            
+            # Use OneCycleLR with sensible defaults
+            scheduler = optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=learning_rate,
+                total_steps=total_steps,
+                pct_start=0.3,  # 30% of training for warmup
+                div_factor=25,  # LR starts at max_lr/25
+                final_div_factor=1000,  # Final LR is max_lr/25000
+                anneal_strategy='cos'  # Cosine annealing
+            )
+            # This scheduler needs to step after each batch
+            scheduler_step_batch = True
+        elif scheduler_type.lower() == 'cosine':
+            # Standard cosine annealing
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, 
+                T_max=epochs, 
+                eta_min=min_lr
+            )
+            scheduler_step_batch = False
         elif scheduler_type.lower() == 'step':
             scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+            scheduler_step_batch = False
         elif scheduler_type.lower() == 'reduce_on_plateau':
             # Add ReduceLROnPlateau option which can be more stable
             scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer, mode='min', factor=0.5, patience=2, 
                 min_lr=min_lr, verbose=verbose > 0
             )
+            scheduler_step_batch = False
         else:
             scheduler = None
+            scheduler_step_batch = False
         
         # Training loop
         best_val_loss = float('inf')
@@ -705,34 +785,41 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     # Backward pass with scaler
                     self.scaler.scale(loss).backward()
                     
-                    # Unscale the gradients once
+                    # Unscale gradients once before gradient clipping and debugging
                     self.scaler.unscale_(optimizer)
                     
-                    # Track gradient norm for debugging
+                    # Track gradient norm for debugging (now safely unscaled)
                     if self.debug_mode:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), float('inf'))
-                        epoch_grad_norm += grad_norm.item()
-                        num_batches += 1
+                        with torch.no_grad():
+                            grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) 
+                                                  for p in self.parameters() if p.grad is not None]), 2)
+                            epoch_grad_norm += grad_norm.item()
+                            num_batches += 1
                     
-                    # Apply gradient clipping
+                    # Apply gradient clipping (on unscaled gradients)
                     if max_grad_norm > 0:
-                        # No need to unscale again, it's already done above
                         torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
                     
                     # Step optimizer with scaler
                     self.scaler.step(optimizer)
                     self.scaler.update()
+                    
+                    # Step OneCycleLR scheduler after each batch if needed
+                    if scheduler is not None and scheduler_step_batch:
+                        scheduler.step()
                 else:
                     # Standard forward and backward pass
                     outputs = self(batch_color, batch_brightness)
                     loss = criterion(outputs, batch_labels)
                     loss.backward()
                     
-                    # Track gradient norm for debugging
+                    # Track gradient norm for debugging in a more stable way
                     if self.debug_mode:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), float('inf'))
-                        epoch_grad_norm += grad_norm.item()
-                        num_batches += 1
+                        with torch.no_grad():
+                            grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) 
+                                                  for p in self.parameters() if p.grad is not None]), 2)
+                            epoch_grad_norm += grad_norm.item()
+                            num_batches += 1
                     
                     # Apply gradient clipping
                     if max_grad_norm > 0:
@@ -740,6 +827,10 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     
                     # Step optimizer
                     optimizer.step()
+                
+                # Step OneCycleLR scheduler after each batch if needed
+                if scheduler is not None and scheduler_step_batch:
+                    scheduler.step()
                 
                 # Track metrics
                 total_loss += loss.item()
@@ -767,8 +858,8 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             avg_grad_norm = epoch_grad_norm / max(num_batches, 1)
             history['gradient_norm'].append(avg_grad_norm)
             
-            # Update learning rate scheduler
-            if scheduler is not None and scheduler_type.lower() != 'reduce_on_plateau':
+            # Update learning rate scheduler at epoch level for non-batch schedulers
+            if scheduler is not None and not scheduler_step_batch and scheduler_type.lower() != 'reduce_on_plateau':
                 scheduler.step()
             
             # Calculate epoch metrics
@@ -858,7 +949,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     # If no progress bar but verbose, print a summary line
                     print(f"Epoch {epoch+1}/{epochs} - "
                           f"Loss: {avg_train_loss:.4f}, Acc: {train_accuracy:.4f}, "
-                          f"Val_Loss: {avg_val_loss:.4f}, Val_Acc: {val_accuracy:.4f}, "
+                          f"Val_Loss: {avg_val_loss:.4f}, Val_Acc: f{val_accuracy:.4f}, "
                           f"LR: {optimizer.param_groups[0]['lr']:.6f}, "
                           f"GradNorm: {avg_grad_norm:.2f}")
             else:
