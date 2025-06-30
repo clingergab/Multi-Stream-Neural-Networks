@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from torch.amp import autocast, GradScaler
+from torch import autocast, GradScaler
 from tqdm import tqdm
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Union
@@ -777,7 +777,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 
                 # Forward pass with mixed precision if available
                 if self.use_mixed_precision and self.scaler:
-                    with autocast(device_type=self.device.type):
+                    with autocast('cuda'):
                         outputs = self(color_input, brightness_input)
                         loss = self.criterion(outputs, labels)
                         
