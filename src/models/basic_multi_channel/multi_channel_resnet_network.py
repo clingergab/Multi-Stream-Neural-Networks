@@ -8,7 +8,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import GradScaler, autocast
 import numpy as np
-from typing import List, Tuple, Dict, Optional
+import os
+from typing import List, Tuple, Dict
 from tqdm import tqdm
 from ..base import BaseMultiStreamModel
 from ..layers.resnet_blocks import (
@@ -24,6 +25,7 @@ from ..layers.conv_layers import (
     MultiChannelAdaptiveAvgPool2d
 )
 from ...utils.device_utils import DeviceManager
+from ...utils.grad_utils import safe_clip_grad_norm
 
 
 class MultiChannelResNetNetwork(BaseMultiStreamModel):
@@ -791,29 +793,24 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     # Track gradient norm for debugging (now safely unscaled)
                     if self.debug_mode:
                         with torch.no_grad():
-                            # Calculate gradient norm manually to avoid potential recursion issues
+                            # Calculate gradient norm in a way that avoids recursion
                             total_norm = 0.0
-                            parameters = [p for p in self.parameters() if p.grad is not None]
-                            for p in parameters:
-                                param_norm = p.grad.detach().data.norm(2)
-                                total_norm += param_norm.item() ** 2
+                            for p in self.parameters():
+                                if p.grad is not None:
+                                    # Direct tensor operation without method calls that might be patched
+                                    param_norm = torch.sqrt(torch.sum(p.grad.detach().data ** 2))
+                                    total_norm += param_norm.item() ** 2
                             grad_norm = total_norm ** 0.5
                             epoch_grad_norm += grad_norm
                             num_batches += 1
                     
                     # Apply gradient clipping (on unscaled gradients)
                     if max_grad_norm > 0:
-                        # Direct implementation to avoid recursion issues
-                        total_norm = 0
-                        parameters = [p for p in self.parameters() if p.grad is not None]
-                        for p in parameters:
-                            param_norm = p.grad.data.norm(2)
-                            total_norm += param_norm.item() ** 2
-                        total_norm = total_norm ** (1. / 2)
-                        clip_coef = max_grad_norm / (total_norm + 1e-6)
-                        if clip_coef < 1:
-                            for p in parameters:
-                                p.grad.data.mul_(clip_coef)
+                        # Use our custom safe gradient clipping function to avoid recursion errors
+                        safe_clip_grad_norm(
+                            [p for p in self.parameters() if p.grad is not None],
+                            max_grad_norm
+                        )
                     
                     # Step optimizer with scaler
                     self.scaler.step(optimizer)
@@ -831,29 +828,24 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     # Track gradient norm for debugging in a more stable way
                     if self.debug_mode:
                         with torch.no_grad():
-                            # Calculate gradient norm manually to avoid potential recursion issues
+                            # Calculate gradient norm in a way that avoids recursion
                             total_norm = 0.0
-                            parameters = [p for p in self.parameters() if p.grad is not None]
-                            for p in parameters:
-                                param_norm = p.grad.detach().data.norm(2)
-                                total_norm += param_norm.item() ** 2
+                            for p in self.parameters():
+                                if p.grad is not None:
+                                    # Direct tensor operation without method calls that might be patched
+                                    param_norm = torch.sqrt(torch.sum(p.grad.detach().data ** 2))
+                                    total_norm += param_norm.item() ** 2
                             grad_norm = total_norm ** 0.5
                             epoch_grad_norm += grad_norm
                             num_batches += 1
                     
                     # Apply gradient clipping
                     if max_grad_norm > 0:
-                        # Direct implementation to avoid recursion issues
-                        total_norm = 0
-                        parameters = [p for p in self.parameters() if p.grad is not None]
-                        for p in parameters:
-                            param_norm = p.grad.data.norm(2)
-                            total_norm += param_norm.item() ** 2
-                        total_norm = total_norm ** (1. / 2)
-                        clip_coef = max_grad_norm / (total_norm + 1e-6)
-                        if clip_coef < 1:
-                            for p in parameters:
-                                p.grad.data.mul_(clip_coef)
+                        # Use our custom safe gradient clipping function to avoid recursion errors
+                        safe_clip_grad_norm(
+                            [p for p in self.parameters() if p.grad is not None],
+                            max_grad_norm
+                        )
                     
                     # Step optimizer
                     optimizer.step()
