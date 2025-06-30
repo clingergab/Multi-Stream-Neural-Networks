@@ -614,9 +614,6 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         if not self.is_compiled:
             raise RuntimeError("Model must be compiled before training. Call model.compile() first.")
         
-        # Enable debug mode for gradient tracking
-        self.debug_mode = True
-        
         # Determine if we're using DataLoaders or direct data
         using_dataloaders = train_loader is not None
         
@@ -651,8 +648,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             'train_accuracy': [],
             'val_loss': [],
             'val_accuracy': [],
-            'learning_rates': [],
-            'gradient_norm': []  # Track gradient norms for debugging
+            'learning_rates': []
         }
         
         # Set up train and validation loaders based on input mode
@@ -748,8 +744,6 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             correct = 0
             total = 0
             batch_lr = []
-            epoch_grad_norm = 0.0
-            num_batches = 0
             
             # Training loop
             for batch_idx, data in enumerate(train_loader):
@@ -784,14 +778,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     # Backward pass with scaled gradients
                     self.scaler.scale(loss).backward()
                     
-                    # Track gradient norm for debugging
-                    if self.debug_mode:
-                        self.scaler.unscale_(self.optimizer)
-                        grad_norm = safe_clip_grad_norm(self.parameters(), max_value=float('inf'))
-                        epoch_grad_norm += grad_norm.item()
-                        num_batches += 1
-                    
-                    # Apply gradient clipping to prevent exploding gradients
+                    # Apply gradient clipping if needed
                     if self.gradient_clip > 0:
                         self.scaler.unscale_(self.optimizer)
                         safe_clip_grad_norm(self.parameters(), self.gradient_clip)
@@ -804,12 +791,6 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     outputs = self(color_input, brightness_input)
                     loss = self.criterion(outputs, labels)
                     loss.backward()
-                    
-                    # Track gradient norm for debugging
-                    if self.debug_mode:
-                        grad_norm = safe_clip_grad_norm(self.parameters(), max_value=float('inf'))
-                        epoch_grad_norm += grad_norm.item()
-                        num_batches += 1
                     
                     # Apply gradient clipping
                     if self.gradient_clip > 0:
@@ -847,10 +828,6 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             # Close progress bar
             if verbose == 1 and epoch_pbar is not None:
                 epoch_pbar.close()
-                
-            # Calculate average gradient norm for this epoch
-            avg_grad_norm = epoch_grad_norm / max(num_batches, 1)
-            history['gradient_norm'].append(avg_grad_norm)
                 
             # Calculate epoch-level metrics
             avg_train_loss = total_loss / len(train_loader)
@@ -890,8 +867,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     print(f"Epoch {epoch+1}/{epochs} - "
                           f"loss: {avg_train_loss:.4f}, acc: {train_accuracy:.4f}, "
                           f"val_loss: {val_loss:.4f}, val_acc: {val_accuracy:.4f}, "
-                          f"lr: {current_lr:.6f}, "
-                          f"GradNorm: {avg_grad_norm:.2f}")
+                          f"lr: {current_lr:.6f}")
                     
                 # Check for early stopping
                 if patience_counter >= early_stopping_patience:
@@ -902,8 +878,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 if verbose > 0:
                     print(f"Epoch {epoch+1}/{epochs} - "
                           f"loss: {avg_train_loss:.4f}, acc: {train_accuracy:.4f}, "
-                          f"lr: {current_lr:.6f}, "
-                          f"GradNorm: {avg_grad_norm:.2f}")
+                          f"lr: {current_lr:.6f}")
                           
         # Load best model if validation was performed and we have saved a best state
         if val_loader is not None and hasattr(self, 'best_model_state'):
