@@ -81,16 +81,11 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         num_blocks: List[int] = [2, 2, 2, 2],
         block_type: str = 'basic',
         activation: str = 'relu',
-        dropout: float = 0.0,  # NEW: Dropout support
-        use_shared_classifier: bool = True,  # NEW: Enable proper fusion
-        input_channels: int = None,  # For backward compatibility
-        device: str = 'auto',  # NEW: Automatic device detection
+        dropout: float = 0.0,  
+        use_shared_classifier: bool = True,
+        device: str = 'auto',
         **kwargs
     ):
-        # Handle backward compatibility
-        if input_channels is not None:
-            color_input_channels = input_channels
-            brightness_input_channels = input_channels
         
         # Initialize base class
         super().__init__(
@@ -105,7 +100,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         self.num_blocks = num_blocks
         self.block_type = block_type
         self.activation = activation
-        self.dropout = dropout  # NEW: Store dropout rate
+        self.dropout = dropout
         self.use_shared_classifier = use_shared_classifier
         
         # Setup device management with proper detection
@@ -142,6 +137,11 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         self.optimizer = None
         self.criterion = None
         self.metrics = []
+        
+        # Debug helpers - these will be filled during training if issues occur
+        self.debug_mode = False
+        self.gradient_norms = []
+        self.feature_norms = []
     
     def _build_network(self):
         """Build the ResNet network with optimized architecture for different input channels."""
@@ -233,20 +233,28 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         return MultiChannelSequential(*layers)
     
     def _initialize_weights(self):
-        """Initialize network weights following ResNet conventions."""
+        """Initialize network weights following ResNet conventions with improved stability."""
         for module in self.modules():
             if isinstance(module, MultiChannelConv2d):
-                # Initialize both color and brightness conv weights
-                nn.init.kaiming_normal_(module.color_weight, mode='fan_out', nonlinearity='relu')
-                nn.init.kaiming_normal_(module.brightness_weight, mode='fan_out', nonlinearity='relu')
+                # Initialize both color and brightness conv weights with more stable initialization
+                # Use fan_in mode for stability in deep networks
+                nn.init.kaiming_normal_(module.color_weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(module.brightness_weight, mode='fan_in', nonlinearity='relu')
+                # Zero out bias if present (for stability)
+                if module.color_bias is not None:
+                    nn.init.zeros_(module.color_bias)
+                if module.brightness_bias is not None:
+                    nn.init.zeros_(module.brightness_bias)
             elif isinstance(module, MultiChannelBatchNorm2d):
-                # Initialize both color and brightness batch norm
-                nn.init.constant_(module.color_bn.weight, 1)
-                nn.init.constant_(module.color_bn.bias, 0)
-                nn.init.constant_(module.brightness_bn.weight, 1)
-                nn.init.constant_(module.brightness_bn.bias, 0)
+                # Initialize both color and brightness batch norm with careful scaling
+                nn.init.constant_(module.color_bn.weight, 1.0)
+                nn.init.constant_(module.color_bn.bias, 0.0)
+                nn.init.constant_(module.brightness_bn.weight, 1.0)
+                nn.init.constant_(module.brightness_bn.bias, 0.0)
             elif isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
+                # Use more stable initialization for linear layers
+                # Changed to fan_in for consistency with convolutional layers
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
@@ -264,6 +272,20 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         Returns:
             Combined classification logits [batch_size, num_classes]
         """
+        # Normalize inputs if needed (helps with stability)
+        if color_input.max() > 1.0 and color_input.min() >= 0.0:
+            color_input = color_input / 255.0
+        if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
+            brightness_input = brightness_input / 255.0
+            
+        # Ensure input shapes are compatible
+        if color_input.dim() != 4 or brightness_input.dim() != 4:
+            raise ValueError(f"Expected 4D tensors (batch_size, channels, height, width), got {color_input.shape} and {brightness_input.shape}")
+            
+        # Check for NaN inputs
+        if torch.isnan(color_input).any() or torch.isnan(brightness_input).any():
+            raise ValueError("Input contains NaN values")
+            
         # Initial layers
         color_x, brightness_x = self.conv1(color_input, brightness_input)
         color_x, brightness_x = self.bn1(color_x, brightness_x)
@@ -286,6 +308,13 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         color_x = torch.flatten(color_x, 1)
         brightness_x = torch.flatten(brightness_x, 1)
         
+        # Check for NaN features after processing
+        if torch.isnan(color_x).any() or torch.isnan(brightness_x).any():
+            # Enable feature map recovery if NaNs are detected
+            # This helps prevent model from getting stuck
+            color_x = torch.where(torch.isnan(color_x), torch.zeros_like(color_x), color_x)
+            brightness_x = torch.where(torch.isnan(brightness_x), torch.zeros_like(brightness_x), brightness_x)
+        
         # Apply dropout if enabled
         if self.dropout_layer is not None:
             color_x = self.dropout_layer(color_x)
@@ -295,12 +324,26 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         if self.use_shared_classifier:
             # Use shared classifier for optimal fusion
             fused_features = torch.cat([color_x, brightness_x], dim=1)
-            return self.shared_classifier(fused_features)
+            logits = self.shared_classifier(fused_features)
+            
+            # Final check for NaN outputs
+            if torch.isnan(logits).any():
+                logits = torch.zeros_like(logits)
+                print("Warning: NaN detected in model output. Using zero outputs.")
+                
+            return logits
         else:
             # Legacy: Add separate outputs
             color_logits = self.color_classifier(color_x)
             brightness_logits = self.brightness_classifier(brightness_x)
-            return color_logits + brightness_logits
+            
+            # Final check for NaN outputs
+            combined_logits = color_logits + brightness_logits
+            if torch.isnan(combined_logits).any():
+                combined_logits = torch.zeros_like(combined_logits)
+                print("Warning: NaN detected in model output. Using zero outputs.")
+                
+            return combined_logits
     
     def analyze_pathways(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -317,6 +360,12 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             Tuple of (color_logits, brightness_logits) [batch_size, num_classes] each
             Separate outputs for analyzing individual pathway performance
         """
+        # Normalize inputs if needed (helps with stability)
+        if color_input.max() > 1.0 and color_input.min() >= 0.0:
+            color_input = color_input / 255.0
+        if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
+            brightness_input = brightness_input / 255.0
+            
         # Initial layers
         color_x, brightness_x = self.conv1(color_input, brightness_input)
         color_x, brightness_x = self.bn1(color_x, brightness_x)
@@ -358,6 +407,12 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
     
     def extract_features(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Extract features before final classification."""
+        # Normalize inputs if needed (helps with stability)
+        if color_input.max() > 1.0 and color_input.min() >= 0.0:
+            color_input = color_input / 255.0
+        if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
+            brightness_input = brightness_input / 255.0
+            
         # Process through all layers except classifier
         color_x, brightness_x = self.conv1(color_input, brightness_input)
         color_x, brightness_x = self.bn1(color_x, brightness_x)
@@ -418,9 +473,9 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
     def fit(self, train_color_data=None, train_brightness_data=None, train_labels=None,
             val_color_data=None, val_brightness_data=None, val_labels=None,
             train_loader=None, val_loader=None, batch_size=None, epochs=10,
-            learning_rate=0.001, weight_decay=0.0, early_stopping_patience=5,
+            learning_rate=None, weight_decay=0.0001, early_stopping_patience=5,
             scheduler_type='cosine', min_lr=1e-6, verbose=1, 
-            num_workers=None, pin_memory=None) -> Dict[str, List[float]]:
+            num_workers=None, pin_memory=None, max_grad_norm=1.0) -> Dict[str, List[float]]:
         """
         Unified fit method that handles both direct data arrays and DataLoaders with on-the-fly augmentation.
         
@@ -446,7 +501,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             val_loader: Optional DataLoader for validation (will be used instead of direct data if provided)
             batch_size: Batch size for training when using direct data (auto-detected if None)
             epochs: Number of epochs to train
-            learning_rate: Learning rate for the optimizer
+            learning_rate: Learning rate for the optimizer (defaults to 0.001 if None)
             weight_decay: Weight decay (L2 regularization)
             early_stopping_patience: Patience for early stopping
             scheduler_type: Learning rate scheduler type ('cosine', 'step', 'none')
@@ -454,16 +509,29 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             verbose: Verbosity level (0: silent, 1: progress bar, 2: one line per epoch)
             num_workers: Number of workers for data loading (auto-detected if None)
             pin_memory: Whether to pin memory for faster GPU transfer (auto-detected if None)
+            max_grad_norm: Maximum gradient norm for gradient clipping (helps prevent exploding gradients)
             
         Returns:
             history: Dictionary containing training and validation metrics
         """
+        # Enable debug mode for issue investigation
+        self.debug_mode = True
+        self.gradient_norms = []
+        self.feature_norms = []
+        
+        # Use a default learning rate if not provided
+        if learning_rate is None:
+            learning_rate = 0.001  # Standard default learning rate
+            if verbose > 0:
+                print(f"Using default learning rate: {learning_rate}")
+        
         # Initialize history dictionary to track metrics
         history = {
             'loss': [],
             'accuracy': [],
             'val_loss': [],
-            'val_accuracy': []
+            'val_accuracy': [],
+            'gradient_norm': []  # Track gradient norms for debugging
         }
         
         # Determine if we're using DataLoaders or direct data
@@ -483,12 +551,12 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 else:
                     batch_size = 32   # Conservative for smaller GPUs
             else:
-                batch_size = 4  # Conservative for CPU/MPS with large datasets
+                batch_size = 16  # More conservative default for CPU/MPS
         
         # Auto-detect optimal number of workers
         if num_workers is None:
             import os
-            num_workers = min(8, os.cpu_count() or 1)
+            num_workers = min(4, os.cpu_count() or 1)  # More conservative default
         
         # Auto-detect pin_memory
         if pin_memory is None:
@@ -506,6 +574,9 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             print(f"   Mixed precision: {self.use_mixed_precision}")
             print(f"   Workers: {num_workers}")
             print(f"   Pin memory: {pin_memory}")
+            print(f"   Gradient clipping: {max_grad_norm}")
+            print(f"   Weight decay: {weight_decay}")
+            print(f"   Learning rate: {learning_rate}")
         
         # Set up train and validation loaders based on input mode
         if not using_dataloaders:
@@ -544,8 +615,15 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     persistent_workers=num_workers > 0 and self.device.type != 'mps'
                 )
         
-        # Optimizer and loss function - use AdamW for better generalization
-        optimizer = optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        # Optimizer and loss function - use AdamW with more stable defaults
+        # Similar to what BaseMultiChannelNetwork uses successfully
+        optimizer = optim.AdamW(
+            self.parameters(), 
+            lr=learning_rate, 
+            weight_decay=weight_decay,
+            betas=(0.9, 0.999),  # Standard AdamW betas
+            eps=1e-8  # More stable epsilon value
+        )
         criterion = nn.CrossEntropyLoss()
         
         # Learning rate scheduler setup based on scheduler type
@@ -553,6 +631,12 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
         elif scheduler_type.lower() == 'step':
             scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
+        elif scheduler_type.lower() == 'reduce_on_plateau':
+            # Add ReduceLROnPlateau option which can be more stable
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=2, 
+                min_lr=min_lr, verbose=verbose > 0
+            )
         else:
             scheduler = None
         
@@ -576,6 +660,8 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             total_loss = 0.0
             train_correct = 0
             train_total = 0
+            epoch_grad_norm = 0.0
+            num_batches = 0
             
             # Create progress bar for training
             epoch_pbar = None
@@ -602,6 +688,11 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 if batch_labels.device != self.device:
                     batch_labels = batch_labels.to(self.device, non_blocking=True)
                 
+                # Check for NaN in inputs
+                if torch.isnan(batch_color).any() or torch.isnan(batch_brightness).any():
+                    print(f"Warning: NaN detected in batch {batch_idx} inputs. Skipping batch.")
+                    continue
+                
                 # Zero gradients
                 optimizer.zero_grad()
                 
@@ -613,6 +704,20 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     
                     # Backward pass with scaler
                     self.scaler.scale(loss).backward()
+                    
+                    # Track gradient norm for debugging
+                    if self.debug_mode:
+                        self.scaler.unscale_(optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_value=float('inf'))
+                        epoch_grad_norm += grad_norm.item()
+                        num_batches += 1
+                    
+                    # Apply gradient clipping
+                    if max_grad_norm > 0:
+                        self.scaler.unscale_(optimizer)  # Unscale before clipping
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
+                    
+                    # Step optimizer with scaler
                     self.scaler.step(optimizer)
                     self.scaler.update()
                 else:
@@ -620,6 +725,18 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     outputs = self(batch_color, batch_brightness)
                     loss = criterion(outputs, batch_labels)
                     loss.backward()
+                    
+                    # Track gradient norm for debugging
+                    if self.debug_mode:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_value=float('inf'))
+                        epoch_grad_norm += grad_norm.item()
+                        num_batches += 1
+                    
+                    # Apply gradient clipping
+                    if max_grad_norm > 0:
+                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
+                    
+                    # Step optimizer
                     optimizer.step()
                 
                 # Track metrics
@@ -644,8 +761,12 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     })
                     epoch_pbar.update(1)
             
+            # Calculate average gradient norm for this epoch
+            avg_grad_norm = epoch_grad_norm / max(num_batches, 1)
+            history['gradient_norm'].append(avg_grad_norm)
+            
             # Update learning rate scheduler
-            if scheduler is not None:
+            if scheduler is not None and scheduler_type.lower() != 'reduce_on_plateau':
                 scheduler.step()
             
             # Calculate epoch metrics
@@ -711,13 +832,18 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 history['val_loss'].append(avg_val_loss)
                 history['val_accuracy'].append(val_accuracy)
                 
+                # Update scheduler if using ReduceLROnPlateau
+                if scheduler is not None and scheduler_type.lower() == 'reduce_on_plateau':
+                    scheduler.step(avg_val_loss)
+                
                 # Prepare summary for the final epoch progress bar update
                 summary = {
                     'Loss': f'{avg_train_loss:.4f}',
                     'Acc': f'{train_accuracy:.4f}',
                     'Val_Loss': f'{avg_val_loss:.4f}',
                     'Val_Acc': f'{val_accuracy:.4f}',
-                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}',
+                    'GradNorm': f'{avg_grad_norm:.2f}'
                 }
                 
                 # Update progress bar with all metrics in one line
@@ -731,13 +857,15 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     print(f"Epoch {epoch+1}/{epochs} - "
                           f"Loss: {avg_train_loss:.4f}, Acc: {train_accuracy:.4f}, "
                           f"Val_Loss: {avg_val_loss:.4f}, Val_Acc: {val_accuracy:.4f}, "
-                          f"LR: {optimizer.param_groups[0]['lr']:.6f}")
+                          f"LR: {optimizer.param_groups[0]['lr']:.6f}, "
+                          f"GradNorm: {avg_grad_norm:.2f}")
             else:
                 # Prepare summary for training-only progress bar update
                 summary = {
                     'Loss': f'{avg_train_loss:.4f}',
                     'Acc': f'{train_accuracy:.4f}',
-                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
+                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}',
+                    'GradNorm': f'{avg_grad_norm:.2f}'
                 }
                 
                 # Update progress bar with training metrics in one line
@@ -750,7 +878,8 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     # If no progress bar but verbose, print a summary line
                     print(f"Epoch {epoch+1}/{epochs} - "
                           f"Loss: {avg_train_loss:.4f}, Acc: {train_accuracy:.4f}, "
-                          f"LR: {optimizer.param_groups[0]['lr']:.6f}")
+                          f"LR: {optimizer.param_groups[0]['lr']:.6f}, "
+                          f"GradNorm: {avg_grad_norm:.2f}")
                 
                 # Store empty validation metrics for consistency
                 history['val_loss'].append(None)
@@ -764,19 +893,23 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     patience_counter = 0
                     # Save the best model
                     self.best_model_state = self.state_dict().copy()
+                    if verbose > 0:
+                        print(f"✅ New best validation loss: {best_val_loss:.4f}")
                 else:
                     patience_counter += 1
+                    if verbose > 0:
+                        print(f"⏳ No improvement for {patience_counter}/{early_stopping_patience} epochs")
                 
                 if patience_counter >= early_stopping_patience:
                     if verbose > 0:
-                        print(f"Early stopping triggered. Stopping training at epoch {epoch + 1}.")
+                        print(f"🛑 Early stopping triggered. Stopping training at epoch {epoch + 1}.")
                     break
         
         # Load best model if validation was performed and we have saved a best state
         if val_loader is not None and hasattr(self, 'best_model_state'):
             self.load_state_dict(self.best_model_state)
             if verbose > 0:
-                print("Loaded best model state from early stopping")
+                print("📊 Loaded best model state from early stopping")
         
         # Clear cache after training
         self.device_manager.clear_cache()

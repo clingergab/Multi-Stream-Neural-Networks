@@ -66,8 +66,8 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         num_classes: int = 10,
         activation: str = 'relu',
         dropout: float = 0.0,
-        use_shared_classifier: bool = True,  # NEW: Enable proper fusion
-        device: str = 'auto',  # NEW: Automatic device detection
+        use_shared_classifier: bool = True,  
+        device: str = 'auto', 
         **kwargs
     ):
         """
