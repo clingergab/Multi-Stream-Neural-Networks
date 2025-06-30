@@ -6,26 +6,73 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from torch.amp import GradScaler, autocast
-import os
-from typing import List, Tuple, Dict
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
-from ..base import BaseMultiStreamModel
-from ..layers.resnet_blocks import (
-    MultiChannelResNetBasicBlock, 
+import numpy as np
+from typing import List, Dict, Tuple, Optional, Union
+import time
+import os
+import sys
+from abc import ABC
+
+# Import Multi-Channel model components
+from src.models.base import BaseMultiStreamModel
+from src.utils.device_utils import DeviceManager
+from src.models.layers.conv_layers import (
+    MultiChannelConv2d,
+    MultiChannelBatchNorm2d,
+    MultiChannelActivation,
+    MultiChannelAdaptiveAvgPool2d
+)
+from src.models.layers.resnet_blocks import (
+    MultiChannelResNetBasicBlock,
     MultiChannelResNetBottleneck,
     MultiChannelDownsample,
     MultiChannelSequential
 )
-from ..layers.conv_layers import (
-    MultiChannelConv2d, 
-    MultiChannelBatchNorm2d, 
-    MultiChannelActivation,
-    MultiChannelAdaptiveAvgPool2d
-)
-from ...utils.device_utils import DeviceManager
-from ...utils.grad_utils import safe_clip_grad_norm
 
+def safe_clip_grad_norm(parameters, max_value, norm_type=2.0):
+    """
+    Safely clips gradient norm while handling edge cases like NaN/Inf.
+    This prevents catastrophic failure when gradients are unstable.
+    
+    Args:
+        parameters: Model parameters to clip
+        max_value: Maximum norm value
+        norm_type: Type of norm (usually 2.0 for L2 norm)
+    
+    Returns:
+        Total norm of parameters (before clipping)
+    """
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    parameters = [p for p in parameters if p.grad is not None]
+    if len(parameters) == 0:
+        return torch.tensor(0.0)
+    device = parameters[0].grad.device
+    
+    # Calculate the norm
+    total_norm = torch.norm(
+        torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), 
+        norm_type
+    )
+    
+    # Handle NaN/Inf
+    if torch.isnan(total_norm) or torch.isinf(total_norm):
+        for p in parameters:
+            # Set gradients to zero if they contain NaN/Inf
+            if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                p.grad.detach().zero_()
+        return torch.tensor(0.0)
+    
+    # Apply clipping if needed
+    if max_value > 0 and total_norm > max_value:
+        clip_coef = max_value / (total_norm + 1e-6)
+        for p in parameters:
+            if p.grad is not None:
+                p.grad.detach().mul_(clip_coef)
+    
+    return total_norm
 
 class MultiChannelResNetNetwork(BaseMultiStreamModel):
     """
@@ -85,7 +132,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         dropout: float = 0.0,  
         use_shared_classifier: bool = True,
         device: str = 'auto',
-        reduce_architecture: bool = True,  # For small datasets like CIFAR, reduce architecture complexity
+        reduce_architecture: bool = False,  # Set to True for small datasets like CIFAR
         **kwargs
     ):
         
@@ -140,43 +187,57 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         self.optimizer = None
         self.criterion = None
         self.metrics = []
-        
-        # Debug helpers - these will be filled during training if issues occur
-        self.debug_mode = False
-        self.gradient_norms = []
-        self.feature_norms = []
     
     def _build_network(self):
         """Build the ResNet network with optimized architecture for different input channels."""
-        # Initial layers (stem) - OPTIMIZED: use different input channels!
+        # Adjust initial channel count for reduced architecture
+        initial_channels = 32 if self.reduce_architecture else 64
+        self.inplanes = initial_channels  # Update inplanes for reduced architecture
+        
+        # Initial layers (stem) - OPTIMIZED for CIFAR-100
         # For CIFAR-100, a smaller kernel and stride works better than ImageNet-style (7x7, stride 2)
         self.conv1 = MultiChannelConv2d(
             color_in_channels=self.color_input_channels,        # 3 for RGB
             brightness_in_channels=self.brightness_input_channels,  # 1 for brightness - efficient!
-            out_channels=64, 
+            out_channels=initial_channels, 
             kernel_size=3, stride=1, padding=1, bias=False  # Smaller kernel and no stride for small images
         )
-        self.bn1 = MultiChannelBatchNorm2d(64)
+        self.bn1 = MultiChannelBatchNorm2d(initial_channels)
         self.activation_initial = MultiChannelActivation(self.activation, inplace=True)
-        # Optional maxpool - for CIFAR, sometimes skipping initial maxpool helps
+        # Optional maxpool - for CIFAR, skipping initial maxpool helps preserve spatial information
         # Since CIFAR images are only 32x32, aggressive downsampling can hurt performance
         self.maxpool = nn.Identity() if self.reduce_architecture else nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         
         # ResNet layers with proper channel progression
-        self.layer1 = self._make_layer(64, self.num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(128, self.num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(256, self.num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(512, self.num_blocks[3], stride=2)
+        # For CIFAR-100, we need fewer channels and less aggressive downsampling
+        if self.reduce_architecture:
+            # Use smaller strides in earlier layers to preserve spatial information
+            self.layer1 = self._make_layer(64, self.num_blocks[0], stride=1)
+            self.layer2 = self._make_layer(128, self.num_blocks[1], stride=2)
+            self.layer3 = self._make_layer(256, self.num_blocks[2], stride=2)
+            self.layer4 = self._make_layer(512, self.num_blocks[3], stride=2)
+        else:
+            # Standard ResNet architecture for larger images
+            self.layer1 = self._make_layer(64, self.num_blocks[0], stride=1)
+            self.layer2 = self._make_layer(128, self.num_blocks[1], stride=2)
+            self.layer3 = self._make_layer(256, self.num_blocks[2], stride=2)
+            self.layer4 = self._make_layer(512, self.num_blocks[3], stride=2)
         
         # Global average pooling and classifier
         self.avgpool = MultiChannelAdaptiveAvgPool2d((1, 1))
         
-        # Final classifier - choose between shared fusion or separate classifiers
-        final_features = 512 * self.block.expansion
+        # Final classifier - calculate final feature size based on architecture
+        # If using reduced architecture, final features will be smaller
+        final_features = (512 if not self.reduce_architecture else 256) * self.block.expansion
         
-        # Add dropout before classifier if specified
-        if self.dropout > 0:
-            self.dropout_layer = nn.Dropout(self.dropout)
+        # Add dropout before classifier if specified - helps prevent overfitting
+        # Higher dropout for reduced architecture to prevent overfitting on smaller dataset
+        dropout_rate = self.dropout
+        if self.reduce_architecture and dropout_rate < 0.2:
+            dropout_rate = max(0.2, dropout_rate)  # Minimum 0.2 dropout for CIFAR
+        
+        if dropout_rate > 0:
+            self.dropout_layer = nn.Dropout(dropout_rate)
         else:
             self.dropout_layer = None
         
@@ -193,11 +254,12 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             self.brightness_classifier = nn.Linear(final_features, self.num_classes)
             
         # Adjust batch normalization momentum for all BatchNorm layers
-        # Use a standard momentum value for more predictable updates
+        # Use a lower momentum value for more stable updates on small batches
+        momentum = 0.05 if self.reduce_architecture else 0.1
         for module in self.modules():
             if isinstance(module, MultiChannelBatchNorm2d):
-                module.color_bn.momentum = 0.1  # Standard PyTorch default
-                module.brightness_bn.momentum = 0.1  # Standard PyTorch default
+                module.color_bn.momentum = momentum
+                module.brightness_bn.momentum = momentum
     
     def _make_layer(self, planes: int, blocks: int, stride: int = 1) -> MultiChannelSequential:
         """
@@ -212,6 +274,10 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             MultiChannelSequential containing all blocks
         """
         downsample = None
+        
+        # Reduce the number of channels if using reduced architecture
+        if self.reduce_architecture:
+            planes = planes // 2  # Halve the number of channels for CIFAR-100
         
         # Create downsample if dimensions change
         if stride != 1 or self.inplanes != planes * self.block.expansion:
@@ -246,29 +312,28 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         return MultiChannelSequential(*layers)
     
     def _initialize_weights(self):
-        """Initialize network weights following ResNet conventions with improved stability."""
+        """Initialize network weights with conservative values to prevent exploding gradients."""
         for module in self.modules():
             if isinstance(module, MultiChannelConv2d):
-                # Initialize both color and brightness conv weights with more stable initialization
-                # Use fan_out mode for better gradient flow in CNNs (standard for ResNet)
-                nn.init.kaiming_normal_(module.color_weight, mode='fan_out', nonlinearity='relu')
-                nn.init.kaiming_normal_(module.brightness_weight, mode='fan_out', nonlinearity='relu')
+                # Switch to fan_in mode for convolutions to prevent exploding activations
+                # This is more appropriate for deep networks on smaller datasets like CIFAR
+                nn.init.kaiming_normal_(module.color_weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(module.brightness_weight, mode='fan_in', nonlinearity='relu')
                 # Zero out bias if present (for stability)
                 if module.color_bias is not None:
                     nn.init.zeros_(module.color_bias)
                 if module.brightness_bias is not None:
                     nn.init.zeros_(module.brightness_bias)
             elif isinstance(module, MultiChannelBatchNorm2d):
-                # Initialize both color and brightness batch norm with slightly higher initial values
-                # for better gradient flow in early training
-                nn.init.constant_(module.color_bn.weight, 1.0)  # Standard value is more stable
+                # Initialize BatchNorm with more conservative weights (0.5 instead of 1.0)
+                # to prevent activation explosion in deeper layers
+                nn.init.constant_(module.color_bn.weight, 0.5)
                 nn.init.constant_(module.color_bn.bias, 0.0)
-                nn.init.constant_(module.brightness_bn.weight, 1.0)
+                nn.init.constant_(module.brightness_bn.weight, 0.5)
                 nn.init.constant_(module.brightness_bn.bias, 0.0)
             elif isinstance(module, nn.Linear):
-                # Use Xavier initialization for fully connected layers
-                # This works better for the final classification layers
-                nn.init.xavier_normal_(module.weight)
+                # Use Xavier initialization for fully connected layers with smaller gain
+                nn.init.xavier_normal_(module.weight, gain=0.8)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
@@ -326,11 +391,22 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         color_x = self.maxpool(color_x)
         brightness_x = self.maxpool(brightness_x)
         
-        # ResNet layers
+        # ResNet layers with stabilization
         color_x, brightness_x = self.layer1(color_x, brightness_x)
+        color_x = self._stabilize_activations(color_x)
+        brightness_x = self._stabilize_activations(brightness_x)
+        
         color_x, brightness_x = self.layer2(color_x, brightness_x)
+        color_x = self._stabilize_activations(color_x)
+        brightness_x = self._stabilize_activations(brightness_x)
+        
         color_x, brightness_x = self.layer3(color_x, brightness_x)
+        color_x = self._stabilize_activations(color_x)
+        brightness_x = self._stabilize_activations(brightness_x)
+        
         color_x, brightness_x = self.layer4(color_x, brightness_x)
+        color_x = self._stabilize_activations(color_x)
+        brightness_x = self._stabilize_activations(brightness_x)
         
         # Global average pooling
         color_x, brightness_x = self.avgpool(color_x, brightness_x)
@@ -339,11 +415,10 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         color_x = torch.flatten(color_x, 1)
         brightness_x = torch.flatten(brightness_x, 1)
         
-        # Check for NaN features after processing
-        if torch.isnan(color_x).any() or torch.isnan(brightness_x).any():
-            # Enable feature map recovery if NaNs are detected
-            # This helps prevent model from getting stuck
+        # Safety check for NaN features
+        if torch.isnan(color_x).any():
             color_x = torch.where(torch.isnan(color_x), torch.zeros_like(color_x), color_x)
+        if torch.isnan(brightness_x).any():
             brightness_x = torch.where(torch.isnan(brightness_x), torch.zeros_like(brightness_x), brightness_x)
         
         # Apply dropout if enabled
@@ -351,16 +426,19 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             color_x = self.dropout_layer(color_x)
             brightness_x = self.dropout_layer(brightness_x)
         
+        # Stabilize final features before fusion to prevent gradient explosion
+        color_x = self._stabilize_features(color_x)
+        brightness_x = self._stabilize_features(brightness_x)
+        
         # Combine outputs for classification
         if self.use_shared_classifier:
             # Use shared classifier for optimal fusion
             fused_features = torch.cat([color_x, brightness_x], dim=1)
             logits = self.shared_classifier(fused_features)
             
-            # Final check for NaN outputs
+            # Safety check for NaN outputs
             if torch.isnan(logits).any():
                 logits = torch.zeros_like(logits)
-                print("Warning: NaN detected in model output. Using zero outputs.")
                 
             return logits
         else:
@@ -368,179 +446,143 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             color_logits = self.color_classifier(color_x)
             brightness_logits = self.brightness_classifier(brightness_x)
             
-            # Final check for NaN outputs
+            # Combine outputs
             combined_logits = color_logits + brightness_logits
+            
+            # Safety check for NaN outputs
             if torch.isnan(combined_logits).any():
                 combined_logits = torch.zeros_like(combined_logits)
-                print("Warning: NaN detected in model output. Using zero outputs.")
                 
             return combined_logits
-    
-    def analyze_pathways(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            
+    def _stabilize_activations(self, x):
         """
-        Analyze individual pathway contributions for research purposes.
-        
-        Returns separate outputs for each stream to analyze individual pathway contributions.
-        Use this method only for research, visualization, and pathway analysis.
+        Apply activation stabilization to prevent gradient explosion.
         
         Args:
-            color_input: Color image tensor [batch_size, channels, height, width]
-            brightness_input: Brightness image tensor [batch_size, channels, height, width]
+            x: Input tensor
             
         Returns:
-            Tuple of (color_logits, brightness_logits) [batch_size, num_classes] each
-            Separate outputs for analyzing individual pathway performance
+            Stabilized tensor
         """
-        # Apply the same normalization as in forward() for consistency
-        if color_input.max() > 1.0 and color_input.min() >= 0.0:
-            color_input = color_input / 255.0
+        # Check for extreme values and clip if necessary
+        if x.abs().max() > 50.0:
+            x = torch.clamp(x, min=-50.0, max=50.0)
+        
+        # Check for NaN values and replace with zeros
+        if torch.isnan(x).any():
+            x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
+                
+        return x
+    
+    def _stabilize_features(self, x):
+        """
+        Stabilize feature vectors before classification to prevent gradient explosion.
+        
+        Args:
+            x: Feature tensor [batch_size, features]
             
-        # Apply CIFAR-100 mean/std normalization for RGB channels
-        if color_input.shape[1] == 3:
-            mean = torch.tensor([0.5071, 0.4867, 0.4408], device=color_input.device).view(1, 3, 1, 1)
-            std = torch.tensor([0.2675, 0.2565, 0.2761], device=color_input.device).view(1, 3, 1, 1)
-            color_input = (color_input - mean) / std
+        Returns:
+            Stabilized features
+        """
+        # Apply L2 normalization if magnitudes are too large
+        norm = x.norm(dim=1, keepdim=True)
+        if (norm > 10.0).any():
+            # Scale down large feature vectors
+            scale_factor = torch.clamp(10.0 / norm, max=1.0)
+            x = x * scale_factor
             
-        # Normalize brightness channel
-        if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
-            brightness_input = brightness_input / 255.0
-            
-        # Standardize brightness
-        if brightness_input.shape[1] == 1:
-            batch_mean = brightness_input.mean(dim=(2, 3), keepdim=True)
-            batch_std = brightness_input.std(dim=(2, 3), keepdim=True) + 1e-6
-            brightness_input = (brightness_input - batch_mean) / batch_std
-            
-        # Initial layers
-        color_x, brightness_x = self.conv1(color_input, brightness_input)
-        color_x, brightness_x = self.bn1(color_x, brightness_x)
-        color_x, brightness_x = self.activation_initial(color_x, brightness_x)
+        return x
+    
+    def compile(self, optimizer: str = 'adam', learning_rate: float = 0.001, 
+                weight_decay: float = 0.0, loss: str = 'cross_entropy', metrics: List[str] = None,
+                gradient_clip: float = 1.0, scheduler: str = 'cosine'):
+        """
+        Compile the model with optimizer, loss function, and gradient clipping (Keras-like API).
         
-        # Apply maxpool to both streams
-        color_x = self.maxpool(color_x)
-        brightness_x = self.maxpool(brightness_x)
-        
-        # ResNet layers
-        color_x, brightness_x = self.layer1(color_x, brightness_x)
-        color_x, brightness_x = self.layer2(color_x, brightness_x)
-        color_x, brightness_x = self.layer3(color_x, brightness_x)
-        color_x, brightness_x = self.layer4(color_x, brightness_x)
-        
-        # Global average pooling
-        color_x, brightness_x = self.avgpool(color_x, brightness_x)
-        
-        # Flatten features
-        color_x = torch.flatten(color_x, 1)
-        brightness_x = torch.flatten(brightness_x, 1)
-        
-        # Apply dropout if enabled (for consistency)
-        if self.dropout_layer is not None:
-            color_x = self.dropout_layer(color_x)
-            brightness_x = self.dropout_layer(brightness_x)
-        
-        # Apply projection/classifier heads to get separate outputs
-        if self.use_shared_classifier:
-            # Use separate heads for research analysis
-            color_logits = self.color_head(color_x)
-            brightness_logits = self.brightness_head(brightness_x)
+        Args:
+            optimizer: Optimizer name ('adam', 'adamw', 'sgd', 'rmsprop')
+            learning_rate: Learning rate
+            weight_decay: Weight decay (L2 regularization)
+            loss: Loss function name ('cross_entropy')
+            metrics: List of metrics to track
+            gradient_clip: Maximum norm for gradient clipping
+            scheduler: Learning rate scheduler ('cosine', 'onecycle', 'none')
+        """
+        # Configure optimizers with appropriate parameters for CIFAR-100
+        if optimizer.lower() == 'adam':
+            self.optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=1e-8)
+        elif optimizer.lower() == 'adamw':
+            self.optimizer = optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=1e-8)
+        elif optimizer.lower() == 'sgd':
+            # Use SGD with Nesterov momentum for CIFAR-100 (standard practice)
+            self.optimizer = optim.SGD(self.parameters(), lr=learning_rate, momentum=0.9, nesterov=True, weight_decay=weight_decay)
+        elif optimizer.lower() == 'rmsprop':
+            self.optimizer = optim.RMSprop(self.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
         else:
-            # Legacy: Use separate classifiers
-            color_logits = self.color_classifier(color_x)
-            brightness_logits = self.brightness_classifier(brightness_x)
+            raise ValueError(f"Unsupported optimizer: {optimizer}")
         
-        return color_logits, brightness_logits
+        # Configure loss function
+        if loss.lower() == 'cross_entropy':
+            self.criterion = nn.CrossEntropyLoss()
+        else:
+            raise ValueError(f"Unsupported loss function: {loss}")
+        
+        # Configure learning rate scheduler
+        self.scheduler = None
+        self.scheduler_type = scheduler.lower()
+        
+        if self.scheduler_type == 'cosine':
+            # Cosine annealing is effective for CIFAR-100
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=100, eta_min=learning_rate * 0.01
+            )
+        elif self.scheduler_type == 'onecycle':
+            # OneCycle is another good option for CIFAR-100
+            self.scheduler = optim.lr_scheduler.OneCycleLR(
+                self.optimizer, max_lr=learning_rate,
+                steps_per_epoch=500,  # This will be updated in fit() with actual steps
+                epochs=100,  # This will also be updated in fit()
+                pct_start=0.3  # Spend 30% of training warming up
+            )
+        elif self.scheduler_type != 'none':
+            raise ValueError(f"Unsupported scheduler: {scheduler}")
+        
+        # Store configuration
+        self.metrics = metrics or ['accuracy']
+        self.gradient_clip = gradient_clip
+        self.is_compiled = True
+        
+        # Log compilation details
+        model_name = self.__class__.__name__
+        print(f"{model_name} compiled with {optimizer} optimizer, {loss} loss, "
+              f"learning rate: {learning_rate}, weight decay: {weight_decay}, "
+              f"gradient clip: {gradient_clip}, scheduler: {scheduler}")
+              
+        # Record configuration for debugging
+        self._config = {
+            'optimizer': optimizer,
+            'learning_rate': learning_rate,
+            'weight_decay': weight_decay,
+            'loss': loss,
+            'gradient_clip': gradient_clip,
+            'scheduler': scheduler,
+            'reduce_architecture': self.reduce_architecture,
+            'batch_norm_momentum': 0.05 if self.reduce_architecture else 0.1,
+            'dropout': self.dropout,
+        }
+        
+        return self
     
-    def extract_features(self, color_input: torch.Tensor, brightness_input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract features before final classification."""
-        # Apply the same normalization as in forward() for consistency
-        if color_input.max() > 1.0 and color_input.min() >= 0.0:
-            color_input = color_input / 255.0
-            
-        # Apply CIFAR-100 mean/std normalization for RGB channels
-        if color_input.shape[1] == 3:
-            mean = torch.tensor([0.5071, 0.4867, 0.4408], device=color_input.device).view(1, 3, 1, 1)
-            std = torch.tensor([0.2675, 0.2565, 0.2761], device=color_input.device).view(1, 3, 1, 1)
-            color_input = (color_input - mean) / std
-            
-        # Normalize brightness channel
-        if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
-            brightness_input = brightness_input / 255.0
-            
-        # Standardize brightness
-        if brightness_input.shape[1] == 1:
-            batch_mean = brightness_input.mean(dim=(2, 3), keepdim=True)
-            batch_std = brightness_input.std(dim=(2, 3), keepdim=True) + 1e-6
-            brightness_input = (brightness_input - batch_mean) / batch_std
-            
-        # Process through all layers except classifier
-        color_x, brightness_x = self.conv1(color_input, brightness_input)
-        color_x, brightness_x = self.bn1(color_x, brightness_x)
-        color_x, brightness_x = self.activation_initial(color_x, brightness_x)
-        
-        color_x = self.maxpool(color_x)
-        brightness_x = self.maxpool(brightness_x)
-        
-        color_x, brightness_x = self.layer1(color_x, brightness_x)
-        color_x, brightness_x = self.layer2(color_x, brightness_x)
-        color_x, brightness_x = self.layer3(color_x, brightness_x)
-        color_x, brightness_x = self.layer4(color_x, brightness_x)
-        
-        color_x, brightness_x = self.avgpool(color_x, brightness_x)
-        
-        color_x = torch.flatten(color_x, 1)
-        brightness_x = torch.flatten(brightness_x, 1)
-        
-        return color_x, brightness_x
-    
-    def get_pathway_importance(self) -> Dict[str, float]:
-        """Calculate pathway importance based on classifier weights."""
-        with torch.no_grad():
-            if self.use_shared_classifier:
-                # For shared classifier, analyze both the shared weights and separate heads
-                shared_weights = self.shared_classifier.weight.data
-                feature_size = shared_weights.shape[1] // 2
-                color_shared_weights = shared_weights[:, :feature_size]
-                brightness_shared_weights = shared_weights[:, feature_size:]
-                
-                # Also analyze separate heads
-                color_head_weights = self.color_head.weight.data
-                brightness_head_weights = self.brightness_head.weight.data
-                
-                color_norm = torch.norm(color_shared_weights).item() + torch.norm(color_head_weights).item()
-                brightness_norm = torch.norm(brightness_shared_weights).item() + torch.norm(brightness_head_weights).item()
-                total_norm = color_norm + brightness_norm + 1e-8
-                
-                return {
-                    'color_pathway': color_norm / total_norm,
-                    'brightness_pathway': brightness_norm / total_norm,
-                    'pathway_ratio': color_norm / (brightness_norm + 1e-8),
-                    'fusion_type': 'shared_with_separate_heads'
-                }
-            else:
-                # For separate classifiers, analyze each pathway
-                color_weight_norm = torch.norm(self.color_classifier.weight.data).item()
-                brightness_weight_norm = torch.norm(self.brightness_classifier.weight.data).item()
-                total_norm = color_weight_norm + brightness_weight_norm + 1e-8
-                
-                return {
-                    'color_pathway': color_weight_norm / total_norm,
-                    'brightness_pathway': brightness_weight_norm / total_norm,
-                    'pathway_ratio': color_weight_norm / (brightness_weight_norm + 1e-8),
-                    'fusion_type': 'separate_classifiers'
-                }
-
     def fit(self, train_color_data=None, train_brightness_data=None, train_labels=None,
-            val_color_data=None, val_brightness_data=None, val_labels=None,
-            train_loader=None, val_loader=None, batch_size=None, epochs=10,
-            learning_rate=None, weight_decay=0.0001, early_stopping_patience=5,
-            scheduler_type='cosine', min_lr=1e-6, verbose=1, 
-            num_workers=None, pin_memory=None, max_grad_norm=1.0,
-            weight_decay_strategy='constant', final_weight_decay=0.01) -> Dict[str, List[float]]:
+             val_color_data=None, val_brightness_data=None, val_labels=None,
+             train_loader=None, val_loader=None, batch_size=None, epochs=10,
+             early_stopping_patience=5, verbose=1, num_workers=None, pin_memory=None):
         """
         Unified fit method that handles both direct data arrays and DataLoaders with on-the-fly augmentation.
         
         This enhanced method supports two modes of operation:
-        1. Direct data array input (original behavior): Provide train_color_data, train_brightness_data, train_labels
+        1. Direct data array input: Provide train_color_data, train_brightness_data, train_labels
         2. DataLoader input (for on-the-fly augmentation): Provide train_loader directly
         
         Memory-Efficient Training:
@@ -561,38 +603,19 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             val_loader: Optional DataLoader for validation (will be used instead of direct data if provided)
             batch_size: Batch size for training when using direct data (auto-detected if None)
             epochs: Number of epochs to train
-            learning_rate: Learning rate for the optimizer (defaults to 0.001 if None)
-            weight_decay: Weight decay (L2 regularization)
-            early_stopping_patience: Patience for early stopping
-            scheduler_type: Learning rate scheduler type ('cosine', 'step', 'none')
-            min_lr: Minimum learning rate for cosine annealing
+            early_stopping_patience: Stop training when validation loss doesn't improve
             verbose: Verbosity level (0: silent, 1: progress bar, 2: one line per epoch)
             num_workers: Number of workers for data loading (auto-detected if None)
             pin_memory: Whether to pin memory for faster GPU transfer (auto-detected if None)
-            max_grad_norm: Maximum gradient norm for gradient clipping (helps prevent exploding gradients)
             
         Returns:
-            history: Dictionary containing training and validation metrics
+            Dictionary with training history
         """
-        # Enable debug mode for issue investigation
+        if not self.is_compiled:
+            raise RuntimeError("Model must be compiled before training. Call model.compile() first.")
+        
+        # Enable debug mode for gradient tracking
         self.debug_mode = True
-        self.gradient_norms = []
-        self.feature_norms = []
-        
-        # Use a default learning rate if not provided
-        if learning_rate is None:
-            learning_rate = 0.001  # Standard default learning rate
-            if verbose > 0:
-                print(f"Using default learning rate: {learning_rate}")
-        
-        # Initialize history dictionary to track metrics
-        history = {
-            'loss': [],
-            'accuracy': [],
-            'val_loss': [],
-            'val_accuracy': [],
-            'gradient_norm': []  # Track gradient norms for debugging
-        }
         
         # Determine if we're using DataLoaders or direct data
         using_dataloaders = train_loader is not None
@@ -622,22 +645,15 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         if pin_memory is None:
             pin_memory = self.device.type == 'cuda'
             
-        if verbose > 0:
-            print(f"🚀 Training {self.__class__.__name__} with {'DataLoader pipeline' if using_dataloaders else 'direct data'}:")
-            print(f"   Device: {self.device}")
-            if using_dataloaders:
-                print(f"   Train batches: {len(train_loader)}")
-                if val_loader:
-                    print(f"   Val batches: {len(val_loader)}")
-            else:
-                print(f"   Batch size: {batch_size}")
-            print(f"   Mixed precision: {self.use_mixed_precision}")
-            print(f"   Workers: {num_workers}")
-            print(f"   Pin memory: {pin_memory}")
-            print(f"   Gradient clipping: {max_grad_norm}")
-            print(f"   Initial weight decay: {weight_decay} (strategy: {weight_decay_strategy})")
-            print(f"   Learning rate: {learning_rate}")
-            print(f"   Reduced architecture: {self.reduce_architecture}")
+        # Training history
+        history = {
+            'train_loss': [],
+            'train_accuracy': [],
+            'val_loss': [],
+            'val_accuracy': [],
+            'learning_rates': [],
+            'gradient_norm': []  # Track gradient norms for debugging
+        }
         
         # Set up train and validation loaders based on input mode
         if not using_dataloaders:
@@ -675,76 +691,42 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     pin_memory=pin_memory,
                     persistent_workers=num_workers > 0 and self.device.type != 'mps'
                 )
-        
-        # Optimizer and loss function - use AdamW with more stable defaults
-        # Similar to what BaseMultiChannelNetwork uses successfully
-        optimizer = optim.AdamW(
-            self.parameters(), 
-            lr=learning_rate, 
-            weight_decay=weight_decay,
-            betas=(0.9, 0.999),  # Standard AdamW betas
-            eps=1e-8  # More stable epsilon value
-        )
-        criterion = nn.CrossEntropyLoss()
-        
-        # Learning rate scheduler setup based on scheduler type
-        if scheduler_type.lower() == 'onecycle':
-            # OneCycleLR is often more effective than standard schedulers
-            # It implements a cyclical learning rate policy with warmup
-            steps_per_epoch = len(train_loader)
-            total_steps = steps_per_epoch * epochs
             
-            # Use OneCycleLR with sensible defaults
-            scheduler = optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=learning_rate,
-                total_steps=total_steps,
-                pct_start=0.3,  # 30% of training for warmup
-                div_factor=25,  # LR starts at max_lr/25
-                final_div_factor=1000,  # Final LR is max_lr/25000
-                anneal_strategy='cos'  # Cosine annealing
+        # Print training configuration
+        if verbose > 0:
+            model_name = self.__class__.__name__
+            print(f"🚀 Training {model_name} with {'DataLoader pipeline' if using_dataloaders else 'direct data'}:")
+            print(f"   Device: {self.device}")
+            print(f"   Architecture: {'Reduced (CIFAR optimized)' if self.reduce_architecture else 'Full'}")
+            print(f"   Mixed precision: {self.use_mixed_precision}")
+            print(f"   Gradient clipping: {self.gradient_clip}")
+            print(f"   Scheduler: {self.scheduler_type}")
+            print(f"   BatchNorm momentum: {0.05 if self.reduce_architecture else 0.1}")
+            if using_dataloaders:
+                print(f"   Train batches: {len(train_loader)}")
+                if val_loader:
+                    print(f"   Val batches: {len(val_loader)}")
+            else:
+                print(f"   Batch size: {batch_size}")
+            print(f"   Workers: {num_workers}")
+            print(f"   Pin memory: {pin_memory}")
+                
+        # Update OneCycleLR scheduler if used
+        if self.scheduler_type == 'onecycle' and self.scheduler is not None:
+            # Reconfigure scheduler with actual steps
+            self.scheduler = optim.lr_scheduler.OneCycleLR(
+                self.optimizer, 
+                max_lr=self._config['learning_rate'],
+                steps_per_epoch=len(train_loader),
+                epochs=epochs,
+                pct_start=0.3
             )
-            # This scheduler needs to step after each batch
-            scheduler_step_batch = True
-        elif scheduler_type.lower() == 'cosine':
-            # Standard cosine annealing
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, 
-                T_max=epochs, 
-                eta_min=min_lr
-            )
-            scheduler_step_batch = False
-        elif scheduler_type.lower() == 'step':
-            scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
-            scheduler_step_batch = False
-        elif scheduler_type.lower() == 'reduce_on_plateau':
-            # Add ReduceLROnPlateau option which can be more stable
-            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=2, 
-                min_lr=min_lr, verbose=verbose > 0
-            )
-            scheduler_step_batch = False
-        else:
-            scheduler = None
-            scheduler_step_batch = False
         
         # Training loop
         best_val_loss = float('inf')
         patience_counter = 0
         
         for epoch in range(epochs):
-            # Update weight decay for better regularization
-            current_weight_decay = self._update_weight_decay(
-                optimizer, epoch, epochs, 
-                initial_weight_decay=weight_decay,
-                final_weight_decay=final_weight_decay, 
-                strategy=weight_decay_strategy
-            )
-            
-            # Apply updated weight decay
-            for param_group in optimizer.param_groups:
-                param_group['weight_decay'] = current_weight_decay
-                
             # Clear any existing tqdm instances
             try:
                 for inst in list(getattr(tqdm, '_instances', [])):
@@ -754,275 +736,145 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                         pass  # Ignore if we can't close an instance
             except Exception:
                 pass  # Ignore any errors in cleaning up tqdm instances
-            
+                
+            # Single progress bar for training
+            epoch_pbar = None
+            if verbose == 1:
+                epoch_pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}")
+                
             # Training phase
             self.train()
             total_loss = 0.0
-            train_correct = 0
-            train_total = 0
+            correct = 0
+            total = 0
+            batch_lr = []
             epoch_grad_norm = 0.0
             num_batches = 0
-            
-            # Create progress bar for training
-            epoch_pbar = None
-            if verbose == 1:
-                epoch_pbar = tqdm(
-                    total=len(train_loader), 
-                    desc=f"Epoch {epoch+1}/{epochs}", 
-                    leave=True
-                )
             
             # Training loop
             for batch_idx, data in enumerate(train_loader):
                 # Unpack data - handle different formats
                 if isinstance(data, (list, tuple)) and len(data) == 3:
-                    batch_color, batch_brightness, batch_labels = data
+                    color_input, brightness_input, labels = data
                 else:
                     raise ValueError("DataLoader must provide (color, brightness, labels) tuples")
                 
-                # Move data to device if not already there
-                if batch_color.device != self.device:
-                    batch_color = batch_color.to(self.device, non_blocking=True)
-                if batch_brightness.device != self.device:
-                    batch_brightness = batch_brightness.to(self.device, non_blocking=True)
-                if batch_labels.device != self.device:
-                    batch_labels = batch_labels.to(self.device, non_blocking=True)
+                # Move data to device with non-blocking transfer for async
+                if color_input.device != self.device:
+                    color_input = color_input.to(self.device, non_blocking=True)
+                if brightness_input.device != self.device:
+                    brightness_input = brightness_input.to(self.device, non_blocking=True)
+                if labels.device != self.device:
+                    labels = labels.to(self.device, non_blocking=True)
                 
-                # Check for NaN in inputs
-                if torch.isnan(batch_color).any() or torch.isnan(batch_brightness).any():
+                # Check for NaN inputs
+                if torch.isnan(color_input).any() or torch.isnan(brightness_input).any():
                     print(f"Warning: NaN detected in batch {batch_idx} inputs. Skipping batch.")
                     continue
                 
                 # Zero gradients
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 
                 # Forward pass with mixed precision if available
-                if self.use_mixed_precision and self.scaler is not None:
-                    with autocast("cuda" if torch.cuda.is_available() else "cpu"):
-                        outputs = self(batch_color, batch_brightness)
-                        loss = criterion(outputs, batch_labels)
-                    
-                    # Backward pass with scaler
+                if self.use_mixed_precision and self.scaler:
+                    with autocast(device_type='cuda' if 'cuda' in str(self.device) else 'cpu'):
+                        outputs = self(color_input, brightness_input)
+                        loss = self.criterion(outputs, labels)
+                        
+                    # Backward pass with scaled gradients
                     self.scaler.scale(loss).backward()
                     
-                    # Unscale gradients once before gradient clipping and debugging
-                    self.scaler.unscale_(optimizer)
-                    
-                    # Track gradient norm for debugging (now safely unscaled)
+                    # Track gradient norm for debugging
                     if self.debug_mode:
-                        with torch.no_grad():
-                            # Calculate gradient norm in a way that avoids recursion
-                            total_norm = 0.0
-                            for p in self.parameters():
-                                if p.grad is not None:
-                                    # Direct tensor operation without method calls that might be patched
-                                    param_norm = torch.sqrt(torch.sum(p.grad.detach().data ** 2))
-                                    total_norm += param_norm.item() ** 2
-                            grad_norm = total_norm ** 0.5
-                            epoch_grad_norm += grad_norm
-                            num_batches += 1
+                        self.scaler.unscale_(self.optimizer)
+                        grad_norm = safe_clip_grad_norm(self.parameters(), max_value=float('inf'))
+                        epoch_grad_norm += grad_norm.item()
+                        num_batches += 1
                     
-                    # Apply gradient clipping (on unscaled gradients)
-                    if max_grad_norm > 0:
-                        # Use our custom safe gradient clipping function to avoid recursion errors
-                        safe_clip_grad_norm(
-                            [p for p in self.parameters() if p.grad is not None],
-                            max_grad_norm
-                        )
+                    # Apply gradient clipping to prevent exploding gradients
+                    if self.gradient_clip > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        safe_clip_grad_norm(self.parameters(), self.gradient_clip)
                     
-                    # Step optimizer with scaler
-                    self.scaler.step(optimizer)
+                    # Update weights with scaled optimizer step
+                    self.scaler.step(self.optimizer)
                     self.scaler.update()
-                    
-                    # Step OneCycleLR scheduler after each batch if needed
-                    if scheduler is not None and scheduler_step_batch:
-                        scheduler.step()
                 else:
-                    # Standard forward and backward pass
-                    outputs = self(batch_color, batch_brightness)
-                    loss = criterion(outputs, batch_labels)
+                    # Standard precision training
+                    outputs = self(color_input, brightness_input)
+                    loss = self.criterion(outputs, labels)
                     loss.backward()
                     
-                    # Track gradient norm for debugging in a more stable way
+                    # Track gradient norm for debugging
                     if self.debug_mode:
-                        with torch.no_grad():
-                            # Calculate gradient norm in a way that avoids recursion
-                            total_norm = 0.0
-                            for p in self.parameters():
-                                if p.grad is not None:
-                                    # Direct tensor operation without method calls that might be patched
-                                    param_norm = torch.sqrt(torch.sum(p.grad.detach().data ** 2))
-                                    total_norm += param_norm.item() ** 2
-                            grad_norm = total_norm ** 0.5
-                            epoch_grad_norm += grad_norm
-                            num_batches += 1
+                        grad_norm = safe_clip_grad_norm(self.parameters(), max_value=float('inf'))
+                        epoch_grad_norm += grad_norm.item()
+                        num_batches += 1
                     
                     # Apply gradient clipping
-                    if max_grad_norm > 0:
-                        # Use our custom safe gradient clipping function to avoid recursion errors
-                        safe_clip_grad_norm(
-                            [p for p in self.parameters() if p.grad is not None],
-                            max_grad_norm
-                        )
-                    
-                    # Step optimizer
-                    optimizer.step()
+                    if self.gradient_clip > 0:
+                        safe_clip_grad_norm(self.parameters(), self.gradient_clip)
+                        
+                    # Update weights
+                    self.optimizer.step()
                 
-                # Step OneCycleLR scheduler after each batch if needed
-                if scheduler is not None and scheduler_step_batch:
-                    scheduler.step()
+                # Step the scheduler (for batch-level schedulers like OneCycle)
+                if self.scheduler_type == 'onecycle' and self.scheduler:
+                    self.scheduler.step()
+                    batch_lr.append(self.scheduler.get_last_lr()[0])
                 
-                # Track metrics
+                # Calculate training metrics
                 total_loss += loss.item()
-                
-                # Calculate training accuracy
-                with torch.no_grad():  # Ensure no unnecessary memory is retained for gradient calculation
-                    _, predicted = torch.max(outputs.data, 1)
-                    train_total += batch_labels.size(0)
-                    train_correct += (predicted == batch_labels).sum().item()
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
                 
                 # Explicitly clear unnecessary tensors to help with memory management
                 del outputs, loss, predicted
-                if self.use_mixed_precision and self.scaler is not None:
+                if self.use_mixed_precision and self.scaler is not None and batch_idx % 20 == 0:
                     torch.cuda.empty_cache()  # Periodic cache clearing for large datasets
                 
                 # Update progress bar
                 if verbose == 1 and epoch_pbar is not None:
+                    current_lr = self.optimizer.param_groups[0]['lr']
                     epoch_pbar.set_postfix({
-                        'loss': total_loss / (batch_idx + 1), 
-                        'acc': 100. * train_correct / train_total
+                        'loss': f'{total_loss / (batch_idx + 1):.4f}',
+                        'acc': f'{correct/total:.4f}',
+                        'lr': f'{current_lr:.6f}'
                     })
                     epoch_pbar.update(1)
             
+            # Close progress bar
+            if verbose == 1 and epoch_pbar is not None:
+                epoch_pbar.close()
+                
             # Calculate average gradient norm for this epoch
             avg_grad_norm = epoch_grad_norm / max(num_batches, 1)
             history['gradient_norm'].append(avg_grad_norm)
-            
-            # Update learning rate scheduler at epoch level for non-batch schedulers
-            if scheduler is not None and not scheduler_step_batch and scheduler_type.lower() != 'reduce_on_plateau':
-                scheduler.step()
-            
-            # Calculate epoch metrics
+                
+            # Calculate epoch-level metrics
             avg_train_loss = total_loss / len(train_loader)
-            train_accuracy = train_correct / train_total
+            train_accuracy = correct / total
+            current_lr = self.optimizer.param_groups[0]['lr']
             
-            # Store training metrics in history
-            history['loss'].append(avg_train_loss)
-            history['accuracy'].append(train_accuracy)
+            # Step the scheduler (for epoch-level schedulers)
+            if self.scheduler_type == 'cosine' and self.scheduler:
+                self.scheduler.step()
+                
+            # Record training metrics
+            history['train_loss'].append(avg_train_loss)
+            history['train_accuracy'].append(train_accuracy)
+            history['learning_rates'].append(batch_lr if batch_lr else [current_lr])
             
             # Validation phase
             if val_loader is not None:
-                self.eval()
-                total_val_loss = 0.0
-                val_correct = 0
-                val_total = 0
-                
-                with torch.no_grad():
-                    for batch_idx, data in enumerate(val_loader):
-                        # Unpack data - handle different formats
-                        if isinstance(data, (list, tuple)) and len(data) == 3:
-                            batch_color, batch_brightness, batch_labels = data
-                        else:
-                            raise ValueError("Val DataLoader must provide (color, brightness, labels) tuples")
-                        
-                        # Move data to device if not already there
-                        if batch_color.device != self.device:
-                            batch_color = batch_color.to(self.device, non_blocking=True)
-                        if batch_brightness.device != self.device:
-                            batch_brightness = batch_brightness.to(self.device, non_blocking=True)
-                        if batch_labels.device != self.device:
-                            batch_labels = batch_labels.to(self.device, non_blocking=True)
-                        
-                        # Forward pass
-                        if self.use_mixed_precision and self.scaler is not None:
-                            with autocast("cuda" if torch.cuda.is_available() else "cpu"):
-                                outputs = self(batch_color, batch_brightness)
-                                loss = criterion(outputs, batch_labels)
-                        else:
-                            outputs = self(batch_color, batch_brightness)
-                            loss = criterion(outputs, batch_labels)
-                        
-                        # Track metrics
-                        total_val_loss += loss.item()
-                        
-                        # Calculate validation accuracy
-                        _, predicted = torch.max(outputs.data, 1)
-                        val_total += batch_labels.size(0)
-                        val_correct += (predicted == batch_labels).sum().item()
-                        
-                        # Explicitly clear unnecessary tensors to help with memory management
-                        del outputs, loss, predicted
-                        
-                        # Periodically clear cache during validation
-                        if batch_idx % 20 == 0 and self.device.type == 'cuda':
-                            torch.cuda.empty_cache()
-                
-                # Calculate epoch validation metrics
-                avg_val_loss = total_val_loss / len(val_loader)
-                val_accuracy = val_correct / val_total
-                
-                # Store validation metrics in history
-                history['val_loss'].append(avg_val_loss)
+                val_loss, val_accuracy = self._validate(val_loader)
+                history['val_loss'].append(val_loss)
                 history['val_accuracy'].append(val_accuracy)
                 
-                # Update scheduler if using ReduceLROnPlateau
-                if scheduler is not None and scheduler_type.lower() == 'reduce_on_plateau':
-                    scheduler.step(avg_val_loss)
-                
-                # Prepare summary for the final epoch progress bar update
-                summary = {
-                    'Loss': f'{avg_train_loss:.4f}',
-                    'Acc': f'{train_accuracy:.4f}',
-                    'Val_Loss': f'{avg_val_loss:.4f}',
-                    'Val_Acc': f'{val_accuracy:.4f}',
-                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}',
-                    'GradNorm': f'{avg_grad_norm:.2f}'
-                }
-                
-                # Update progress bar with all metrics in one line
-                if verbose == 1 and epoch_pbar is not None:
-                    epoch_pbar.set_postfix(summary)
-                    epoch_pbar.refresh()
-                    epoch_pbar.close()
-                    print("\r\033[K", end="")  # Clear the current line
-                elif verbose > 0:
-                    # If no progress bar but verbose, print a summary line
-                    print(f"Epoch {epoch+1}/{epochs} - "
-                          f"Loss: {avg_train_loss:.4f}, Acc: {train_accuracy:.4f}, "
-                          f"Val_Loss: {avg_val_loss:.4f}, Val_Acc: f{val_accuracy:.4f}, "
-                          f"LR: {optimizer.param_groups[0]['lr']:.6f}, "
-                          f"GradNorm: {avg_grad_norm:.2f}")
-            else:
-                # Prepare summary for training-only progress bar update
-                summary = {
-                    'Loss': f'{avg_train_loss:.4f}',
-                    'Acc': f'{train_accuracy:.4f}',
-                    'LR': f'{optimizer.param_groups[0]["lr"]:.6f}',
-                    'GradNorm': f'{avg_grad_norm:.2f}'
-                }
-                
-                # Update progress bar with training metrics in one line
-                if verbose == 1 and epoch_pbar is not None:
-                    epoch_pbar.set_postfix(summary)
-                    epoch_pbar.refresh()
-                    epoch_pbar.close()
-                    print("\r\033[K", end="")  # Clear the current line
-                elif verbose > 0:
-                    # If no progress bar but verbose, print a summary line
-                    print(f"Epoch {epoch+1}/{epochs} - "
-                          f"Loss: {avg_train_loss:.4f}, Acc: {train_accuracy:.4f}, "
-                          f"LR: {optimizer.param_groups[0]['lr']:.6f}, "
-                          f"GradNorm: {avg_grad_norm:.2f}")
-                
-                # Store empty validation metrics for consistency
-                history['val_loss'].append(None)
-                history['val_accuracy'].append(None)
-                avg_val_loss = float('inf')  # For early stopping logic
-            
-            # Early stopping check (only if validation data provided)
-            if val_loader is not None:
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
+                # Early stopping check
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
                     patience_counter = 0
                     # Save the best model
                     self.best_model_state = self.state_dict().copy()
@@ -1032,12 +884,27 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     patience_counter += 1
                     if verbose > 0:
                         print(f"⏳ No improvement for {patience_counter}/{early_stopping_patience} epochs")
-                
+                    
+                # Print epoch summary
+                if verbose > 0:
+                    print(f"Epoch {epoch+1}/{epochs} - "
+                          f"loss: {avg_train_loss:.4f}, acc: {train_accuracy:.4f}, "
+                          f"val_loss: {val_loss:.4f}, val_acc: {val_accuracy:.4f}, "
+                          f"lr: {current_lr:.6f}, "
+                          f"GradNorm: {avg_grad_norm:.2f}")
+                    
+                # Check for early stopping
                 if patience_counter >= early_stopping_patience:
-                    if verbose > 0:
-                        print(f"🛑 Early stopping triggered. Stopping training at epoch {epoch + 1}.")
+                    print(f"🛑 Early stopping triggered after {epoch+1} epochs.")
                     break
-        
+            else:
+                # Print epoch summary without validation metrics
+                if verbose > 0:
+                    print(f"Epoch {epoch+1}/{epochs} - "
+                          f"loss: {avg_train_loss:.4f}, acc: {train_accuracy:.4f}, "
+                          f"lr: {current_lr:.6f}, "
+                          f"GradNorm: {avg_grad_norm:.2f}")
+                          
         # Load best model if validation was performed and we have saved a best state
         if val_loader is not None and hasattr(self, 'best_model_state'):
             self.load_state_dict(self.best_model_state)
@@ -1047,203 +914,354 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         # Clear cache after training
         self.device_manager.clear_cache()
         
-        # Return the history dictionary with training metrics
         return history
-    
-    def find_learning_rate(self, train_loader, start_lr=1e-7, end_lr=10, num_iter=100, 
-                        smoothing=0.05, plot=True):
+        
+    def _validate(self, val_loader):
         """
-        Learning rate finder to determine optimal learning rate.
-        Uses the technique described in the 2015 paper "Cyclical Learning Rates for Training Neural Networks"
-        by Leslie N. Smith and implemented in the fastai library.
+        Validate the model on validation data.
         
         Args:
-            train_loader: DataLoader for training data
-            start_lr: Starting learning rate
-            end_lr: Ending learning rate
-            num_iter: Number of iterations to run
-            smoothing: Amount of smoothing to apply to the loss curve
-            plot: Whether to generate and display a plot
+            val_loader: Validation data loader
             
         Returns:
-            Dictionary with learning rates and corresponding losses
+            Tuple of (validation_loss, validation_accuracy)
         """
-        import matplotlib.pyplot as plt
+        self.eval()
+        val_loss = 0.0
+        correct = 0
+        total = 0
         
-        # Initialize optimizer with start_lr
-        optimizer = optim.AdamW(self.parameters(), lr=start_lr)
-        criterion = nn.CrossEntropyLoss()
-        
-        # Calculate the multiplication factor for each update
-        mult = (end_lr / start_lr) ** (1 / num_iter)
-        
-        # Lists to store learning rates and losses
-        lrs = []
-        losses = []
-        best_loss = float('inf')
-        avg_loss = 0.0
-        beta = smoothing  # Smoothing factor
-        
-        # Set model to training mode
-        self.train()
-        
-        # Run the learning rate finder
-        batch_num = 0
-        for data in train_loader:
-            if len(data) == 3:
-                batch_color, batch_brightness, batch_labels = data
-            else:
-                raise ValueError("DataLoader must provide (color, brightness, labels) tuples")
-            
-            # Move data to device
-            batch_color = batch_color.to(self.device)
-            batch_brightness = batch_brightness.to(self.device)
-            batch_labels = batch_labels.to(self.device)
-            
-            # Get the current learning rate
-            lr = optimizer.param_groups[0]['lr']
-            lrs.append(lr)
-            
-            # Zero gradients
-            optimizer.zero_grad()
-            
-            # Forward pass
-            outputs = self(batch_color, batch_brightness)
-            loss = criterion(outputs, batch_labels)
-            
-            # Calculate smoothed loss
-            if batch_num == 0:
-                avg_loss = loss.item()
-            else:
-                avg_loss = beta * loss.item() + (1 - beta) * avg_loss
+        with torch.no_grad():
+            for color_input, brightness_input, labels in val_loader:
+                # Move data to device
+                color_input = color_input.to(self.device, non_blocking=True)
+                brightness_input = brightness_input.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
                 
-            # Record the loss
-            losses.append(avg_loss / (1 - beta ** (batch_num + 1)))
-            
-            # Check if loss is getting too large
-            if batch_num > 0 and loss.item() > 4 * best_loss:
-                break
+                # Forward pass (no need for mixed precision during validation)
+                outputs = self(color_input, brightness_input)
+                loss = self.criterion(outputs, labels)
                 
-            if loss.item() < best_loss:
-                best_loss = loss.item()
+                # Calculate validation metrics
+                val_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
                 
-            # Backward pass
-            loss.backward()
-            
-            # Step optimizer
-            optimizer.step()
-            
-            # Update learning rate
-            optimizer.param_groups[0]['lr'] *= mult
-            
-            batch_num += 1
-            if batch_num >= num_iter:
-                break
-                
-        # Plot the learning rate vs loss
-        if plot:
-            plt.figure(figsize=(10, 6))
-            plt.semilogx(lrs, losses)
-            plt.xlabel('Learning rate')
-            plt.ylabel('Loss')
-            plt.title('Learning rate finder')
-            plt.grid(True, alpha=0.3)
-            plt.show()
-            
-        return {'lr': lrs, 'loss': losses}
-    
-    def _update_weight_decay(self, optimizer, epoch, max_epochs, initial_weight_decay=0.0001, 
-                        final_weight_decay=0.01, strategy='linear'):
+        # Calculate average validation metrics
+        avg_val_loss = val_loss / len(val_loader)
+        val_accuracy = correct / total
+        
+        return avg_val_loss, val_accuracy
+        
+    def _forward_color_pathway(self, color_input):
         """
-        Update weight decay during training to provide better regularization.
+        Forward pass through the color pathway only.
         
         Args:
-            optimizer: Optimizer instance (usually AdamW)
-            epoch: Current epoch number
-            max_epochs: Total number of epochs
-            initial_weight_decay: Starting weight decay value
-            final_weight_decay: Ending weight decay value
-            strategy: How to schedule the weight decay ('linear', 'cosine', or 'constant')
+            color_input: Color image tensor [batch_size, channels, height, width]
             
         Returns:
-            Current weight decay value
+            Color pathway features [batch_size, features]
         """
-        if strategy == 'constant':
-            return initial_weight_decay
-        
-        if strategy == 'linear':
-            # Linear increase in weight decay
-            return initial_weight_decay + (final_weight_decay - initial_weight_decay) * (epoch / max_epochs)
-        
-        if strategy == 'cosine':
-            # Cosine schedule (slower increase at beginning and end, faster in middle)
-            import math
-            cos_out = math.cos(math.pi * epoch / max_epochs) + 1
-            return final_weight_decay - (final_weight_decay - initial_weight_decay) / 2 * cos_out
+        # Normalize inputs properly with CIFAR-100 mean and std
+        if color_input.max() > 1.0 and color_input.min() >= 0.0:
+            # Scale from [0-255] to [0-1] range
+            color_input = color_input / 255.0
             
-        # Default to constant if unknown strategy
-        return initial_weight_decay
+        # Apply CIFAR-100 mean/std normalization for RGB channels (ImageNet-style normalization)
+        # CIFAR-100 approximate mean: [0.5071, 0.4867, 0.4408], std: [0.2675, 0.2565, 0.2761]
+        if color_input.shape[1] == 3:  # Only apply to RGB inputs
+            mean = torch.tensor([0.5071, 0.4867, 0.4408], device=color_input.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.2675, 0.2565, 0.2761], device=color_input.device).view(1, 3, 1, 1)
+            color_input = (color_input - mean) / std
+            
+        # Initial layers - only process color pathway
+        color_x = self.conv1.forward_color(color_input)
+        color_x = self.bn1.forward_color(color_x)
+        color_x = self.activation_initial.forward_single(color_x)
+        
+        # Apply maxpool
+        color_x = self.maxpool(color_x)
+        
+        # ResNet layers with stabilization
+        color_x = self.layer1.forward_color(color_x)
+        color_x = self._stabilize_activations(color_x)
+        
+        color_x = self.layer2.forward_color(color_x)
+        color_x = self._stabilize_activations(color_x)
+        
+        color_x = self.layer3.forward_color(color_x)
+        color_x = self._stabilize_activations(color_x)
+        
+        color_x = self.layer4.forward_color(color_x)
+        color_x = self._stabilize_activations(color_x)
+        
+        # Global average pooling
+        color_x = self.avgpool.forward_single(color_x)
+        
+        # Flatten features
+        color_x = torch.flatten(color_x, 1)
+        
+        # Safety check for NaN features
+        if torch.isnan(color_x).any():
+            color_x = torch.where(torch.isnan(color_x), torch.zeros_like(color_x), color_x)
+        
+        # Apply dropout if enabled
+        if self.dropout_layer is not None:
+            color_x = self.dropout_layer(color_x)
+        
+        # Stabilize final features
+        color_x = self._stabilize_features(color_x)
+        
+        return color_x
+        
+    def _forward_brightness_pathway(self, brightness_input):
+        """
+        Forward pass through the brightness pathway only.
+        
+        Args:
+            brightness_input: Brightness image tensor [batch_size, channels, height, width]
+            
+        Returns:
+            Brightness pathway features [batch_size, features]
+        """
+        # Normalize brightness channel
+        if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
+            brightness_input = brightness_input / 255.0
+            
+        # Standardize brightness for better training
+        if brightness_input.shape[1] == 1:  # Brightness channel
+            # Compute batch statistics for standardization
+            batch_mean = brightness_input.mean(dim=(2, 3), keepdim=True)
+            batch_std = brightness_input.std(dim=(2, 3), keepdim=True) + 1e-6  # Avoid division by zero
+            brightness_input = (brightness_input - batch_mean) / batch_std
+        
+        # Initial layers - only process brightness pathway
+        brightness_x = self.conv1.forward_brightness(brightness_input)
+        brightness_x = self.bn1.forward_brightness(brightness_x)
+        brightness_x = self.activation_initial.forward_single(brightness_x)
+        
+        # Apply maxpool
+        brightness_x = self.maxpool(brightness_x)
+        
+        # ResNet layers with stabilization
+        brightness_x = self.layer1.forward_brightness(brightness_x)
+        brightness_x = self._stabilize_activations(brightness_x)
+        
+        brightness_x = self.layer2.forward_brightness(brightness_x)
+        brightness_x = self._stabilize_activations(brightness_x)
+        
+        brightness_x = self.layer3.forward_brightness(brightness_x)
+        brightness_x = self._stabilize_activations(brightness_x)
+        
+        brightness_x = self.layer4.forward_brightness(brightness_x)
+        brightness_x = self._stabilize_activations(brightness_x)
+        
+        # Global average pooling
+        brightness_x = self.avgpool.forward_single(brightness_x)
+        
+        # Flatten features
+        brightness_x = torch.flatten(brightness_x, 1)
+        
+        # Safety check for NaN features
+        if torch.isnan(brightness_x).any():
+            brightness_x = torch.where(torch.isnan(brightness_x), torch.zeros_like(brightness_x), brightness_x)
+        
+        # Apply dropout if enabled
+        if self.dropout_layer is not None:
+            brightness_x = self.dropout_layer(brightness_x)
+        
+        # Stabilize final features
+        brightness_x = self._stabilize_features(brightness_x)
+        
+        return brightness_x
+    
+    def analyze_pathways(self, color_input, brightness_input):
+        """
+        Analyze the contribution of each pathway separately.
+        
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Output logits from color and brightness pathways
+        """
+        # Move inputs to the correct device
+        color_input = color_input.to(self.device)
+        brightness_input = brightness_input.to(self.device)
+        
+        # Feature extraction
+        color_features = self._forward_color_pathway(color_input)
+        brightness_features = self._forward_brightness_pathway(brightness_input)
+        
+        # Get the prediction from each pathway individually
+        if self.use_shared_classifier:
+            # Apply the separate projection heads to each feature separately
+            color_out = self.color_head(color_features)
+            brightness_out = self.brightness_head(brightness_features)
+        else:
+            # Use the separate classifiers
+            color_out = self.color_classifier(color_features)
+            brightness_out = self.brightness_classifier(brightness_features)
+        
+        return color_out, brightness_out
 
+    def extract_features(self, color_input, brightness_input):
+        """
+        Extract features from both pathways without classification.
+        
+        Args:
+            color_input (torch.Tensor): Color input data
+            brightness_input (torch.Tensor): Brightness input data
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Features from color and brightness pathways
+        """
+        # Move inputs to the correct device
+        color_input = color_input.to(self.device)
+        brightness_input = brightness_input.to(self.device)
+        
+        # Feature extraction
+        color_features = self._forward_color_pathway(color_input)
+        brightness_features = self._forward_brightness_pathway(brightness_input)
+        
+        return color_features, brightness_features
 
-# Factory functions following ResNet naming conventions
-def multi_channel_resnet18(num_classes: int = 10, **kwargs) -> MultiChannelResNetNetwork:
-    """Create a Multi-Channel ResNet-18."""
+    def get_pathway_importance(self):
+        """
+        Calculate the relative importance of each pathway based on weights.
+        
+        Returns:
+            Dict[str, float]: Dictionary with importance scores for each pathway
+        """
+        # This is a simple implementation based on parameter magnitudes
+        # A more sophisticated implementation would use attribution methods
+        
+        color_params = []
+        brightness_params = []
+        
+        # Collect parameters for each pathway
+        for name, param in self.named_parameters():
+            if 'color' in name:
+                color_params.append(param.abs().mean().item())
+            elif 'brightness' in name:
+                brightness_params.append(param.abs().mean().item())
+        
+        # Calculate average magnitude for each pathway
+        color_importance = sum(color_params) / len(color_params) if color_params else 0
+        brightness_importance = sum(brightness_params) / len(brightness_params) if brightness_params else 0
+        
+        # Normalize to sum to 1.0
+        total = color_importance + brightness_importance
+        if total > 0:
+            color_importance /= total
+            brightness_importance /= total
+        
+        return {
+            'color_pathway': color_importance,
+            'brightness_pathway': brightness_importance
+        }
+    
+    @classmethod
+    def for_cifar100(cls, use_shared_classifier=True, dropout=0.3, block_type='basic'):
+        """
+        Factory method to create a model pre-configured for CIFAR-100.
+        
+        This creates a model with reduced architecture and appropriate settings
+        specifically optimized for the CIFAR-100 dataset.
+        
+        Args:
+            use_shared_classifier: Whether to use shared classifier for fusion
+            dropout: Dropout rate (recommended: 0.2-0.5 for CIFAR)
+            block_type: Block type ('basic' or 'bottleneck')
+            
+        Returns:
+            Configured MultiChannelResNetNetwork for CIFAR-100
+        """
+        model = cls(
+            num_classes=100,  # CIFAR-100 has 100 classes
+            color_input_channels=3,  # RGB channels
+            brightness_input_channels=1,  # L channel
+            num_blocks=[2, 2, 2, 2],  # Smaller ResNet-18 style configuration
+            block_type=block_type,
+            activation='relu',
+            dropout=dropout,
+            use_shared_classifier=use_shared_classifier,
+            reduce_architecture=True,  # Enable CIFAR optimization
+            device='auto'  # Auto-detect best device
+        )
+        
+        # Print model configuration summary
+        params = sum(p.numel() for p in model.parameters())
+        print("🚀 Created CIFAR-100 optimized model:")
+        print(f"   Architecture: Reduced ResNet with {block_type} blocks")
+        print(f"   Parameters: {params:,}")
+        print(f"   Classifier: {'Shared (fusion)' if use_shared_classifier else 'Separate'}")
+        print(f"   Device: {model.device}")
+        
+        return model
+
+# Factory functions to create ResNet variants
+def multi_channel_resnet18(num_classes=10, color_input_channels=3, brightness_input_channels=1, **kwargs):
+    """
+    Creates a ResNet-18 variant of the MultiChannelResNetNetwork
+    """
     return MultiChannelResNetNetwork(
         num_classes=num_classes,
+        color_input_channels=color_input_channels,
+        brightness_input_channels=brightness_input_channels,
         num_blocks=[2, 2, 2, 2],
         block_type='basic',
         **kwargs
     )
 
-
-def multi_channel_resnet34(num_classes: int = 10, **kwargs) -> MultiChannelResNetNetwork:
-    """Create a Multi-Channel ResNet-34."""
+def multi_channel_resnet34(num_classes=10, color_input_channels=3, brightness_input_channels=1, **kwargs):
+    """
+    Creates a ResNet-34 variant of the MultiChannelResNetNetwork
+    """
     return MultiChannelResNetNetwork(
         num_classes=num_classes,
+        color_input_channels=color_input_channels,
+        brightness_input_channels=brightness_input_channels,
         num_blocks=[3, 4, 6, 3],
         block_type='basic',
         **kwargs
     )
 
-
-def multi_channel_resnet50(num_classes: int = 10, **kwargs) -> MultiChannelResNetNetwork:
-    """Create a Multi-Channel ResNet-50."""
+def multi_channel_resnet50(num_classes=10, color_input_channels=3, brightness_input_channels=1, **kwargs):
+    """
+    Creates a ResNet-50 variant of the MultiChannelResNetNetwork
+    """
     return MultiChannelResNetNetwork(
         num_classes=num_classes,
+        color_input_channels=color_input_channels,
+        brightness_input_channels=brightness_input_channels,
         num_blocks=[3, 4, 6, 3],
         block_type='bottleneck',
         **kwargs
     )
 
-
-def multi_channel_resnet101(num_classes: int = 10, **kwargs) -> MultiChannelResNetNetwork:
-    """Create a Multi-Channel ResNet-101."""
+def multi_channel_resnet101(num_classes=10, color_input_channels=3, brightness_input_channels=1, **kwargs):
+    """
+    Creates a ResNet-101 variant of the MultiChannelResNetNetwork
+    """
     return MultiChannelResNetNetwork(
         num_classes=num_classes,
+        color_input_channels=color_input_channels,
+        brightness_input_channels=brightness_input_channels,
         num_blocks=[3, 4, 23, 3],
         block_type='bottleneck',
         **kwargs
     )
 
-
-def multi_channel_resnet152(num_classes: int = 10, **kwargs) -> MultiChannelResNetNetwork:
-    """Create a Multi-Channel ResNet-152."""
+def multi_channel_resnet152(num_classes=10, color_input_channels=3, brightness_input_channels=1, **kwargs):
+    """
+    Creates a ResNet-152 variant of the MultiChannelResNetNetwork
+    """
     return MultiChannelResNetNetwork(
         num_classes=num_classes,
+        color_input_channels=color_input_channels,
+        brightness_input_channels=brightness_input_channels,
         num_blocks=[3, 8, 36, 3],
         block_type='bottleneck',
-        **kwargs
-    )
-
-
-def multi_channel_resnet18_cifar(num_classes: int = 100, **kwargs) -> MultiChannelResNetNetwork:
-    """Create a Multi-Channel ResNet-18 optimized for CIFAR-100."""
-    return MultiChannelResNetNetwork(
-        num_classes=num_classes,
-        num_blocks=[2, 2, 2, 2],
-        block_type='basic',
-        reduce_architecture=True,
-        dropout=0.3,  # Add dropout for CIFAR to prevent overfitting
         **kwargs
     )
 

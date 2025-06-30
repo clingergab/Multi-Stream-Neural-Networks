@@ -74,6 +74,56 @@ class MultiChannelResNetBasicBlock(nn.Module):
         color_out, brightness_out = self.activation2(color_out, brightness_out)
         
         return color_out, brightness_out
+    
+    def forward_color(self, color_input: torch.Tensor) -> torch.Tensor:
+        """Forward pass through color pathway only."""
+        # Save input for skip connection
+        color_identity = color_input
+        
+        # Main pathway
+        color_out = self.conv1.forward_color(color_input)
+        color_out = self.bn1.forward_color(color_out)
+        color_out = self.activation1.forward_single(color_out)
+        
+        color_out = self.conv2.forward_color(color_out)
+        color_out = self.bn2.forward_color(color_out)
+        
+        # Skip connection
+        if self.downsample is not None:
+            color_identity = self.downsample.forward_color(color_identity)
+        
+        # Add residual connection
+        color_out += color_identity
+        
+        # Final activation
+        color_out = self.activation2.forward_single(color_out)
+        
+        return color_out
+        
+    def forward_brightness(self, brightness_input: torch.Tensor) -> torch.Tensor:
+        """Forward pass through brightness pathway only."""
+        # Save input for skip connection
+        brightness_identity = brightness_input
+        
+        # Main pathway
+        brightness_out = self.conv1.forward_brightness(brightness_input)
+        brightness_out = self.bn1.forward_brightness(brightness_out)
+        brightness_out = self.activation1.forward_single(brightness_out)
+        
+        brightness_out = self.conv2.forward_brightness(brightness_out)
+        brightness_out = self.bn2.forward_brightness(brightness_out)
+        
+        # Skip connection
+        if self.downsample is not None:
+            brightness_identity = self.downsample.forward_brightness(brightness_identity)
+        
+        # Add residual connection
+        brightness_out += brightness_identity
+        
+        # Final activation
+        brightness_out = self.activation2.forward_single(brightness_out)
+        
+        return brightness_out
 
 
 class MultiChannelResNetBottleneck(nn.Module):
@@ -170,6 +220,18 @@ class MultiChannelDownsample(nn.Module):
         color_out, brightness_out = self.conv(color_input, brightness_input)
         color_out, brightness_out = self.bn(color_out, brightness_out)
         return color_out, brightness_out
+        
+    def forward_color(self, color_input: torch.Tensor) -> torch.Tensor:
+        """Forward pass through color pathway only."""
+        color_out = self.conv.forward_color(color_input)
+        color_out = self.bn.forward_color(color_out)
+        return color_out
+        
+    def forward_brightness(self, brightness_input: torch.Tensor) -> torch.Tensor:
+        """Forward pass through brightness pathway only."""
+        brightness_out = self.conv.forward_brightness(brightness_input)
+        brightness_out = self.bn.forward_brightness(brightness_out)
+        return brightness_out
 
 
 class MultiChannelSequential(nn.Module):
@@ -187,6 +249,24 @@ class MultiChannelSequential(nn.Module):
             color_x, brightness_x = module(color_x, brightness_x)
             
         return color_x, brightness_x
+    
+    def forward_color(self, color_input: torch.Tensor) -> torch.Tensor:
+        """Forward through color pathway only."""
+        color_x = color_input
+        
+        for module in self.modules_list:
+            color_x = module.forward_color(color_x)
+            
+        return color_x
+    
+    def forward_brightness(self, brightness_input: torch.Tensor) -> torch.Tensor:
+        """Forward through brightness pathway only."""
+        brightness_x = brightness_input
+        
+        for module in self.modules_list:
+            brightness_x = module.forward_brightness(brightness_x)
+            
+        return brightness_x
     
     def __len__(self):
         return len(self.modules_list)

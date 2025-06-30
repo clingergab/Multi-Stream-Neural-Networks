@@ -96,6 +96,42 @@ class MultiChannelConv2d(nn.Module):
         )
         
         return color_output, brightness_output
+    
+    def forward_color(self, color_input):
+        """
+        Forward pass through only the color pathway.
+        
+        Args:
+            color_input: Color input tensor (B, C, H, W)
+            
+        Returns:
+            Color output tensor
+        """
+        # Apply convolution with color weights
+        color_output = F.conv2d(
+            color_input, self.color_weight, self.color_bias,
+            self.stride, self.padding, self.dilation, self.groups
+        )
+        
+        return color_output
+        
+    def forward_brightness(self, brightness_input):
+        """
+        Forward pass through only the brightness pathway.
+        
+        Args:
+            brightness_input: Brightness input tensor (B, C, H, W)
+            
+        Returns:
+            Brightness output tensor
+        """
+        # Apply convolution with brightness weights
+        brightness_output = F.conv2d(
+            brightness_input, self.brightness_weight, self.brightness_bias,
+            self.stride, self.padding, self.dilation, self.groups
+        )
+        
+        return brightness_output
 
 
 class MultiChannelBatchNorm2d(nn.Module):
@@ -134,6 +170,30 @@ class MultiChannelBatchNorm2d(nn.Module):
         brightness_output = self.brightness_bn(brightness_input)
         
         return color_output, brightness_output
+    
+    def forward_color(self, color_input):
+        """
+        Forward pass through batch normalization for the color pathway only.
+        
+        Args:
+            color_input: Color input tensor (B, C, H, W)
+            
+        Returns:
+            Normalized color output tensor
+        """
+        return self.color_bn(color_input)
+    
+    def forward_brightness(self, brightness_input):
+        """
+        Forward pass through batch normalization for the brightness pathway only.
+        
+        Args:
+            brightness_input: Brightness input tensor (B, C, H, W)
+            
+        Returns:
+            Normalized brightness output tensor
+        """
+        return self.brightness_bn(brightness_input)
 
 
 class MultiChannelActivation(nn.Module):
@@ -176,6 +236,18 @@ class MultiChannelActivation(nn.Module):
         brightness_output = self.activation(brightness_input)
         
         return color_output, brightness_output
+    
+    def forward_single(self, x):
+        """
+        Forward pass for a single stream.
+        
+        Args:
+            x: Input tensor from either color or brightness stream
+            
+        Returns:
+            Activated output tensor
+        """
+        return self.activation(x)
 
 
 class MultiChannelDropout2d(nn.Module):
@@ -235,3 +307,15 @@ class MultiChannelAdaptiveAvgPool2d(nn.Module):
         brightness_output = self.pool(brightness_input)
         
         return color_output, brightness_output
+    
+    def forward_single(self, x):
+        """
+        Forward pass for a single stream.
+        
+        Args:
+            x: Input tensor from either color or brightness stream
+            
+        Returns:
+            Pooled output tensor
+        """
+        return self.pool(x)

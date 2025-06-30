@@ -299,6 +299,14 @@ def test_resnet_model(data):
         
         # Test training for a few epochs
         print(f"🚀 Training {fusion_name} ResNet model...")
+        # Compile the model first with the learning rate
+        model.compile(
+            optimizer='adam',
+            learning_rate=0.001,
+            loss='cross_entropy'
+        )
+        
+        # Then fit without passing learning_rate
         model.fit(
             train_color_data=train_rgb,
             train_brightness_data=train_brightness,
@@ -308,7 +316,6 @@ def test_resnet_model(data):
             val_labels=data['validation']['labels'],
             batch_size=16,  # Smaller batch for ResNet testing
             epochs=2,  # Just test training works
-            learning_rate=0.001,
             verbose=1
         )
         
