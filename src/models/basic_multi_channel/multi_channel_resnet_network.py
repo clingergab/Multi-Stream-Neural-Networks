@@ -791,14 +791,29 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     # Track gradient norm for debugging (now safely unscaled)
                     if self.debug_mode:
                         with torch.no_grad():
-                            grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) 
-                                                  for p in self.parameters() if p.grad is not None]), 2)
-                            epoch_grad_norm += grad_norm.item()
+                            # Calculate gradient norm manually to avoid potential recursion issues
+                            total_norm = 0.0
+                            parameters = [p for p in self.parameters() if p.grad is not None]
+                            for p in parameters:
+                                param_norm = p.grad.detach().data.norm(2)
+                                total_norm += param_norm.item() ** 2
+                            grad_norm = total_norm ** 0.5
+                            epoch_grad_norm += grad_norm
                             num_batches += 1
                     
                     # Apply gradient clipping (on unscaled gradients)
                     if max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
+                        # Direct implementation to avoid recursion issues
+                        total_norm = 0
+                        parameters = [p for p in self.parameters() if p.grad is not None]
+                        for p in parameters:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                        total_norm = total_norm ** (1. / 2)
+                        clip_coef = max_grad_norm / (total_norm + 1e-6)
+                        if clip_coef < 1:
+                            for p in parameters:
+                                p.grad.data.mul_(clip_coef)
                     
                     # Step optimizer with scaler
                     self.scaler.step(optimizer)
@@ -816,14 +831,29 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     # Track gradient norm for debugging in a more stable way
                     if self.debug_mode:
                         with torch.no_grad():
-                            grad_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2) 
-                                                  for p in self.parameters() if p.grad is not None]), 2)
-                            epoch_grad_norm += grad_norm.item()
+                            # Calculate gradient norm manually to avoid potential recursion issues
+                            total_norm = 0.0
+                            parameters = [p for p in self.parameters() if p.grad is not None]
+                            for p in parameters:
+                                param_norm = p.grad.detach().data.norm(2)
+                                total_norm += param_norm.item() ** 2
+                            grad_norm = total_norm ** 0.5
+                            epoch_grad_norm += grad_norm
                             num_batches += 1
                     
                     # Apply gradient clipping
                     if max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
+                        # Direct implementation to avoid recursion issues
+                        total_norm = 0
+                        parameters = [p for p in self.parameters() if p.grad is not None]
+                        for p in parameters:
+                            param_norm = p.grad.data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                        total_norm = total_norm ** (1. / 2)
+                        clip_coef = max_grad_norm / (total_norm + 1e-6)
+                        if clip_coef < 1:
+                            for p in parameters:
+                                p.grad.data.mul_(clip_coef)
                     
                     # Step optimizer
                     optimizer.step()
@@ -913,9 +943,9 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                         # Explicitly clear unnecessary tensors to help with memory management
                         del outputs, loss, predicted
                         
-                # Periodically clear cache during validation
-                if batch_idx % 20 == 0 and self.device.type == 'cuda':
-                    torch.cuda.empty_cache()
+                        # Periodically clear cache during validation
+                        if batch_idx % 20 == 0 and self.device.type == 'cuda':
+                            torch.cuda.empty_cache()
                 
                 # Calculate epoch validation metrics
                 avg_val_loss = total_val_loss / len(val_loader)
