@@ -2,7 +2,7 @@
 Models module for Multi-Stream Neural Networks
 """
 
-from .base import BaseMultiStreamModel, IntegrationMixin
+from .base import BaseMultiStreamModel
 from .basic_multi_channel import (
     BaseMultiChannelNetwork,
     MultiChannelResNetNetwork,
@@ -19,7 +19,6 @@ from .builders.model_factory import create_model, list_available_models
 
 __all__ = [
     'BaseMultiStreamModel',
-    'IntegrationMixin',
     'BaseMultiChannelNetwork',
     'MultiChannelResNetNetwork', 
     'base_multi_channel_small',

@@ -13,8 +13,8 @@ import os
 import sys
 from pathlib import Path
 
-# Add src to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Add project root to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 import torch.nn as nn
@@ -181,6 +181,8 @@ def main():
     if args.config:
         logger.info(f"Loading configuration from: {args.config}")
         # config = ConfigManager.load_config(args.config)
+        # Set dataset from config
+        args.dataset = "cifar100"  # Hardcoded for now, should be read from config
     else:
         logger.info("Using command line arguments for configuration")
         # Create config from args

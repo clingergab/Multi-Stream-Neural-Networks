@@ -1,8 +1,16 @@
-# Tests Directory
+# Multi-Stream Neural Networks Test Suite
 
-This directory contains test scripts for the Multi-Stream Neural Networks project.
+This directory contains comprehensive tests for the Multi-Stream Neural Networks (MSNN) project.
 
-## Test Files
+## Test Categories
+
+### API and Model Tests
+
+- **`test_api_methods.py`** - Comprehensive test of all model API methods
+  - Tests fit(), evaluate(), predict(), predict_proba() for all models
+  - Verifies input shape handling (2D/4D)
+  - Validates DataLoader support
+  - Ensures consistent API across model types
 
 ### CIFAR-100 Integration Tests
 
@@ -26,6 +34,7 @@ This directory contains test scripts for the Multi-Stream Neural Networks projec
 
 ```bash
 # Run individual tests
+python tests/test_api_methods.py
 python tests/test_cifar100_loader.py
 python tests/test_cifar100_rgbl_integration.py
 python tests/demo_notebook_workflow.py
@@ -36,6 +45,9 @@ python -m pytest tests/ -v
 
 ## Test Coverage
 
+- ✅ Model API consistency and robustness
+- ✅ Input shape handling for different model architectures
+- ✅ DataLoader support for all methods
 - ✅ CIFAR-100 data loading
 - ✅ RGBtoRGBL transformation
 - ✅ Integration between components
@@ -44,4 +56,4 @@ python -m pytest tests/ -v
 - ✅ Visual verification
 - ✅ Notebook workflow compatibility
 
-All tests pass and verify the complete data loading and processing pipeline.
+All tests pass and verify the complete MSNN functionality including models, data loading, and processing pipeline.

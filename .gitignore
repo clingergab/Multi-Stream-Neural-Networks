@@ -52,6 +52,7 @@ tensorboard/
 *.swp
 *.swo
 *~
+.copilot-instructions.md
 
 # OS
 .DS_Store

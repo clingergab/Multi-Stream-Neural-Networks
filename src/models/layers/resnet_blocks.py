@@ -203,6 +203,64 @@ class MultiChannelResNetBottleneck(nn.Module):
         color_out, brightness_out = self.activation3(color_out, brightness_out)
         
         return color_out, brightness_out
+    
+    def forward_color(self, color_input: torch.Tensor) -> torch.Tensor:
+        """Forward pass through color pathway only."""
+        # Save input for skip connection
+        color_identity = color_input
+        
+        # Bottleneck pathway - color only
+        color_out = self.conv1.forward_color(color_input)
+        color_out = self.bn1.forward_color(color_out)
+        color_out = self.activation1.forward_single(color_out)
+        
+        color_out = self.conv2.forward_color(color_out)
+        color_out = self.bn2.forward_color(color_out)
+        color_out = self.activation2.forward_single(color_out)
+        
+        color_out = self.conv3.forward_color(color_out)
+        color_out = self.bn3.forward_color(color_out)
+        
+        # Skip connection
+        if self.downsample is not None:
+            color_identity = self.downsample.forward_color(color_identity)
+        
+        # Add residual connection
+        color_out += color_identity
+        
+        # Final activation
+        color_out = self.activation3.forward_single(color_out)
+        
+        return color_out
+        
+    def forward_brightness(self, brightness_input: torch.Tensor) -> torch.Tensor:
+        """Forward pass through brightness pathway only."""
+        # Save input for skip connection
+        brightness_identity = brightness_input
+        
+        # Bottleneck pathway - brightness only
+        brightness_out = self.conv1.forward_brightness(brightness_input)
+        brightness_out = self.bn1.forward_brightness(brightness_out)
+        brightness_out = self.activation1.forward_single(brightness_out)
+        
+        brightness_out = self.conv2.forward_brightness(brightness_out)
+        brightness_out = self.bn2.forward_brightness(brightness_out)
+        brightness_out = self.activation2.forward_single(brightness_out)
+        
+        brightness_out = self.conv3.forward_brightness(brightness_out)
+        brightness_out = self.bn3.forward_brightness(brightness_out)
+        
+        # Skip connection
+        if self.downsample is not None:
+            brightness_identity = self.downsample.forward_brightness(brightness_identity)
+        
+        # Add residual connection
+        brightness_out += brightness_identity
+        
+        # Final activation
+        brightness_out = self.activation3.forward_single(brightness_out)
+        
+        return brightness_out
 
 
 class MultiChannelDownsample(nn.Module):
@@ -255,8 +313,12 @@ class MultiChannelSequential(nn.Module):
         color_x = color_input
         
         for module in self.modules_list:
-            color_x = module.forward_color(color_x)
-            
+            # Only use forward_color if it exists
+            if hasattr(module, 'forward_color') and callable(getattr(module, 'forward_color')):
+                color_x = module.forward_color(color_x)
+            else:
+                raise AttributeError(f"Module {module.__class__.__name__} from {module.__class__.__module__} has no attribute 'forward_color'")
+        
         return color_x
     
     def forward_brightness(self, brightness_input: torch.Tensor) -> torch.Tensor:
@@ -264,8 +326,12 @@ class MultiChannelSequential(nn.Module):
         brightness_x = brightness_input
         
         for module in self.modules_list:
-            brightness_x = module.forward_brightness(brightness_x)
-            
+            # Only use forward_brightness if it exists
+            if hasattr(module, 'forward_brightness') and callable(getattr(module, 'forward_brightness')):
+                brightness_x = module.forward_brightness(brightness_x)
+            else:
+                raise AttributeError(f"Module {module.__class__.__name__} from {module.__class__.__module__} has no attribute 'forward_brightness'")
+                
         return brightness_x
     
     def __len__(self):
@@ -273,5 +339,20 @@ class MultiChannelSequential(nn.Module):
     
     def __getitem__(self, idx):
         return self.modules_list[idx]
+        
+    def verify_pathway_methods(self):
+        """Verify that all modules have the required pathway-specific methods."""
+        all_valid = True
+        
+        for module in self.modules_list:
+            # Check forward_color
+            has_color = hasattr(module, 'forward_color')
+            # Check forward_brightness
+            has_brightness = hasattr(module, 'forward_brightness')
+            
+            if not has_color or not has_brightness:
+                all_valid = False
+                
+        return all_valid
 
 

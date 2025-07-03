@@ -1,28 +1,18 @@
 """
 Multi-channel block implementations for building deeper networks.
 
-This module provides building blocks like ResNet-style blocks, bottleneck blocks,
-and other architectural components that work with multi-channel inputs.
+This module provides the MultiChannelConvBlock, a simple convolutional block
+that works with multi-channel inputs.
 
-Note: The main ResNet blocks have been moved to resnet_blocks.py for better organization.
-This file provides clean imports.
+Note: The ResNet-style blocks have been moved to resnet_blocks.py.
+Import them directly from there instead of from this module.
 """
 
 import torch.nn as nn
 from .conv_layers import MultiChannelConv2d, MultiChannelBatchNorm2d, MultiChannelActivation
-from .resnet_blocks import (
-    MultiChannelResNetBasicBlock, 
-    MultiChannelResNetBottleneck,
-    MultiChannelDownsample,
-    MultiChannelSequential
-)
 
-# Export the new ResNet block names directly
+# Define which classes this module exports
 __all__ = [
-    'MultiChannelResNetBasicBlock',
-    'MultiChannelResNetBottleneck',
-    'MultiChannelDownsample',
-    'MultiChannelSequential',
     'MultiChannelConvBlock'
 ]
 

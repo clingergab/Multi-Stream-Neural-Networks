@@ -1,0 +1,20 @@
+{
+  "base_multi_channel_large": {
+    "model_type": "BaseMultiChannelNetwork",
+    "color_input_size": 3072,
+    "brightness_input_size": 1024,
+    "num_classes": 100,
+    "parameters": 5625900,
+    "path": "/Users/gclinger/Documents/projects/Multi-Stream-Neural-Networks/saved_models/base_multi_channel_large.pth"
+  },
+  "multi_channel_resnet50": {
+    "model_type": "MultiChannelResNetNetwork",
+    "color_input_channels": 3,
+    "brightness_input_channels": 1,
+    "num_classes": 100,
+    "parameters": 47819052,
+    "path": "/Users/gclinger/Documents/projects/Multi-Stream-Neural-Networks/saved_models/multi_channel_resnet50.pth"
+  },
+  "dataset": "CIFAR-100",
+  "training_date": "2025-07-02"
+}

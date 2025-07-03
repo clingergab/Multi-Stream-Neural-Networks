@@ -11,11 +11,12 @@ from .conv_layers import (
     MultiChannelDropout2d, MultiChannelAdaptiveAvgPool2d
 )
 
-# Multi-channel blocks
-from .blocks import (
-    MultiChannelResNetBasicBlock, MultiChannelResNetBottleneck, MultiChannelConvBlock,
+# Multi-channel blocks - import directly from source modules
+from .resnet_blocks import (
+    MultiChannelResNetBasicBlock, MultiChannelResNetBottleneck,
     MultiChannelDownsample, MultiChannelSequential
 )
+from .blocks import MultiChannelConvBlock
 
 # Integration layers
 from .integration_layers import *

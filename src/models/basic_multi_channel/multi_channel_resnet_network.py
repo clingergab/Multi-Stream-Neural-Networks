@@ -5,19 +5,14 @@ Multi-Channel ResNet implementation following standard ResNet architecture.
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from torch.amp import autocast, GradScaler
-from tqdm import tqdm
 import numpy as np
-from typing import List, Dict, Tuple, Optional, Union
-import time
-import os
 import sys
-from abc import ABC
-
-# Import Multi-Channel model components
+from torch.utils.data import DataLoader, TensorDataset
+from torch.amp import autocast
+from tqdm import tqdm
+from typing import Dict, List, Any, Union
 from src.models.base import BaseMultiStreamModel
-from src.utils.device_utils import DeviceManager
+from src.utils.grad_utils import safe_clip_grad_norm
 from src.models.layers.conv_layers import (
     MultiChannelConv2d,
     MultiChannelBatchNorm2d,
@@ -30,49 +25,6 @@ from src.models.layers.resnet_blocks import (
     MultiChannelDownsample,
     MultiChannelSequential
 )
-
-def safe_clip_grad_norm(parameters, max_value, norm_type=2.0):
-    """
-    Safely clips gradient norm while handling edge cases like NaN/Inf.
-    This prevents catastrophic failure when gradients are unstable.
-    
-    Args:
-        parameters: Model parameters to clip
-        max_value: Maximum norm value
-        norm_type: Type of norm (usually 2.0 for L2 norm)
-    
-    Returns:
-        Total norm of parameters (before clipping)
-    """
-    if isinstance(parameters, torch.Tensor):
-        parameters = [parameters]
-    parameters = [p for p in parameters if p.grad is not None]
-    if len(parameters) == 0:
-        return torch.tensor(0.0)
-    device = parameters[0].grad.device
-    
-    # Calculate the norm
-    total_norm = torch.norm(
-        torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters]), 
-        norm_type
-    )
-    
-    # Handle NaN/Inf
-    if torch.isnan(total_norm) or torch.isinf(total_norm):
-        for p in parameters:
-            # Set gradients to zero if they contain NaN/Inf
-            if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
-                p.grad.detach().zero_()
-        return torch.tensor(0.0)
-    
-    # Apply clipping if needed
-    if max_value > 0 and total_norm > max_value:
-        clip_coef = max_value / (total_norm + 1e-6)
-        for p in parameters:
-            if p.grad is not None:
-                p.grad.detach().mul_(clip_coef)
-    
-    return total_norm
 
 class MultiChannelResNetNetwork(BaseMultiStreamModel):
     """
@@ -121,26 +73,36 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
     brightness_accuracy = accuracy_metric(brightness_logits, labels)
     """
     
+    # Compilation defaults optimized for CNN/ResNet architectures
+    DEFAULT_COMPILE_CONFIG = {
+        'learning_rate': 0.0003,   # Lower learning rate for stable CNN training
+        'weight_decay': 1e-4,      # Regularization important for CNNs
+        'gradient_clip': 1.0,      # Enabled for deep network stability
+        'scheduler': 'cosine',     # Cosine annealing works well for ResNets
+        'early_stopping_patience': 5  # CNNs typically converge faster
+    }
+    
     def __init__(
         self,
-        num_classes: int = 10,
+        num_classes: int,
         color_input_channels: int = 3,
         brightness_input_channels: int = 1,
         num_blocks: List[int] = [2, 2, 2, 2],
         block_type: str = 'basic',
         activation: str = 'relu',
         dropout: float = 0.0,  
-        use_shared_classifier: bool = True,
         device: str = 'auto',
         reduce_architecture: bool = False,  # Set to True for small datasets like CIFAR
         **kwargs
     ):
         
-        # Initialize base class
+        
+        # Initialize base class with common parameters
         super().__init__(
-            input_size=(max(color_input_channels, brightness_input_channels), 224, 224),
-            hidden_size=64,  # Initial channel count
             num_classes=num_classes,
+            activation=activation,
+            dropout=dropout,
+            device=device,
             **kwargs
         )
         
@@ -148,18 +110,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         self.brightness_input_channels = brightness_input_channels
         self.num_blocks = num_blocks
         self.block_type = block_type
-        self.activation = activation
-        self.dropout = dropout
-        self.use_shared_classifier = use_shared_classifier
         self.reduce_architecture = reduce_architecture
-        
-        # Setup device management with proper detection
-        self.device_manager = DeviceManager(preferred_device=device if device != 'auto' else None)
-        self.device = self.device_manager.device
-        
-        # Mixed precision support
-        self.use_mixed_precision = self.device_manager.enable_mixed_precision()
-        self.scaler = GradScaler() if self.use_mixed_precision else None
         
         # Track current channel count for proper ResNet progression
         self.inplanes = 64
@@ -178,15 +129,8 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         # Initialize weights
         self._initialize_weights()
         
-        # Move model to device and optimize
-        self.to(self.device)
-        self.device_manager.optimize_for_device(self)
-        
-        # Training state
-        self.is_compiled = False
-        self.optimizer = None
-        self.criterion = None
-        self.metrics = []
+        # Finalize initialization (device setup, etc.)
+        self._finalize_initialization()
     
     def _build_network(self):
         """Build the ResNet network with optimized architecture for different input channels."""
@@ -241,17 +185,11 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         else:
             self.dropout_layer = None
         
-        if self.use_shared_classifier:
-            # Shared classifier with proper fusion - concatenates features from both streams
-            self.shared_classifier = nn.Linear(final_features * 2, self.num_classes, bias=True)
-            # Also create separate projection heads for research/analysis purposes
-            self.color_head = nn.Linear(final_features, self.num_classes, bias=True)
-            self.brightness_head = nn.Linear(final_features, self.num_classes, bias=True)
-        else:
-            # Legacy: Separate classifiers for each stream
-            self.shared_classifier = None  # Not used in separate mode
-            self.color_classifier = nn.Linear(final_features, self.num_classes)
-            self.brightness_classifier = nn.Linear(final_features, self.num_classes)
+        # Shared classifier with proper fusion - concatenates features from both streams
+        self.shared_classifier = nn.Linear(final_features * 2, self.num_classes, bias=True)
+        # Also create separate projection heads for research/analysis purposes
+        self.color_head = nn.Linear(final_features, self.num_classes, bias=True)
+        self.brightness_head = nn.Linear(final_features, self.num_classes, bias=True)
             
         # Adjust batch normalization momentum for all BatchNorm layers
         # Use a lower momentum value for more stable updates on small batches
@@ -290,27 +228,30 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         layers = []
         
         # First block (might downsample)
-        layers.append(self.block(
+        first_block = self.block(
             self.inplanes, 
             planes, 
             stride, 
             downsample,
             self.activation
-        ))
+        )
+        layers.append(first_block)
         
         # Update inplanes for subsequent blocks
         self.inplanes = planes * self.block.expansion
         
         # Remaining blocks
         for _ in range(1, blocks):
-            layers.append(self.block(
+            block = self.block(
                 self.inplanes,
                 planes,
                 activation=self.activation
-            ))
+            )
+            layers.append(block)
         
+        # Create MultiChannelSequential
         return MultiChannelSequential(*layers)
-    
+            
     def _initialize_weights(self):
         """Initialize network weights with conservative values to prevent exploding gradients."""
         for module in self.modules():
@@ -325,11 +266,11 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 if module.brightness_bias is not None:
                     nn.init.zeros_(module.brightness_bias)
             elif isinstance(module, MultiChannelBatchNorm2d):
-                # Initialize BatchNorm with more conservative weights (0.5 instead of 1.0)
-                # to prevent activation explosion in deeper layers
-                nn.init.constant_(module.color_bn.weight, 0.5)
+                # Initialize BatchNorm with standard weights (1.0) and zero bias
+                # This follows standard BatchNorm initialization practices
+                nn.init.constant_(module.color_bn.weight, 1.0)
                 nn.init.constant_(module.color_bn.bias, 0.0)
-                nn.init.constant_(module.brightness_bn.weight, 0.5)
+                nn.init.constant_(module.brightness_bn.weight, 1.0)
                 nn.init.constant_(module.brightness_bn.bias, 0.0)
             elif isinstance(module, nn.Linear):
                 # Use Xavier initialization for fully connected layers with smaller gain
@@ -351,36 +292,15 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         Returns:
             Combined classification logits [batch_size, num_classes]
         """
-        # Normalize inputs properly with CIFAR-100 mean and std
-        if color_input.max() > 1.0 and color_input.min() >= 0.0:
-            # Scale from [0-255] to [0-1] range
+        # Basic input normalization (transforms should handle detailed normalization)
+        if color_input.max() > 1.0:
             color_input = color_input / 255.0
-            
-        # Apply CIFAR-100 mean/std normalization for RGB channels (ImageNet-style normalization)
-        # CIFAR-100 approximate mean: [0.5071, 0.4867, 0.4408], std: [0.2675, 0.2565, 0.2761]
-        if color_input.shape[1] == 3:  # Only apply to RGB inputs
-            mean = torch.tensor([0.5071, 0.4867, 0.4408], device=color_input.device).view(1, 3, 1, 1)
-            std = torch.tensor([0.2675, 0.2565, 0.2761], device=color_input.device).view(1, 3, 1, 1)
-            color_input = (color_input - mean) / std
-            
-        # Normalize brightness channel (standardize it for better gradient flow)
-        if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
+        if brightness_input.max() > 1.0:
             brightness_input = brightness_input / 255.0
             
-        # Standardize brightness for better training
-        if brightness_input.shape[1] == 1:  # Brightness channel
-            # Compute batch statistics for standardization
-            batch_mean = brightness_input.mean(dim=(2, 3), keepdim=True)
-            batch_std = brightness_input.std(dim=(2, 3), keepdim=True) + 1e-6  # Avoid division by zero
-            brightness_input = (brightness_input - batch_mean) / batch_std
-            
-        # Ensure input shapes are compatible
+        # Basic input validation
         if color_input.dim() != 4 or brightness_input.dim() != 4:
             raise ValueError(f"Expected 4D tensors (batch_size, channels, height, width), got {color_input.shape} and {brightness_input.shape}")
-            
-        # Check for NaN inputs
-        if torch.isnan(color_input).any() or torch.isnan(brightness_input).any():
-            raise ValueError("Input contains NaN values")
             
         # Initial layers
         color_x, brightness_x = self.conv1(color_input, brightness_input)
@@ -391,22 +311,11 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         color_x = self.maxpool(color_x)
         brightness_x = self.maxpool(brightness_x)
         
-        # ResNet layers with stabilization
+        # ResNet layers
         color_x, brightness_x = self.layer1(color_x, brightness_x)
-        color_x = self._stabilize_activations(color_x)
-        brightness_x = self._stabilize_activations(brightness_x)
-        
         color_x, brightness_x = self.layer2(color_x, brightness_x)
-        color_x = self._stabilize_activations(color_x)
-        brightness_x = self._stabilize_activations(brightness_x)
-        
         color_x, brightness_x = self.layer3(color_x, brightness_x)
-        color_x = self._stabilize_activations(color_x)
-        brightness_x = self._stabilize_activations(brightness_x)
-        
         color_x, brightness_x = self.layer4(color_x, brightness_x)
-        color_x = self._stabilize_activations(color_x)
-        brightness_x = self._stabilize_activations(brightness_x)
         
         # Global average pooling
         color_x, brightness_x = self.avgpool(color_x, brightness_x)
@@ -415,169 +324,272 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         color_x = torch.flatten(color_x, 1)
         brightness_x = torch.flatten(brightness_x, 1)
         
-        # Safety check for NaN features
-        if torch.isnan(color_x).any():
-            color_x = torch.where(torch.isnan(color_x), torch.zeros_like(color_x), color_x)
-        if torch.isnan(brightness_x).any():
-            brightness_x = torch.where(torch.isnan(brightness_x), torch.zeros_like(brightness_x), brightness_x)
-        
         # Apply dropout if enabled
         if self.dropout_layer is not None:
             color_x = self.dropout_layer(color_x)
             brightness_x = self.dropout_layer(brightness_x)
         
-        # Stabilize final features before fusion to prevent gradient explosion
-        color_x = self._stabilize_features(color_x)
-        brightness_x = self._stabilize_features(brightness_x)
-        
-        # Combine outputs for classification
-        if self.use_shared_classifier:
-            # Use shared classifier for optimal fusion
-            fused_features = torch.cat([color_x, brightness_x], dim=1)
-            logits = self.shared_classifier(fused_features)
-            
-            # Safety check for NaN outputs
-            if torch.isnan(logits).any():
-                logits = torch.zeros_like(logits)
-                
-            return logits
-        else:
-            # Legacy: Add separate outputs
-            color_logits = self.color_classifier(color_x)
-            brightness_logits = self.brightness_classifier(brightness_x)
-            
-            # Combine outputs
-            combined_logits = color_logits + brightness_logits
-            
-            # Safety check for NaN outputs
-            if torch.isnan(combined_logits).any():
-                combined_logits = torch.zeros_like(combined_logits)
-                
-            return combined_logits
-            
-    def _stabilize_activations(self, x):
+        # Use shared classifier for optimal fusion
+        fused_features = torch.cat([color_x, brightness_x], dim=1)
+        logits = self.shared_classifier(fused_features)
+        return logits
+    
+    def _forward_color_pathway(self, color_input):
         """
-        Apply activation stabilization to prevent gradient explosion.
+        Forward pass through the color pathway only.
         
         Args:
-            x: Input tensor
+            color_input: Color image tensor [batch_size, channels, height, width]
             
         Returns:
-            Stabilized tensor
+            Color pathway features [batch_size, features]
         """
-        # Check for extreme values and clip if necessary
-        if x.abs().max() > 50.0:
-            x = torch.clamp(x, min=-50.0, max=50.0)
+        # Basic normalization
+        if color_input.max() > 1.0:
+            color_input = color_input / 255.0
+            
+        # Initial layers - only process color pathway
+        color_x = self.conv1.forward_color(color_input)
+        color_x = self.bn1.forward_color(color_x)
+        color_x = self.activation_initial.forward_single(color_x)
         
-        # Check for NaN values and replace with zeros
-        if torch.isnan(x).any():
-            x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
-                
-        return x
-    
-    def _stabilize_features(self, x):
+        # Apply maxpool
+        color_x = self.maxpool(color_x)
+        
+        # ResNet layers
+        color_x = self.layer1.forward_color(color_x)
+        color_x = self.layer2.forward_color(color_x)
+        color_x = self.layer3.forward_color(color_x)
+        color_x = self.layer4.forward_color(color_x)
+        
+        # Global average pooling
+        color_x = self.avgpool.forward_single(color_x)
+        
+        # Flatten features
+        color_x = torch.flatten(color_x, 1)
+        
+        # Apply dropout if enabled
+        if self.dropout_layer is not None:
+            color_x = self.dropout_layer(color_x)
+        
+        return color_x
+        
+    def _forward_brightness_pathway(self, brightness_input):
         """
-        Stabilize feature vectors before classification to prevent gradient explosion.
+        Forward pass through the brightness pathway only.
         
         Args:
-            x: Feature tensor [batch_size, features]
+            brightness_input: Brightness image tensor [batch_size, channels, height, width]
             
         Returns:
-            Stabilized features
+            Brightness pathway features [batch_size, features]
         """
-        # Apply L2 normalization if magnitudes are too large
-        norm = x.norm(dim=1, keepdim=True)
-        if (norm > 10.0).any():
-            # Scale down large feature vectors
-            scale_factor = torch.clamp(10.0 / norm, max=1.0)
-            x = x * scale_factor
-            
-        return x
+        # Basic normalization
+        if brightness_input.max() > 1.0:
+            brightness_input = brightness_input / 255.0
+        
+        # Initial layers - only process brightness pathway
+        brightness_x = self.conv1.forward_brightness(brightness_input)
+        brightness_x = self.bn1.forward_brightness(brightness_x)
+        brightness_x = self.activation_initial.forward_single(brightness_x)
+        
+        # Apply maxpool
+        brightness_x = self.maxpool(brightness_x)
+        
+        # ResNet layers
+        brightness_x = self.layer1.forward_brightness(brightness_x)
+        brightness_x = self.layer2.forward_brightness(brightness_x)
+        brightness_x = self.layer3.forward_brightness(brightness_x)
+        brightness_x = self.layer4.forward_brightness(brightness_x)
+        
+        # Global average pooling
+        brightness_x = self.avgpool.forward_single(brightness_x)
+        
+        # Flatten features
+        brightness_x = torch.flatten(brightness_x, 1)
+        
+        # Apply dropout if enabled
+        if self.dropout_layer is not None:
+            brightness_x = self.dropout_layer(brightness_x)
+        
+        return brightness_x
     
-    def compile(self, optimizer: str = 'adam', learning_rate: float = 0.001, 
-                weight_decay: float = 0.0, loss: str = 'cross_entropy', metrics: List[str] = None,
-                gradient_clip: float = 1.0, scheduler: str = 'cosine'):
+    def extract_features(self, color_input, brightness_input):
         """
-        Compile the model with optimizer, loss function, and gradient clipping (Keras-like API).
+        Extract concatenated features before final classification.
+        
+        This method returns fused features ready for external classifiers.
+        For separate pathway features, use get_separate_features() instead.
         
         Args:
-            optimizer: Optimizer name ('adam', 'adamw', 'sgd', 'rmsprop')
-            learning_rate: Learning rate
-            weight_decay: Weight decay (L2 regularization)
-            loss: Loss function name ('cross_entropy')
-            metrics: List of metrics to track
-            gradient_clip: Maximum norm for gradient clipping
-            scheduler: Learning rate scheduler ('cosine', 'onecycle', 'none')
+            color_input (torch.Tensor): Color input data
+            brightness_input (torch.Tensor): Brightness input data
+            
+        Returns:
+            torch.Tensor: Concatenated fused features [batch_size, feature_size * 2]
+            Ready for external linear classifiers or further processing
         """
-        # Configure optimizers with appropriate parameters for CIFAR-100
-        if optimizer.lower() == 'adam':
-            self.optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=1e-8)
-        elif optimizer.lower() == 'adamw':
-            self.optimizer = optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=1e-8)
-        elif optimizer.lower() == 'sgd':
-            # Use SGD with Nesterov momentum for CIFAR-100 (standard practice)
-            self.optimizer = optim.SGD(self.parameters(), lr=learning_rate, momentum=0.9, nesterov=True, weight_decay=weight_decay)
-        elif optimizer.lower() == 'rmsprop':
-            self.optimizer = optim.RMSprop(self.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9)
-        else:
-            raise ValueError(f"Unsupported optimizer: {optimizer}")
+        # Get separate features and concatenate them
+        color_features, brightness_features = self.get_separate_features(color_input, brightness_input)
         
-        # Configure loss function
-        if loss.lower() == 'cross_entropy':
-            self.criterion = nn.CrossEntropyLoss()
-        else:
-            raise ValueError(f"Unsupported loss function: {loss}")
+        # Return concatenated features (fusion approach for external use)
+        return torch.cat([color_features, brightness_features], dim=1)
+
+    def get_separate_features(self, color_input, brightness_input):
+        """
+        Extract separate features from both pathways without classification.
         
-        # Configure learning rate scheduler
-        self.scheduler = None
-        self.scheduler_type = scheduler.lower()
+        This method returns individual pathway features for research and analysis.
+        For fused features ready for external classifiers, use extract_features() instead.
         
-        if self.scheduler_type == 'cosine':
-            # Cosine annealing is effective for CIFAR-100
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=100, eta_min=learning_rate * 0.01
-            )
-        elif self.scheduler_type == 'onecycle':
-            # OneCycle is another good option for CIFAR-100
-            self.scheduler = optim.lr_scheduler.OneCycleLR(
-                self.optimizer, max_lr=learning_rate,
-                steps_per_epoch=500,  # This will be updated in fit() with actual steps
-                epochs=100,  # This will also be updated in fit()
-                pct_start=0.3  # Spend 30% of training warming up
-            )
-        elif self.scheduler_type != 'none':
-            raise ValueError(f"Unsupported scheduler: {scheduler}")
+        Args:
+            color_input (torch.Tensor): Color input data
+            brightness_input (torch.Tensor): Brightness input data
+            
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Features from color and brightness pathways
+            Separate features for pathway analysis and research
+        """
+        # Move inputs to the correct device
+        color_input = color_input.to(self.device)
+        brightness_input = brightness_input.to(self.device)
         
-        # Store configuration
-        self.metrics = metrics or ['accuracy']
-        self.gradient_clip = gradient_clip
-        self.is_compiled = True
+        # Feature extraction
+        color_features = self._forward_color_pathway(color_input)
+        brightness_features = self._forward_brightness_pathway(brightness_input)
         
-        # Log compilation details
-        model_name = self.__class__.__name__
-        print(f"{model_name} compiled with {optimizer} optimizer, {loss} loss, "
-              f"learning rate: {learning_rate}, weight decay: {weight_decay}, "
-              f"gradient clip: {gradient_clip}, scheduler: {scheduler}")
-              
-        # Record configuration for debugging
-        self._config = {
-            'optimizer': optimizer,
-            'learning_rate': learning_rate,
-            'weight_decay': weight_decay,
-            'loss': loss,
-            'gradient_clip': gradient_clip,
-            'scheduler': scheduler,
-            'reduce_architecture': self.reduce_architecture,
-            'batch_norm_momentum': 0.05 if self.reduce_architecture else 0.1,
-            'dropout': self.dropout,
+        return color_features, brightness_features
+    
+    def analyze_pathways(self, color_input, brightness_input):
+        """
+        Analyze the contribution of each pathway separately.
+        
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: Output logits from color and brightness pathways
+        """
+        # Move inputs to the correct device
+        color_input = color_input.to(self.device)
+        brightness_input = brightness_input.to(self.device)
+        
+        # Feature extraction
+        color_features = self._forward_color_pathway(color_input)
+        brightness_features = self._forward_brightness_pathway(brightness_input)
+        
+        # Get the prediction from each pathway individually
+        # Apply the separate projection heads to each feature separately
+        color_out = self.color_head(color_features)
+        brightness_out = self.brightness_head(brightness_features)
+        
+        return color_out, brightness_out
+
+    def analyze_pathway_weights(self) -> Dict[str, float]:
+        """
+        Analyze the relative importance of color vs brightness pathways.
+        
+        Returns:
+            Dictionary with pathway weight statistics
+        """
+        # Analyze both the shared weights and separate heads
+        shared_weights = self.shared_classifier.weight.data
+        feature_size = shared_weights.shape[1] // 2
+        color_shared_weights = shared_weights[:, :feature_size]
+        brightness_shared_weights = shared_weights[:, feature_size:]
+        
+        # Also analyze separate heads
+        color_head_weights = self.color_head.weight.data
+        brightness_head_weights = self.brightness_head.weight.data
+        
+        # Calculate pathway norms
+        color_norm = torch.norm(color_shared_weights).item() + torch.norm(color_head_weights).item()
+        brightness_norm = torch.norm(brightness_shared_weights).item() + torch.norm(brightness_head_weights).item()
+        total_norm = color_norm + brightness_norm + 1e-8
+        
+        return {
+            'color_pathway': color_norm / total_norm,
+            'brightness_pathway': brightness_norm / total_norm,
+            'pathway_ratio': color_norm / (brightness_norm + 1e-8),
+            'fusion_type': 'shared_with_separate_heads',
+            'shared_color_norm': torch.norm(color_shared_weights).item(),
+            'shared_brightness_norm': torch.norm(brightness_shared_weights).item(),
+            'head_color_norm': torch.norm(color_head_weights).item(),
+            'head_brightness_norm': torch.norm(brightness_head_weights).item(),
+            'architecture_type': 'resnet'
         }
+
+    def get_pathway_importance(self):
+        """
+        Calculate the relative importance of each pathway based on weights.
         
-        return self
+        Returns:
+            Dict[str, float]: Dictionary with importance scores for each pathway
+        """
+        # This is a simple implementation based on parameter magnitudes
+        # A more sophisticated implementation would use attribution methods
+        
+        color_params = []
+        brightness_params = []
+        
+        # Collect parameters for each pathway
+        for name, param in self.named_parameters():
+            if 'color' in name:
+                color_params.append(param.abs().mean().item())
+            elif 'brightness' in name:
+                brightness_params.append(param.abs().mean().item())
+        
+        # Calculate average magnitude for each pathway
+        color_importance = sum(color_params) / len(color_params) if color_params else 0
+        brightness_importance = sum(brightness_params) / len(brightness_params) if brightness_params else 0
+        
+        # Normalize to sum to 1.0
+        total = color_importance + brightness_importance
+        if total > 0:
+            color_importance /= total
+            brightness_importance /= total
+        
+        return {
+            'color_pathway': color_importance,
+            'brightness_pathway': brightness_importance
+        }
     
-    def fit(self, train_color_data=None, train_brightness_data=None, train_labels=None,
-             val_color_data=None, val_brightness_data=None, val_labels=None,
-             train_loader=None, val_loader=None, batch_size=None, epochs=10,
-             early_stopping_patience=5, verbose=1, num_workers=None, pin_memory=None):
+    @property
+    def fusion_type(self) -> str:
+        """Return the type of fusion used by this model."""
+        return "shared_classifier"
+    
+    def get_classifier_info(self) -> Dict[str, Any]:
+        """Get information about the classifier architecture."""
+        shared_params = sum(p.numel() for p in self.shared_classifier.parameters())
+        color_params = sum(p.numel() for p in self.color_head.parameters())
+        brightness_params = sum(p.numel() for p in self.brightness_head.parameters())
+        
+        final_features = (512 if not self.reduce_architecture else 256) * self.block.expansion
+        
+        return {
+            'type': 'shared_with_separate_heads',
+            'shared_classifier_params': shared_params,
+            'color_head_params': color_params, 
+            'brightness_head_params': brightness_params,
+            'total_params': shared_params + color_params + brightness_params,
+            'shared_input_size': self.shared_classifier.in_features,
+            'output_size': self.shared_classifier.out_features,
+            'feature_size_per_stream': final_features,
+            'architecture_type': 'reduced' if self.reduce_architecture else 'full'
+        }
+    
+    def fit(
+        self,
+        train_color_data=None,
+        train_brightness_data=None,
+        train_labels=None,
+        val_color_data=None,
+        val_brightness_data=None,
+        val_labels=None,
+        train_loader=None,
+        val_loader=None,
+        batch_size=None,
+        epochs: int = 10,
+        verbose: int = 1
+    ) -> Dict[str, List[float]]:
         """
         Unified fit method that handles both direct data arrays and DataLoaders with on-the-fly augmentation.
         
@@ -603,10 +615,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             val_loader: Optional DataLoader for validation (will be used instead of direct data if provided)
             batch_size: Batch size for training when using direct data (auto-detected if None)
             epochs: Number of epochs to train
-            early_stopping_patience: Stop training when validation loss doesn't improve
             verbose: Verbosity level (0: silent, 1: progress bar, 2: one line per epoch)
-            num_workers: Number of workers for data loading (auto-detected if None)
-            pin_memory: Whether to pin memory for faster GPU transfer (auto-detected if None)
             
         Returns:
             Dictionary with training history
@@ -614,34 +623,6 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         if not self.is_compiled:
             raise RuntimeError("Model must be compiled before training. Call model.compile() first.")
         
-        # Determine if we're using DataLoaders or direct data
-        using_dataloaders = train_loader is not None
-        
-        # Auto-detect optimal batch size for CNN (used only if creating DataLoaders from direct data)
-        if batch_size is None and not using_dataloaders:
-            if self.device.type == 'cuda':
-                # For CNNs, use appropriate batch sizes based on GPU memory
-                memory_gb = torch.cuda.get_device_properties(self.device).total_memory / 1e9
-                if memory_gb >= 80:  # A100 80GB
-                    batch_size = 256  # Much larger batch size for A100 80GB
-                elif memory_gb >= 40:  # A100 40GB
-                    batch_size = 128  # Larger batch size for A100 40GB
-                elif memory_gb >= 16:  # V100
-                    batch_size = 64   # Medium batch size for V100
-                else:
-                    batch_size = 32   # Conservative for smaller GPUs
-            else:
-                batch_size = 16  # More conservative default for CPU/MPS
-        
-        # Auto-detect optimal number of workers
-        if num_workers is None:
-            import os
-            num_workers = min(4, os.cpu_count() or 1)  # More conservative default
-        
-        # Auto-detect pin_memory
-        if pin_memory is None:
-            pin_memory = self.device.type == 'cuda'
-            
         # Training history
         history = {
             'train_loss': [],
@@ -651,15 +632,35 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             'learning_rates': []
         }
         
+        # Determine if we're using DataLoaders or direct data
+        using_dataloaders = train_loader is not None
+        
+        # Use reasonable default batch size if not specified
+        if batch_size is None and not using_dataloaders:
+            # For CNNs, moderate batch sizes work well across devices
+            batch_size = 128 if self.device.type == 'cuda' else 64
+        
+        # Get optimal DataLoader configuration from device manager (conservative for CNNs)
+        dataloader_config = self.device_manager.get_dataloader_config(conservative=True)
+        num_workers = dataloader_config['num_workers']
+        pin_memory = dataloader_config['pin_memory']
+            
+        
         # Set up train and validation loaders based on input mode
         if not using_dataloaders:
             # Check that required data is provided when not using DataLoaders
             if train_color_data is None or train_brightness_data is None or train_labels is None:
                 raise ValueError("When train_loader is not provided, you must provide train_color_data, train_brightness_data, and train_labels")
             
-            # Create DataLoaders from direct data - keep tensors on CPU for memory efficiency
-            train_color_tensor = torch.tensor(train_color_data, dtype=torch.float32)
-            train_brightness_tensor = torch.tensor(train_brightness_data, dtype=torch.float32)
+            # Create DataLoaders from direct data
+            if isinstance(train_color_data, torch.Tensor):
+                train_color_tensor = train_color_data.detach().clone()
+            else:
+                train_color_tensor = torch.tensor(train_color_data, dtype=torch.float32)
+            if isinstance(train_brightness_data, torch.Tensor):
+                train_brightness_tensor = train_brightness_data.detach().clone()
+            else:
+                train_brightness_tensor = torch.tensor(train_brightness_data, dtype=torch.float32)
             train_labels_tensor = torch.tensor(train_labels, dtype=torch.long)
             
             train_dataset = TensorDataset(train_color_tensor, train_brightness_tensor, train_labels_tensor)
@@ -667,28 +668,60 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 train_dataset, 
                 batch_size=batch_size, 
                 shuffle=True,
-                num_workers=num_workers if self.device.type != 'mps' else 0,  # MPS doesn't support multiprocessing
-                pin_memory=pin_memory,
-                persistent_workers=num_workers > 0 and self.device.type != 'mps'
+                **dataloader_config
             )
             
             # Set up validation loader if validation data is provided
             if val_color_data is not None and val_brightness_data is not None and val_labels is not None:
-                val_color_tensor = torch.tensor(val_color_data, dtype=torch.float32)
-                val_brightness_tensor = torch.tensor(val_brightness_data, dtype=torch.float32)
-                val_labels_tensor = torch.tensor(val_labels, dtype=torch.long)
+                if isinstance(val_color_data, np.ndarray):
+                    val_color_tensor = torch.from_numpy(val_color_data).float()
+                elif isinstance(val_color_data, torch.Tensor):
+                    val_color_tensor = val_color_data.detach().clone()
+                else:
+                    val_color_tensor = val_color_data
+                    
+                if isinstance(val_brightness_data, np.ndarray):
+                    val_brightness_tensor = torch.from_numpy(val_brightness_data).float()
+                elif isinstance(val_brightness_data, torch.Tensor):
+                    val_brightness_tensor = val_brightness_data.detach().clone()
+                else:
+                    val_brightness_tensor = val_brightness_data
+                    
+                if isinstance(val_labels, np.ndarray):
+                    val_labels_tensor = torch.from_numpy(val_labels).long()
+                elif isinstance(val_labels, torch.Tensor):
+                    val_labels_tensor = val_labels.detach().clone()
+                else:
+                    val_labels_tensor = val_labels
                 
                 val_dataset = TensorDataset(val_color_tensor, val_brightness_tensor, val_labels_tensor)
                 val_loader = DataLoader(
                     val_dataset, 
                     batch_size=batch_size, 
                     shuffle=False,
-                    num_workers=num_workers if self.device.type != 'mps' else 0,
-                    pin_memory=pin_memory,
-                    persistent_workers=num_workers > 0 and self.device.type != 'mps'
+                    **dataloader_config
                 )
             
-        # Print training configuration
+        # Update scheduler configuration if used
+        if self.scheduler is not None:
+            if self.scheduler_type == 'cosine':
+                # Reconfigure cosine scheduler with actual epochs
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer, T_max=epochs, eta_min=self.min_lr
+                )
+            elif self.scheduler_type == 'onecycle':
+                # Reconfigure OneCycle scheduler with actual steps
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.scheduler = optim.lr_scheduler.OneCycleLR(
+                    self.optimizer, 
+                    max_lr=current_lr,
+                    steps_per_epoch=len(train_loader),
+                    epochs=epochs,
+                    pct_start=0.3
+                )
+        
+        # Print training configuration (after all setup is complete)
         if verbose > 0:
             model_name = self.__class__.__name__
             print(f"🚀 Training {model_name} with {'DataLoader pipeline' if using_dataloaders else 'direct data'}:")
@@ -706,37 +739,35 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 print(f"   Batch size: {batch_size}")
             print(f"   Workers: {num_workers}")
             print(f"   Pin memory: {pin_memory}")
-                
-        # Update OneCycleLR scheduler if used
-        if self.scheduler_type == 'onecycle' and self.scheduler is not None:
-            # Reconfigure scheduler with actual steps
-            self.scheduler = optim.lr_scheduler.OneCycleLR(
-                self.optimizer, 
-                max_lr=self._config['learning_rate'],
-                steps_per_epoch=len(train_loader),
-                epochs=epochs,
-                pct_start=0.3
-            )
         
         # Training loop
         best_val_loss = float('inf')
         patience_counter = 0
         
         for epoch in range(epochs):
-            # Clear any existing tqdm instances
+            # Clear any existing tqdm instances and ensure clean state
             try:
-                for inst in list(getattr(tqdm, '_instances', [])):
-                    try:
-                        inst.close()
-                    except Exception:
-                        pass  # Ignore if we can't close an instance
+                # Force close any existing instances
+                tqdm._instances.clear() if hasattr(tqdm, '_instances') else None
+                # Flush stdout to clear any remaining output
+                sys.stdout.flush()
+                sys.stderr.flush()
             except Exception:
-                pass  # Ignore any errors in cleaning up tqdm instances
+                pass  # Ignore any errors in cleaning up
                 
             # Single progress bar for training
             epoch_pbar = None
             if verbose == 1:
-                epoch_pbar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{epochs}")
+                epoch_pbar = tqdm(
+                    total=len(train_loader), 
+                    desc=f"Epoch {epoch+1}/{epochs}",
+                    leave=False,  # Don't leave the progress bar after completion
+                    dynamic_ncols=True,  # Dynamically adjust width
+                    file=sys.stdout,  # Ensure output goes to stdout
+                    position=0,  # Position at top
+                    ascii=False,  # Use unicode characters
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
+                )
                 
             # Training phase
             self.train()
@@ -806,9 +837,12 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 
                 # Calculate training metrics
                 total_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+                
+                # Calculate training accuracy with memory efficiency
+                with torch.no_grad():  # Ensure no unnecessary memory is retained for gradient calculation
+                    _, predicted = torch.max(outputs.data, 1)
+                    total += labels.size(0)
+                    correct += predicted.eq(labels).sum().item()
                 
                 # Explicitly clear unnecessary tensors to help with memory management
                 del outputs, loss, predicted
@@ -817,26 +851,36 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 
                 # Update progress bar
                 if verbose == 1 and epoch_pbar is not None:
-                    current_lr = self.optimizer.param_groups[0]['lr']
-                    epoch_pbar.set_postfix({
-                        'loss': f'{total_loss / (batch_idx + 1):.4f}',
-                        'acc': f'{correct/total:.4f}',
-                        'lr': f'{current_lr:.6f}'
-                    })
-                    epoch_pbar.update(1)
+                    try:
+                        current_lr = self.optimizer.param_groups[0]['lr']
+                        epoch_pbar.set_postfix({
+                            'loss': f'{total_loss / (batch_idx + 1):.4f}',
+                            'acc': f'{correct/total:.4f}',
+                            'lr': f'{current_lr:.6f}'
+                        })
+                        epoch_pbar.update(1)
+                        epoch_pbar.refresh()  # Force refresh to ensure proper display
+                    except Exception:
+                        # If progress bar fails, continue without it
+                        pass
             
-            # Close progress bar
+            # Close progress bar properly
             if verbose == 1 and epoch_pbar is not None:
-                epoch_pbar.close()
-                
-            # Calculate epoch-level metrics
-            avg_train_loss = total_loss / len(train_loader)
-            train_accuracy = correct / total
-            current_lr = self.optimizer.param_groups[0]['lr']
+                try:
+                    epoch_pbar.close()
+                    # Add a small delay to ensure proper cleanup
+                    sys.stdout.flush()
+                except Exception:
+                    pass
             
             # Step the scheduler (for epoch-level schedulers)
             if self.scheduler_type == 'cosine' and self.scheduler:
                 self.scheduler.step()
+                    
+            # Calculate epoch-level metrics
+            avg_train_loss = total_loss / len(train_loader)
+            train_accuracy = correct / total
+            current_lr = self.optimizer.param_groups[0]['lr']
                 
             # Record training metrics
             history['train_loss'].append(avg_train_loss)
@@ -860,7 +904,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 else:
                     patience_counter += 1
                     if verbose > 0:
-                        print(f"⏳ No improvement for {patience_counter}/{early_stopping_patience} epochs")
+                        print(f"⏳ No improvement for {patience_counter}/{self.early_stopping_patience} epochs")
                     
                 # Print epoch summary
                 if verbose > 0:
@@ -870,7 +914,7 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                           f"lr: {current_lr:.6f}")
                     
                 # Check for early stopping
-                if patience_counter >= early_stopping_patience:
+                if patience_counter >= self.early_stopping_patience:
                     print(f"🛑 Early stopping triggered after {epoch+1} epochs.")
                     break
             else:
@@ -879,6 +923,10 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     print(f"Epoch {epoch+1}/{epochs} - "
                           f"loss: {avg_train_loss:.4f}, acc: {train_accuracy:.4f}, "
                           f"lr: {current_lr:.6f}")
+                
+                # Store empty validation metrics for consistency
+                history['val_loss'].append(None)
+                history['val_accuracy'].append(None)
                           
         # Load best model if validation was performed and we have saved a best state
         if val_loader is not None and hasattr(self, 'best_model_state'):
@@ -890,253 +938,81 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         self.device_manager.clear_cache()
         
         return history
-        
-    def _validate(self, val_loader):
+    
+    def evaluate(self, test_color_data=None, test_brightness_data=None, test_labels=None, 
+                 test_loader=None, batch_size: int = 32) -> Dict[str, float]:
         """
-        Validate the model on validation data.
+        Evaluate the model on test data or test data loader.
+        
+        Supports both direct data arrays and DataLoader inputs.
+        Expects 4D tensor inputs (no reshaping required).
         
         Args:
-            val_loader: Validation data loader
+            test_color_data: Test color data (optional if test_loader is provided)
+            test_brightness_data: Test brightness data (optional if test_loader is provided)
+            test_labels: Test labels (optional if test_loader is provided)
+            test_loader: Test data loader (optional if direct data is provided)
+            batch_size: Batch size for evaluation (used when creating a loader from direct data)
             
         Returns:
-            Tuple of (validation_loss, validation_accuracy)
+            Dictionary with evaluation metrics
         """
         self.eval()
-        val_loss = 0.0
-        correct = 0
-        total = 0
         
-        with torch.no_grad():
-            for color_input, brightness_input, labels in val_loader:
-                # Move data to device
-                color_input = color_input.to(self.device, non_blocking=True)
-                brightness_input = brightness_input.to(self.device, non_blocking=True)
-                labels = labels.to(self.device, non_blocking=True)
+        if test_loader is None and (test_color_data is not None and test_brightness_data is not None and test_labels is not None):
+            # Convert to tensors if needed - avoiding torch.tensor(tensor) pattern
+            if isinstance(test_color_data, np.ndarray):
+                color_tensor = torch.from_numpy(test_color_data).float()
+            elif isinstance(test_color_data, torch.Tensor):
+                color_tensor = test_color_data.detach().clone()
+            else:
+                color_tensor = test_color_data
                 
-                # Forward pass (no need for mixed precision during validation)
-                outputs = self(color_input, brightness_input)
-                loss = self.criterion(outputs, labels)
+            if isinstance(test_brightness_data, np.ndarray):
+                brightness_tensor = torch.from_numpy(test_brightness_data).float()
+            elif isinstance(test_brightness_data, torch.Tensor):
+                brightness_tensor = test_brightness_data.detach().clone()
+            else:
+                brightness_tensor = test_brightness_data
                 
-                # Calculate validation metrics
-                val_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-                
-        # Calculate average validation metrics
-        avg_val_loss = val_loss / len(val_loader)
-        val_accuracy = correct / total
-        
-        return avg_val_loss, val_accuracy
-        
-    def _forward_color_pathway(self, color_input):
-        """
-        Forward pass through the color pathway only.
-        
-        Args:
-            color_input: Color image tensor [batch_size, channels, height, width]
+            if isinstance(test_labels, np.ndarray):
+                labels_tensor = torch.from_numpy(test_labels).long()
+            elif isinstance(test_labels, torch.Tensor):
+                labels_tensor = test_labels.detach().clone()
+            else:
+                labels_tensor = test_labels
             
-        Returns:
-            Color pathway features [batch_size, features]
-        """
-        # Normalize inputs properly with CIFAR-100 mean and std
-        if color_input.max() > 1.0 and color_input.min() >= 0.0:
-            # Scale from [0-255] to [0-1] range
-            color_input = color_input / 255.0
+            # Make sure inputs are 4D tensors
+            if len(color_tensor.shape) != 4:
+                raise ValueError("MultiChannelResNetNetwork expects 4D input tensors in shape [batch, channels, height, width]")
             
-        # Apply CIFAR-100 mean/std normalization for RGB channels (ImageNet-style normalization)
-        # CIFAR-100 approximate mean: [0.5071, 0.4867, 0.4408], std: [0.2675, 0.2565, 0.2761]
-        if color_input.shape[1] == 3:  # Only apply to RGB inputs
-            mean = torch.tensor([0.5071, 0.4867, 0.4408], device=color_input.device).view(1, 3, 1, 1)
-            std = torch.tensor([0.2675, 0.2565, 0.2761], device=color_input.device).view(1, 3, 1, 1)
-            color_input = (color_input - mean) / std
+            # Move to device
+            color_tensor = color_tensor.to(self.device)
+            brightness_tensor = brightness_tensor.to(self.device)
+            labels_tensor = labels_tensor.to(self.device)
             
-        # Initial layers - only process color pathway
-        color_x = self.conv1.forward_color(color_input)
-        color_x = self.bn1.forward_color(color_x)
-        color_x = self.activation_initial.forward_single(color_x)
+            # Create dataset and loader
+            dataset = TensorDataset(color_tensor, brightness_tensor, labels_tensor)
+            test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+        elif test_loader is None:
+            raise ValueError("Either test_loader or all of test_color_data, test_brightness_data, and test_labels must be provided")
         
-        # Apply maxpool
-        color_x = self.maxpool(color_x)
+        # Use the validation method to get metrics
+        val_loss, val_accuracy = self._validate(test_loader)
         
-        # ResNet layers with stabilization
-        color_x = self.layer1.forward_color(color_x)
-        color_x = self._stabilize_activations(color_x)
-        
-        color_x = self.layer2.forward_color(color_x)
-        color_x = self._stabilize_activations(color_x)
-        
-        color_x = self.layer3.forward_color(color_x)
-        color_x = self._stabilize_activations(color_x)
-        
-        color_x = self.layer4.forward_color(color_x)
-        color_x = self._stabilize_activations(color_x)
-        
-        # Global average pooling
-        color_x = self.avgpool.forward_single(color_x)
-        
-        # Flatten features
-        color_x = torch.flatten(color_x, 1)
-        
-        # Safety check for NaN features
-        if torch.isnan(color_x).any():
-            color_x = torch.where(torch.isnan(color_x), torch.zeros_like(color_x), color_x)
-        
-        # Apply dropout if enabled
-        if self.dropout_layer is not None:
-            color_x = self.dropout_layer(color_x)
-        
-        # Stabilize final features
-        color_x = self._stabilize_features(color_x)
-        
-        return color_x
-        
-    def _forward_brightness_pathway(self, brightness_input):
-        """
-        Forward pass through the brightness pathway only.
-        
-        Args:
-            brightness_input: Brightness image tensor [batch_size, channels, height, width]
-            
-        Returns:
-            Brightness pathway features [batch_size, features]
-        """
-        # Normalize brightness channel
-        if brightness_input.max() > 1.0 and brightness_input.min() >= 0.0:
-            brightness_input = brightness_input / 255.0
-            
-        # Standardize brightness for better training
-        if brightness_input.shape[1] == 1:  # Brightness channel
-            # Compute batch statistics for standardization
-            batch_mean = brightness_input.mean(dim=(2, 3), keepdim=True)
-            batch_std = brightness_input.std(dim=(2, 3), keepdim=True) + 1e-6  # Avoid division by zero
-            brightness_input = (brightness_input - batch_mean) / batch_std
-        
-        # Initial layers - only process brightness pathway
-        brightness_x = self.conv1.forward_brightness(brightness_input)
-        brightness_x = self.bn1.forward_brightness(brightness_x)
-        brightness_x = self.activation_initial.forward_single(brightness_x)
-        
-        # Apply maxpool
-        brightness_x = self.maxpool(brightness_x)
-        
-        # ResNet layers with stabilization
-        brightness_x = self.layer1.forward_brightness(brightness_x)
-        brightness_x = self._stabilize_activations(brightness_x)
-        
-        brightness_x = self.layer2.forward_brightness(brightness_x)
-        brightness_x = self._stabilize_activations(brightness_x)
-        
-        brightness_x = self.layer3.forward_brightness(brightness_x)
-        brightness_x = self._stabilize_activations(brightness_x)
-        
-        brightness_x = self.layer4.forward_brightness(brightness_x)
-        brightness_x = self._stabilize_activations(brightness_x)
-        
-        # Global average pooling
-        brightness_x = self.avgpool.forward_single(brightness_x)
-        
-        # Flatten features
-        brightness_x = torch.flatten(brightness_x, 1)
-        
-        # Safety check for NaN features
-        if torch.isnan(brightness_x).any():
-            brightness_x = torch.where(torch.isnan(brightness_x), torch.zeros_like(brightness_x), brightness_x)
-        
-        # Apply dropout if enabled
-        if self.dropout_layer is not None:
-            brightness_x = self.dropout_layer(brightness_x)
-        
-        # Stabilize final features
-        brightness_x = self._stabilize_features(brightness_x)
-        
-        return brightness_x
-    
-    def analyze_pathways(self, color_input, brightness_input):
-        """
-        Analyze the contribution of each pathway separately.
-        
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Output logits from color and brightness pathways
-        """
-        # Move inputs to the correct device
-        color_input = color_input.to(self.device)
-        brightness_input = brightness_input.to(self.device)
-        
-        # Feature extraction
-        color_features = self._forward_color_pathway(color_input)
-        brightness_features = self._forward_brightness_pathway(brightness_input)
-        
-        # Get the prediction from each pathway individually
-        if self.use_shared_classifier:
-            # Apply the separate projection heads to each feature separately
-            color_out = self.color_head(color_features)
-            brightness_out = self.brightness_head(brightness_features)
-        else:
-            # Use the separate classifiers
-            color_out = self.color_classifier(color_features)
-            brightness_out = self.brightness_classifier(brightness_features)
-        
-        return color_out, brightness_out
-
-    def extract_features(self, color_input, brightness_input):
-        """
-        Extract features from both pathways without classification.
-        
-        Args:
-            color_input (torch.Tensor): Color input data
-            brightness_input (torch.Tensor): Brightness input data
-            
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Features from color and brightness pathways
-        """
-        # Move inputs to the correct device
-        color_input = color_input.to(self.device)
-        brightness_input = brightness_input.to(self.device)
-        
-        # Feature extraction
-        color_features = self._forward_color_pathway(color_input)
-        brightness_features = self._forward_brightness_pathway(brightness_input)
-        
-        return color_features, brightness_features
-
-    def get_pathway_importance(self):
-        """
-        Calculate the relative importance of each pathway based on weights.
-        
-        Returns:
-            Dict[str, float]: Dictionary with importance scores for each pathway
-        """
-        # This is a simple implementation based on parameter magnitudes
-        # A more sophisticated implementation would use attribution methods
-        
-        color_params = []
-        brightness_params = []
-        
-        # Collect parameters for each pathway
-        for name, param in self.named_parameters():
-            if 'color' in name:
-                color_params.append(param.abs().mean().item())
-            elif 'brightness' in name:
-                brightness_params.append(param.abs().mean().item())
-        
-        # Calculate average magnitude for each pathway
-        color_importance = sum(color_params) / len(color_params) if color_params else 0
-        brightness_importance = sum(brightness_params) / len(brightness_params) if brightness_params else 0
-        
-        # Normalize to sum to 1.0
-        total = color_importance + brightness_importance
-        if total > 0:
-            color_importance /= total
-            brightness_importance /= total
+        # Count total samples
+        total = sum(len(batch[2]) for batch in test_loader)
+        correct = int(val_accuracy * total)
         
         return {
-            'color_pathway': color_importance,
-            'brightness_pathway': brightness_importance
+            'accuracy': val_accuracy,
+            'loss': val_loss,
+            'correct': correct,
+            'total': total
         }
-    
+        
     @classmethod
-    def for_cifar100(cls, use_shared_classifier=True, dropout=0.3, block_type='basic'):
+    def for_cifar100(cls, dropout=0.3, block_type='basic'):
         """
         Factory method to create a model pre-configured for CIFAR-100.
         
@@ -1144,7 +1020,6 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         specifically optimized for the CIFAR-100 dataset.
         
         Args:
-            use_shared_classifier: Whether to use shared classifier for fusion
             dropout: Dropout rate (recommended: 0.2-0.5 for CIFAR)
             block_type: Block type ('basic' or 'bottleneck')
             
@@ -1159,7 +1034,6 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             block_type=block_type,
             activation='relu',
             dropout=dropout,
-            use_shared_classifier=use_shared_classifier,
             reduce_architecture=True,  # Enable CIFAR optimization
             device='auto'  # Auto-detect best device
         )
@@ -1169,72 +1043,337 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         print("🚀 Created CIFAR-100 optimized model:")
         print(f"   Architecture: Reduced ResNet with {block_type} blocks")
         print(f"   Parameters: {params:,}")
-        print(f"   Classifier: {'Shared (fusion)' if use_shared_classifier else 'Separate'}")
+        print("   Classifier: Shared (fusion)")
         print(f"   Device: {model.device}")
         
         return model
 
+    def _validate(self, val_loader):
+        """
+        Validation method for MultiChannelResNetNetwork, which expects 4D tensors.
+        
+        Args:
+            val_loader: Validation data loader
+            
+        Returns:
+            Tuple of (average_validation_loss, validation_accuracy)
+        """
+        self.eval()
+        total_val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for batch_idx, data in enumerate(val_loader):
+                # Unpack data - handle different formats flexibly
+                if isinstance(data, (list, tuple)) and len(data) == 3:
+                    color_batch, brightness_batch, labels_batch = data
+                elif hasattr(data, '__iter__') and len(data) == 3:
+                    # Handle other iterable formats (e.g., from different DataLoader implementations)
+                    color_batch, brightness_batch, labels_batch = data
+                else:
+                    raise ValueError("DataLoader must provide (color, brightness, labels) tuples")
+                
+                # Move data to device if not already there (with non-blocking for performance)
+                if color_batch.device != self.device:
+                    color_batch = color_batch.to(self.device, non_blocking=True)
+                if brightness_batch.device != self.device:
+                    brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+                if labels_batch.device != self.device:
+                    labels_batch = labels_batch.to(self.device, non_blocking=True)
+                
+                # For MultiChannelResNetNetwork, we expect 4D inputs (no reshaping needed)
+                # Make sure we have 4D tensors
+                if len(color_batch.shape) != 4:
+                    raise ValueError("MultiChannelResNetNetwork expects 4D input tensors in shape [batch, channels, height, width]")
+                
+                # Forward pass with mixed precision if available and configured
+                if self.use_mixed_precision and hasattr(self, 'scaler') and self.scaler is not None:
+                    with autocast(device_type=self.device.type):
+                        outputs = self(color_batch, brightness_batch)
+                        loss = self.criterion(outputs, labels_batch)
+                else:
+                    outputs = self(color_batch, brightness_batch)
+                    loss = self.criterion(outputs, labels_batch)
+                
+                # Track metrics
+                total_val_loss += loss.item()
+                
+                # Calculate validation accuracy
+                _, predicted = outputs.max(1)
+                val_total += labels_batch.size(0)
+                val_correct += predicted.eq(labels_batch).sum().item()
+                
+                # Memory management - explicitly clear unnecessary tensors
+                del outputs, loss, predicted
+                
+                # Periodic cache clearing for large datasets (especially important for GPU)
+                if batch_idx % 20 == 0 and self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
+        
+        # Calculate average validation metrics
+        avg_val_loss = total_val_loss / len(val_loader)
+        val_accuracy = val_correct / val_total
+        
+        return avg_val_loss, val_accuracy
+
+    def predict(self, color_data: Union[np.ndarray, torch.Tensor, DataLoader], brightness_data: Union[np.ndarray, torch.Tensor] = None, 
+                batch_size: int = None) -> np.ndarray:
+        """
+        Make predictions on new data with proper input handling for MultiChannelResNetNetwork.
+        
+        This implementation overrides the parent method to:
+        1. Support both direct data arrays and DataLoader inputs
+        2. Enforce 4D input tensors required by MultiChannelResNetNetwork
+        
+        Args:
+            color_data: Color input data or a DataLoader containing both color and brightness data
+            brightness_data: Brightness input data (not needed if color_data is a DataLoader)
+            batch_size: Batch size for prediction (auto-detected if None)
+            
+        Returns:
+            Predicted class labels
+        """
+        # Auto-detect optimal batch size for inference
+        if batch_size is None:
+            if self.device.type == 'cuda':
+                batch_size = 512  # Larger batches for inference
+            else:
+                batch_size = 128
+        
+        self.eval()
+        
+        # Handle DataLoader input
+        if isinstance(color_data, DataLoader):
+            loader = color_data
+            
+            predictions = []
+            with torch.no_grad():
+                for batch_data in loader:
+                    # Handle different DataLoader formats
+                    if len(batch_data) >= 2:  # Expecting (color, brightness, [labels]) format
+                        batch_color = batch_data[0]
+                        batch_brightness = batch_data[1]
+                    else:
+                        raise ValueError("DataLoader must provide at least (color, brightness) tuples")
+                    
+                    # Move to device if needed
+                    if batch_color.device != self.device:
+                        batch_color = batch_color.to(self.device, non_blocking=True)
+                    if batch_brightness.device != self.device:
+                        batch_brightness = batch_brightness.to(self.device, non_blocking=True)
+                    
+                    # Enforce 4D input tensors for MultiChannelResNetNetwork
+                    if len(batch_color.shape) != 4:
+                        raise ValueError("MultiChannelResNetNetwork expects 4D input tensors in shape [batch, channels, height, width]")
+                    
+                    # Forward pass with mixed precision if available
+                    if self.use_mixed_precision:
+                        with autocast(device_type='cuda'):
+                            outputs = self(batch_color, batch_brightness)
+                    else:
+                        outputs = self(batch_color, batch_brightness)
+                    
+                    _, predicted = torch.max(outputs.data, 1)
+                    predictions.extend(predicted.cpu().numpy())
+            
+            return np.array(predictions)
+        
+        # Handle direct data input
+        else:
+            if brightness_data is None:
+                raise ValueError("brightness_data must be provided when not using a DataLoader")
+            
+            # Convert to tensors if needed - avoiding torch.tensor(tensor) pattern
+            if isinstance(color_data, np.ndarray):
+                color_tensor = torch.from_numpy(color_data).float()
+            elif isinstance(color_data, torch.Tensor):
+                color_tensor = color_data.detach().clone()
+            else:
+                color_tensor = color_data
+                
+            if isinstance(brightness_data, np.ndarray):
+                brightness_tensor = torch.from_numpy(brightness_data).float()
+            elif isinstance(brightness_data, torch.Tensor):
+                brightness_tensor = brightness_data.detach().clone()
+            else:
+                brightness_tensor = brightness_data
+            
+            # Enforce 4D input tensors for MultiChannelResNetNetwork
+            if len(color_tensor.shape) != 4:
+                raise ValueError("MultiChannelResNetNetwork expects 4D input tensors in shape [batch, channels, height, width]")
+            
+            # Move to device efficiently
+            color_tensor = color_tensor.to(self.device, non_blocking=True)
+            brightness_tensor = brightness_tensor.to(self.device, non_blocking=True)
+            
+            # Create dataset and loader with optimizations
+            dataset = TensorDataset(color_tensor, brightness_tensor)
+            loader = DataLoader(
+                dataset, 
+                batch_size=batch_size, 
+                shuffle=False,
+                pin_memory=self.device.type == 'cuda'
+            )
+            
+            predictions = []
+            with torch.no_grad():
+                for batch_color, batch_brightness in loader:
+                    if self.use_mixed_precision:
+                        with autocast(device_type='cuda'):
+                            outputs = self(batch_color, batch_brightness)
+                    else:
+                        outputs = self(batch_color, batch_brightness)
+                    _, predicted = torch.max(outputs.data, 1)
+                    predictions.extend(predicted.cpu().numpy())
+            
+            return np.array(predictions)
+    
+    def predict_proba(self, color_data: Union[np.ndarray, torch.Tensor, DataLoader], brightness_data: Union[np.ndarray, torch.Tensor] = None,
+                      batch_size: int = None) -> np.ndarray:
+        """
+        Get prediction probabilities with proper input handling for MultiChannelResNetNetwork.
+        
+        This implementation overrides the parent method to:
+        1. Support both direct data arrays and DataLoader inputs
+        2. Enforce 4D input tensors required by MultiChannelResNetNetwork
+        
+        Args:
+            color_data: Color input data or a DataLoader containing both color and brightness data
+            brightness_data: Brightness input data (not needed if color_data is a DataLoader)
+            batch_size: Batch size for prediction (auto-detected if None)
+            
+        Returns:
+            Prediction probabilities
+        """
+        # Auto-detect optimal batch size for inference
+        if batch_size is None:
+            if self.device.type == 'cuda':
+                batch_size = 512  # Larger batches for inference
+            else:
+                batch_size = 128
+                
+        self.eval()
+        
+        # Handle DataLoader input
+        if isinstance(color_data, DataLoader):
+            loader = color_data
+            
+            probabilities = []
+            with torch.no_grad():
+                for batch_data in loader:
+                    # Handle different DataLoader formats
+                    if len(batch_data) >= 2:  # Expecting (color, brightness, [labels]) format
+                        batch_color = batch_data[0]
+                        batch_brightness = batch_data[1]
+                    else:
+                        raise ValueError("DataLoader must provide at least (color, brightness) tuples")
+                    
+                    # Move to device if needed
+                    if batch_color.device != self.device:
+                        batch_color = batch_color.to(self.device, non_blocking=True)
+                    if batch_brightness.device != self.device:
+                        batch_brightness = batch_brightness.to(self.device, non_blocking=True)
+                    
+                    # Enforce 4D input tensors for MultiChannelResNetNetwork
+                    if len(batch_color.shape) != 4:
+                        raise ValueError("MultiChannelResNetNetwork expects 4D input tensors in shape [batch, channels, height, width]")
+                    
+                    # Forward pass
+                    outputs = self(batch_color, batch_brightness)
+                    probs = torch.softmax(outputs, dim=1)
+                    probabilities.extend(probs.cpu().numpy())
+            
+            return np.array(probabilities)
+        
+        # Handle direct data input
+        else:
+            if brightness_data is None:
+                raise ValueError("brightness_data must be provided when not using a DataLoader")
+            
+            # Convert to tensors if needed - avoiding torch.tensor(tensor) pattern
+            if isinstance(color_data, np.ndarray):
+                color_tensor = torch.from_numpy(color_data).float()
+            elif isinstance(color_data, torch.Tensor):
+                color_tensor = color_data.detach().clone()
+            else:
+                color_tensor = color_data
+                
+            if isinstance(brightness_data, np.ndarray):
+                brightness_tensor = torch.from_numpy(brightness_data).float()
+            elif isinstance(brightness_data, torch.Tensor):
+                brightness_tensor = brightness_data.detach().clone()
+            else:
+                brightness_tensor = brightness_data
+            
+            # Enforce 4D input tensors for MultiChannelResNetNetwork
+            if len(color_tensor.shape) != 4:
+                raise ValueError("MultiChannelResNetNetwork expects 4D input tensors in shape [batch, channels, height, width]")
+            
+            # Move to device efficiently
+            color_tensor = color_tensor.to(self.device, non_blocking=True)
+            brightness_tensor = brightness_tensor.to(self.device, non_blocking=True)
+            
+            # Create dataset and loader with optimizations
+            dataset = TensorDataset(color_tensor, brightness_tensor)
+            loader = DataLoader(
+                dataset, 
+                batch_size=batch_size, 
+                shuffle=False,
+                pin_memory=self.device.type == 'cuda'
+            )
+            
+            probabilities = []
+            with torch.no_grad():
+                for batch_color, batch_brightness in loader:
+                    outputs = self(batch_color, batch_brightness)
+                    probs = torch.softmax(outputs, dim=1)
+                    probabilities.extend(probs.cpu().numpy())
+            
+            return np.array(probabilities)
+        
+
 # Factory functions to create ResNet variants
-def multi_channel_resnet18(num_classes=10, color_input_channels=3, brightness_input_channels=1, **kwargs):
-    """
-    Creates a ResNet-18 variant of the MultiChannelResNetNetwork
-    """
+def multi_channel_resnet18(num_classes=1000, **kwargs):
+    """Create a MultiChannelResNetNetwork with ResNet-18 architecture."""
     return MultiChannelResNetNetwork(
         num_classes=num_classes,
-        color_input_channels=color_input_channels,
-        brightness_input_channels=brightness_input_channels,
         num_blocks=[2, 2, 2, 2],
         block_type='basic',
         **kwargs
     )
 
-def multi_channel_resnet34(num_classes=10, color_input_channels=3, brightness_input_channels=1, **kwargs):
-    """
-    Creates a ResNet-34 variant of the MultiChannelResNetNetwork
-    """
+def multi_channel_resnet34(num_classes=1000, **kwargs):
+    """Create a MultiChannelResNetNetwork with ResNet-34 architecture."""
     return MultiChannelResNetNetwork(
         num_classes=num_classes,
-        color_input_channels=color_input_channels,
-        brightness_input_channels=brightness_input_channels,
         num_blocks=[3, 4, 6, 3],
         block_type='basic',
         **kwargs
     )
 
-def multi_channel_resnet50(num_classes=10, color_input_channels=3, brightness_input_channels=1, **kwargs):
-    """
-    Creates a ResNet-50 variant of the MultiChannelResNetNetwork
-    """
+def multi_channel_resnet50(num_classes=1000, **kwargs):
+    """Create a MultiChannelResNetNetwork with ResNet-50 architecture."""
     return MultiChannelResNetNetwork(
         num_classes=num_classes,
-        color_input_channels=color_input_channels,
-        brightness_input_channels=brightness_input_channels,
         num_blocks=[3, 4, 6, 3],
         block_type='bottleneck',
         **kwargs
     )
 
-def multi_channel_resnet101(num_classes=10, color_input_channels=3, brightness_input_channels=1, **kwargs):
-    """
-    Creates a ResNet-101 variant of the MultiChannelResNetNetwork
-    """
+def multi_channel_resnet101(num_classes=1000, **kwargs):
+    """Create a MultiChannelResNetNetwork with ResNet-101 architecture."""
     return MultiChannelResNetNetwork(
         num_classes=num_classes,
-        color_input_channels=color_input_channels,
-        brightness_input_channels=brightness_input_channels,
         num_blocks=[3, 4, 23, 3],
         block_type='bottleneck',
         **kwargs
     )
 
-def multi_channel_resnet152(num_classes=10, color_input_channels=3, brightness_input_channels=1, **kwargs):
-    """
-    Creates a ResNet-152 variant of the MultiChannelResNetNetwork
-    """
+def multi_channel_resnet152(num_classes=1000, **kwargs):
+    """Create a MultiChannelResNetNetwork with ResNet-152 architecture."""
     return MultiChannelResNetNetwork(
         num_classes=num_classes,
-        color_input_channels=color_input_channels,
-        brightness_input_channels=brightness_input_channels,
         num_blocks=[3, 8, 36, 3],
         block_type='bottleneck',
         **kwargs

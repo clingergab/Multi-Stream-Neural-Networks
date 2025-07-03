@@ -26,8 +26,6 @@ class NeuralProcessingModel(BaseMultiStreamModel):
         **kwargs
     ):
         super().__init__(
-            input_size=(input_channels, 32, 32),
-            hidden_size=hidden_dim,
             num_classes=num_classes,
             **kwargs
         )

@@ -21,8 +21,6 @@ class ScalarMixingModel(BaseMultiStreamModel):
         **kwargs
     ):
         super().__init__(
-            input_size=(input_channels, 32, 32),
-            hidden_size=hidden_dim,
             num_classes=num_classes,
             **kwargs
         )
@@ -52,9 +50,9 @@ class ScalarMixingModel(BaseMultiStreamModel):
         # Apply scalar mixing to channels
         if self.input_channels == 4:  # RGBL
             rgb = x[:, :3]  # RGB channels
-            l = x[:, 3:4]   # L channel
+            L = x[:, 3:4]   # L channel
             # Mix RGB and L with scalar weight
-            mixed = self.mixing_weight * rgb.mean(dim=1, keepdim=True) + (1 - self.mixing_weight) * l
+            mixed = self.mixing_weight * rgb.mean(dim=1, keepdim=True) + (1 - self.mixing_weight) * L
             x = torch.cat([rgb, mixed], dim=1)
         
         features = self.feature_extractor(x)
@@ -73,7 +71,7 @@ class ChannelAdaptiveMixingModel(BaseMultiStreamModel):
     ):
         super().__init__(
             input_size=(input_channels, 32, 32),
-            hidden_size=hidden_dim,
+            
             num_classes=num_classes,
             **kwargs
         )
@@ -126,7 +124,7 @@ class DynamicMixingModel(BaseMultiStreamModel):
     ):
         super().__init__(
             input_size=(input_channels, 32, 32),
-            hidden_size=hidden_dim,
+            
             num_classes=num_classes,
             **kwargs
         )
@@ -186,7 +184,7 @@ class SpatialAdaptiveMixingModel(BaseMultiStreamModel):
     ):
         super().__init__(
             input_size=(input_channels, 32, 32),
-            hidden_size=hidden_dim,
+            
             num_classes=num_classes,
             **kwargs
         )

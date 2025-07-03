@@ -25,7 +25,7 @@ def safe_clip_grad_value(parameters: Iterable[torch.Tensor], clip_value: float) 
 def safe_clip_grad_norm(parameters: Iterable[torch.Tensor], max_norm: float, norm_type: float = 2.0) -> float:
     """
     A safe implementation of gradient norm clipping that avoids using torch.nn.utils.clip_grad_norm_
-    to prevent recursion errors with monkey patching.
+    to prevent recursion errors with monkey patching. Also handles NaN/Inf gradients gracefully.
     
     Args:
         parameters: an iterable of Tensors or a single Tensor that will have gradients normalized
@@ -43,16 +43,32 @@ def safe_clip_grad_norm(parameters: Iterable[torch.Tensor], max_norm: float, nor
     if len(parameters) == 0:
         return torch.tensor(0.0)
     
-    # Calculate norm
+    # Get device for consistent tensor operations
+    device = parameters[0].grad.device
+    
+    # Calculate norm with NaN/Inf handling
     if norm_type == float('inf'):
         total_norm = max(p.grad.data.abs().max() for p in parameters)
     else:
-        total_norm = torch.norm(torch.stack([torch.norm(p.grad.data, norm_type) for p in parameters]), norm_type)
+        try:
+            total_norm = torch.norm(torch.stack([torch.norm(p.grad.data, norm_type).to(device) for p in parameters]), norm_type)
+        except RuntimeError:
+            # Fallback if tensor stacking fails
+            total_norm = torch.tensor(0.0, device=device)
+    
+    # Handle NaN/Inf values in gradients
+    if torch.isnan(total_norm) or torch.isinf(total_norm):
+        for p in parameters:
+            # Set gradients to zero if they contain NaN/Inf
+            if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                p.grad.detach().zero_()
+        return torch.tensor(0.0, device=device)
     
     # Apply scaling if needed
-    clip_coef = max_norm / (total_norm + 1e-6)
-    if clip_coef < 1.0:
+    if max_norm > 0 and total_norm > max_norm:
+        clip_coef = max_norm / (total_norm + 1e-6)
         for p in parameters:
-            p.grad.data.mul_(clip_coef)
+            if p.grad is not None:
+                p.grad.data.mul_(clip_coef)
     
     return total_norm

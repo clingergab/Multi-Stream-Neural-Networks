@@ -171,7 +171,46 @@ class DeviceManager:
         if self.device_type == 'cuda':
             return hasattr(torch.cuda, 'amp') and torch.cuda.get_device_capability(self.device)[0] >= 7
         return False
-
+    
+    def get_dataloader_config(self, conservative: bool = False) -> dict:
+        """
+        Get optimal DataLoader configuration for the current device.
+        
+        Args:
+            conservative: If True, use more conservative settings for stability
+            
+        Returns:
+            Dictionary with num_workers, pin_memory, and persistent_workers settings
+        """
+        import os
+        
+        # Determine optimal number of workers
+        cpu_count = os.cpu_count() or 1
+        
+        if self.device_type == 'mps':
+            # MPS doesn't support multiprocessing well
+            num_workers = 0
+            pin_memory = False
+            persistent_workers = False
+        elif self.device_type == 'cuda':
+            # CUDA can benefit from multiple workers and pin_memory
+            if conservative:
+                num_workers = min(4, cpu_count)  # Conservative for CNNs/complex models
+            else:
+                num_workers = min(8, cpu_count)  # More aggressive for tabular/simple data
+            pin_memory = True
+            persistent_workers = num_workers > 0
+        else:  # CPU
+            # CPU-only training benefits from fewer workers
+            num_workers = min(2, cpu_count)
+            pin_memory = False
+            persistent_workers = num_workers > 0
+        
+        return {
+            'num_workers': num_workers,
+            'pin_memory': pin_memory,
+            'persistent_workers': persistent_workers
+        }
 
 # Global device manager instance
 _device_manager = None

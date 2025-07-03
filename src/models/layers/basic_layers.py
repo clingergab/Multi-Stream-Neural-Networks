@@ -48,8 +48,8 @@ class BasicMultiChannelLayer(nn.Module):
         output = [y_color, y_brightness]
     """
     
-    def __init__(self, color_input_size=None, brightness_input_size=None, output_size=None, 
-                 bias=True, activation='relu', input_size=None):
+    def __init__(self, color_input_size: int, brightness_input_size: int, output_size: int, 
+                 bias: bool = True, activation: str = 'relu'):
         """
         Initialize BasicMultiChannelLayer.
         
@@ -59,14 +59,8 @@ class BasicMultiChannelLayer(nn.Module):
             output_size: Output size for both streams
             bias: Whether to use bias
             activation: Activation function
-            input_size: For backward compatibility - if provided, both streams use same input size
         """
         super().__init__()
-        
-        # Handle backward compatibility
-        if input_size is not None:
-            color_input_size = input_size
-            brightness_input_size = input_size
             
         if color_input_size is None or brightness_input_size is None or output_size is None:
             raise ValueError("Must provide color_input_size, brightness_input_size, and output_size")
