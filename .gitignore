@@ -1,60 +1,40 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# PyTorch
+# PyTorch model files
 *.pth
 *.pt
-*.ckpt
+*.bin
+saved_models/
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Large datasets
+data/MNIST/
+data/cifar-100/
+data/cifar-100-python/
+data/ImageNet/
+data/
 
-# Environments
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Output files
+outputs/
+checkpoints/
+results/*.png
+
+# Environment and IDE files
 .env
 .venv
 env/
 venv/
 ENV/
-env.bak/
-venv.bak/
-
-# Data and Model Files
-data/
-datasets/
-outputs/
-checkpoints/
-logs/
-wandb/
-tensorboard/
-
-# IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-.copilot-instructions.md
 
-# OS
+# OS generated files
 .DS_Store
 .DS_Store?
 ._*
@@ -63,24 +43,5 @@ tensorboard/
 ehthumbs.db
 Thumbs.db
 
-# Temporary files
-*.tmp
-*.temp
-*.log
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Experiments and temporary directories
-experiments/
-temp/
-temporary/
-
-# Auto-generated code and CI artifacts
-pyrightconfig.json
-
-# Results and output directories
-results/
-output/
+# The patch file we created
+tensor_handling_fix.patch

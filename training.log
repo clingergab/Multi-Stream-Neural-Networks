@@ -1,0 +1,21 @@
+2025-07-01 20:28:54,215 - __main__ - INFO - Starting Multi-Stream Neural Network training
+2025-07-01 20:28:54,215 - __main__ - INFO - Using device: cpu
+2025-07-01 20:28:54,215 - __main__ - INFO - Loading configuration from: configs/model_configs/direct_mixing/scalar.yaml
+2025-07-01 20:28:54,215 - __main__ - INFO - Creating direct_mixing model with variant: scalar
+2025-07-01 20:28:54,215 - __main__ - INFO - Loading cifar10 dataset
+2025-07-01 20:29:28,563 - __main__ - INFO - Starting Multi-Stream Neural Network training
+2025-07-01 20:29:28,563 - __main__ - INFO - Using device: cpu
+2025-07-01 20:29:28,563 - __main__ - INFO - Loading configuration from: configs/model_configs/direct_mixing/scalar.yaml
+2025-07-01 20:29:28,563 - __main__ - INFO - Creating direct_mixing model with variant: scalar
+2025-07-01 20:29:28,563 - __main__ - INFO - Loading cifar10 dataset
+2025-07-01 20:30:31,652 - __main__ - INFO - Starting Multi-Stream Neural Network training
+2025-07-01 20:30:31,652 - __main__ - INFO - Using device: cpu
+2025-07-01 20:30:31,652 - __main__ - INFO - Loading configuration from: configs/model_configs/direct_mixing/scalar.yaml
+2025-07-01 20:30:31,652 - __main__ - INFO - Creating direct_mixing model with variant: scalar
+2025-07-01 20:30:31,652 - __main__ - INFO - Loading cifar100 dataset
+2025-07-01 20:30:33,080 - __main__ - INFO - Converting RGB data to RGB + Brightness streams...
+2025-07-01 20:30:33,081 - __main__ - INFO - Creating augmented dataloaders...
+2025-07-01 20:30:33,081 - __main__ - INFO - Starting training...
+2025-07-01 20:30:33,081 - __main__ - INFO - Evaluating model...
+2025-07-01 20:30:33,081 - __main__ - INFO - Training completed successfully!
+2025-07-01 20:30:33,081 - __main__ - WARNING - This is a template script. Actual implementation will be added when core modules are complete.

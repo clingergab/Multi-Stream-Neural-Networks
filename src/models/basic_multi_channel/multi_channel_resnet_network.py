@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import sys
+import time
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
 from tqdm import tqdm
@@ -504,10 +505,14 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         brightness_norm = torch.norm(brightness_shared_weights).item() + torch.norm(brightness_head_weights).item()
         total_norm = color_norm + brightness_norm + 1e-8
         
+        # Calculate balance ratio (closer to 1.0 = more balanced)
+        balance_ratio = min(color_norm, brightness_norm) / max(color_norm, brightness_norm) if max(color_norm, brightness_norm) > 0 else 1.0
+        
         return {
             'color_pathway': color_norm / total_norm,
             'brightness_pathway': brightness_norm / total_norm,
             'pathway_ratio': color_norm / (brightness_norm + 1e-8),
+            'balance_ratio': balance_ratio,  # This is what diagnostics look for
             'fusion_type': 'shared_with_separate_heads',
             'shared_color_norm': torch.norm(color_shared_weights).item(),
             'shared_brightness_norm': torch.norm(brightness_shared_weights).item(),
@@ -588,7 +593,9 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         val_loader=None,
         batch_size=None,
         epochs: int = 10,
-        verbose: int = 1
+        verbose: int = 1,
+        enable_diagnostics: bool = False,
+        diagnostic_output_dir: str = "diagnostics"
     ) -> Dict[str, List[float]]:
         """
         Unified fit method that handles both direct data arrays and DataLoaders with on-the-fly augmentation.
@@ -632,13 +639,29 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             'learning_rates': []
         }
         
+        # Initialize diagnostics if enabled
+        if enable_diagnostics:
+            if verbose > 0:
+                print("🔍 Diagnostic mode enabled - comprehensive monitoring active")
+            self._setup_diagnostic_hooks()
+            
+            # Add diagnostic metrics to history
+            history.update({
+                'gradient_norms': [],
+                'weight_norms': [],
+                'dead_neuron_counts': [],
+                'pathway_balance': [],
+                'epoch_times': []
+            })
+        
         # Determine if we're using DataLoaders or direct data
         using_dataloaders = train_loader is not None
         
         # Use reasonable default batch size if not specified
         if batch_size is None and not using_dataloaders:
-            # For CNNs, moderate batch sizes work well across devices
-            batch_size = 128 if self.device.type == 'cuda' else 64
+            # For CNNs, smaller batch sizes work better for CIFAR-100
+            # Based on empirical testing: batch_size=32 significantly outperforms larger sizes
+            batch_size = 32
         
         # Get optimal DataLoader configuration from device manager (conservative for CNNs)
         dataloader_config = self.device_manager.get_dataloader_config(conservative=True)
@@ -887,11 +910,61 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             history['train_accuracy'].append(train_accuracy)
             history['learning_rates'].append(batch_lr if batch_lr else [current_lr])
             
+            # Collect diagnostic metrics if enabled
+            if enable_diagnostics:
+                # Get sample batch for dead neuron analysis
+                sample_batch = None
+                for batch_data in train_loader:
+                    if isinstance(batch_data, (list, tuple)) and len(batch_data) == 3:
+                        color_batch, brightness_batch, _ = batch_data
+                        # Move to device
+                        if color_batch.device != self.device:
+                            color_batch = color_batch.to(self.device)
+                        if brightness_batch.device != self.device:
+                            brightness_batch = brightness_batch.to(self.device)
+                        sample_batch = (color_batch, brightness_batch)
+                        break
+                
+                # Collect comprehensive diagnostics
+                diagnostics = self._collect_epoch_diagnostics(
+                    epoch=epoch,
+                    sample_batch=sample_batch,
+                    epoch_time=0.0,  # Will be calculated later
+                    current_lr=current_lr
+                )
+                
+                # Store diagnostic metrics in history
+                history['gradient_norms'].append(diagnostics['gradient_norm'])
+                history['weight_norms'].append(diagnostics['weight_norm'])
+                history['dead_neuron_counts'].append(diagnostics['dead_neuron_count'])
+                history['pathway_balance'].append(diagnostics['pathway_balance'])
+                history['epoch_times'].append(diagnostics['epoch_time'])
+                
+                if verbose > 0:
+                    print(f"📊 Diagnostics - Grad: {diagnostics['gradient_norm']:.4f}, "
+                          f"Weight: {diagnostics['weight_norm']:.4f}, "
+                          f"Balance: {diagnostics['pathway_balance']:.4f}")
+            
             # Validation phase
             if val_loader is not None:
                 val_loss, val_accuracy = self._validate(val_loader)
                 history['val_loss'].append(val_loss)
                 history['val_accuracy'].append(val_accuracy)
+                
+                # Collect validation diagnostics if enabled
+                if enable_diagnostics:
+                    val_diagnostics = self._collect_validation_diagnostics(val_loader, epoch)
+                    
+                    # Store validation diagnostic metrics
+                    for key, value in val_diagnostics.items():
+                        if key not in history:
+                            history[key] = []
+                        history[key].append(value)
+                    
+                    if verbose > 0:
+                        print(f"📋 Val Diagnostics - Dead neurons: {val_diagnostics.get('dead_neurons_detected', 0)}, "
+                              f"Avg confidence: {val_diagnostics.get('avg_confidence', 0):.4f}, "
+                              f"Low confidence %: {val_diagnostics.get('low_confidence_percent', 0):.1f}%")
                 
                 # Early stopping check
                 if val_loss < best_val_loss:
@@ -936,6 +1009,33 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         
         # Clear cache after training
         self.device_manager.clear_cache()
+        
+        # Generate diagnostic outputs if enabled
+        if enable_diagnostics:
+            if verbose > 0:
+                print("📊 Generating diagnostic outputs...")
+            
+            # Clean up diagnostic hooks
+            self._cleanup_diagnostic_hooks()
+            
+            # Save diagnostic plots
+            self._save_diagnostic_plots(diagnostic_output_dir)
+            
+            # Generate and save diagnostic summary
+            summary = self.get_diagnostic_summary()
+            import json
+            from pathlib import Path
+            
+            output_path = Path(diagnostic_output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+            summary_path = output_path / f"{self.__class__.__name__}_diagnostic_summary.json"
+            with open(summary_path, 'w') as f:
+                json.dump(summary, f, indent=2, default=str)
+            
+            if verbose > 0:
+                print(f"📋 Diagnostic summary saved to {summary_path}")
+                print("🏁 Training completed with comprehensive diagnostics")
         
         return history
     

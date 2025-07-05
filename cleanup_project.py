@@ -175,6 +175,78 @@ def perform_cleanup(candidates, dry_run=True):
     
     print(f"\n{'📋 Summary' if dry_run else '✅ Cleanup Complete'}: {len(files_to_remove)} files {'would be' if dry_run else 'were'} removed")
 
+def git_cleanup_check():
+    """Check for Git-related cleanup opportunities."""
+    import subprocess
+    
+    print("\n🔍 Checking for Git-related cleanup opportunities...")
+    
+    # Check if Git is available
+    try:
+        subprocess.run(["git", "--version"], capture_output=True, check=True)
+    except (subprocess.SubprocessError, FileNotFoundError):
+        print("❌ Git not found. Skipping Git cleanup checks.")
+        return
+    
+    # Check for large files that might cause push issues
+    print("\n📦 Checking for large files that might cause Git push issues...")
+    
+    large_files = []
+    try:
+        # Find files larger than 50MB
+        result = subprocess.run(
+            ["find", ".", "-type", "f", "-size", "+50M", "-not", "-path", "*.git*"],
+            capture_output=True, text=True
+        )
+        large_files = [line.strip() for line in result.stdout.split("\n") if line.strip()]
+    except Exception as e:
+        print(f"❌ Error checking for large files: {e}")
+    
+    if large_files:
+        print(f"\n⚠️ Found {len(large_files)} large files that may cause Git push issues:")
+        for file in large_files:
+            size_mb = os.path.getsize(file) / (1024 * 1024)
+            print(f"   - {file} ({size_mb:.2f}MB)")
+        
+        print("\n💡 Recommendations:")
+        print("   - Consider using Git LFS for these files")
+        print("   - Or add them to .gitignore to prevent them from being tracked")
+        print("   - Or move them to external storage")
+    else:
+        print("✅ No problematic large files found.")
+    
+    # Check if the current repository is ahead of remote
+    try:
+        result = subprocess.run(
+            ["git", "status", "-sb"],
+            capture_output=True, text=True
+        )
+        status_output = result.stdout.strip()
+        if "ahead" in status_output:
+            print("\n⚠️ Your local repository is ahead of the remote.")
+            print("   - Consider pushing your changes: git push")
+    except Exception:
+        pass
+    
+    # Check for untracked files that should be ignored
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True
+        )
+        untracked = [line.strip() for line in result.stdout.split("\n") if line.strip()]
+        
+        # Check for potential data/model files
+        data_model_files = [f for f in untracked if any(ext in f for ext in ['.pth', '.pt', '.bin', '.pkl', '.npz', '.npy'])]
+        if data_model_files:
+            print("\n⚠️ Found untracked data/model files that should probably be ignored:")
+            for file in data_model_files[:5]:  # Show just the first 5
+                print(f"   - {file}")
+            if len(data_model_files) > 5:
+                print(f"   - ... and {len(data_model_files) - 5} more")
+    except Exception:
+        pass
+
 def main():
     """Main cleanup function."""
     print("🚀 Multi-Stream Neural Networks Project Cleanup")
@@ -186,7 +258,11 @@ def main():
     # Print analysis
     print_cleanup_analysis(candidates)
     
+    # Run Git-specific cleanup checks
+    git_cleanup_check()
+    
     if sum(len(files) for files in candidates.values()) == 0:
+        print("\n✅ No file cleanup needed, but check the Git recommendations above.")
         return
     
     # Ask user for confirmation

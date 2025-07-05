@@ -10,7 +10,10 @@ from torch.amp import GradScaler
 from torch import optim
 import torch.nn as nn
 from abc import ABC, abstractmethod
-from typing import Tuple, Dict, Any, List, Union
+from typing import Tuple, Dict, Any, List, Union, Optional
+import time
+import matplotlib.pyplot as plt
+from pathlib import Path
 
 
 class BaseMultiStreamModel(nn.Module, ABC):
@@ -58,9 +61,281 @@ class BaseMultiStreamModel(nn.Module, ABC):
         # Mixed precision support
         self.use_mixed_precision = self.device_manager.enable_mixed_precision()
         self.scaler = GradScaler() if self.use_mixed_precision else None
+        # Initialize diagnostic tracking
+        self._init_diagnostics()
+    
+    def _init_diagnostics(self):
+        """Initialize diagnostic tracking variables."""
+        self.diagnostic_history = {
+            'gradient_norms': [],
+            'weight_norms': [],
+            'dead_neuron_counts': [],
+            'pathway_balance': [],
+            'epoch_times': [],
+            'learning_rates': [],
+            'nan_inf_detections': []
+        }
+        self.diagnostic_hooks = []
+    
+    def _calculate_gradient_norm(self) -> float:
+        """Calculate total gradient norm for diagnostic purposes."""
+        total_norm = 0.0
+        param_count = 0
         
-        # Note: Subclasses should call self._finalize_initialization() after their setup
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
         
+        return total_norm ** 0.5 if param_count > 0 else 0.0
+    
+    def _calculate_weight_norm(self) -> float:
+        """Calculate total weight norm for diagnostic purposes."""
+        total_norm = 0.0
+        param_count = 0
+        
+        for p in self.parameters():
+            if p.requires_grad:
+                param_norm = p.data.norm(2)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
+        
+        return total_norm ** 0.5 if param_count > 0 else 0.0
+    
+    def _count_dead_neurons(self, sample_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> int:
+        """
+        Count dead neurons using activation tracking.
+        
+        Args:
+            sample_batch: Optional sample batch for activation analysis
+            
+        Returns:
+            Number of dead neurons detected
+        """
+        if sample_batch is None:
+            # Simple check without activation tracking
+            return 0
+        
+        # Use the debug_utils function for comprehensive dead neuron detection
+        try:
+            from ..utils.debug_utils import check_for_dead_neurons
+            dead_stats = check_for_dead_neurons(self, sample_batch, num_batches=1, threshold=0.05)
+            
+            # Sum up dead neurons across all layers
+            total_dead = 0
+            for layer_name, dead_percent in dead_stats.items():
+                if isinstance(dead_percent, dict):
+                    # Multi-channel layers
+                    total_dead += dead_percent.get('color_dead_percent', 0)
+                    total_dead += dead_percent.get('brightness_dead_percent', 0)
+                else:
+                    # Standard layers
+                    total_dead += dead_percent
+            
+            return int(total_dead)
+        except Exception:
+            return 0
+    
+    def _analyze_pathway_balance(self) -> float:
+        """
+        Analyze balance between pathways.
+        
+        Returns:
+            Balance ratio (1.0 = perfectly balanced)
+        """
+        try:
+            # Use the model's pathway analysis if available
+            if hasattr(self, 'analyze_pathway_weights'):
+                weights = self.analyze_pathway_weights()
+                return weights.get('balance_ratio', 1.0)
+            
+            # Fallback: analyze gradient balance
+            from ..utils.debug_utils import check_pathway_gradients
+            pathway_stats = check_pathway_gradients(self)
+            
+            if 'pathway_balance' in pathway_stats:
+                balance_info = pathway_stats['pathway_balance']
+                color_percent = balance_info.get('color_pathway_grad_percent', 50)
+                brightness_percent = balance_info.get('brightness_pathway_grad_percent', 50)
+                
+                # Calculate balance ratio (closer to 1.0 = more balanced)
+                if color_percent > 0 and brightness_percent > 0:
+                    return min(color_percent, brightness_percent) / max(color_percent, brightness_percent)
+            
+            return 1.0
+        except Exception:
+            return 1.0
+    
+    def _setup_diagnostic_hooks(self):
+        """Set up hooks for NaN/Inf detection during training."""
+        try:
+            from ..utils.debug_utils import add_diagnostic_hooks
+            self.diagnostic_hooks = add_diagnostic_hooks(self)
+        except Exception:
+            self.diagnostic_hooks = []
+    
+    def _cleanup_diagnostic_hooks(self):
+        """Clean up diagnostic hooks."""
+        for hook in self.diagnostic_hooks:
+            try:
+                hook.remove()
+            except Exception:
+                pass
+        self.diagnostic_hooks = []
+    
+    def _collect_epoch_diagnostics(self, epoch: int, sample_batch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
+                                  epoch_time: float = 0.0, current_lr: float = 0.0) -> Dict[str, float]:
+        """
+        Collect diagnostic information for the current epoch.
+        
+        Args:
+            epoch: Current epoch number
+            sample_batch: Optional sample batch for activation analysis
+            epoch_time: Time taken for this epoch
+            current_lr: Current learning rate
+            
+        Returns:
+            Dictionary with diagnostic metrics
+        """
+        diagnostics = {}
+        
+        # Collect gradient norm
+        gradient_norm = self._calculate_gradient_norm()
+        diagnostics['gradient_norm'] = gradient_norm
+        self.diagnostic_history['gradient_norms'].append(gradient_norm)
+        
+        # Collect weight norm
+        weight_norm = self._calculate_weight_norm()
+        diagnostics['weight_norm'] = weight_norm
+        self.diagnostic_history['weight_norms'].append(weight_norm)
+        
+        # Collect dead neuron count
+        dead_count = self._count_dead_neurons(sample_batch)
+        diagnostics['dead_neuron_count'] = dead_count
+        self.diagnostic_history['dead_neuron_counts'].append(dead_count)
+        
+        # Collect pathway balance
+        pathway_balance = self._analyze_pathway_balance()
+        diagnostics['pathway_balance'] = pathway_balance
+        self.diagnostic_history['pathway_balance'].append(pathway_balance)
+        
+        # Store timing and learning rate
+        diagnostics['epoch_time'] = epoch_time
+        diagnostics['learning_rate'] = current_lr
+        self.diagnostic_history['epoch_times'].append(epoch_time)
+        self.diagnostic_history['learning_rates'].append(current_lr)
+        
+        return diagnostics
+    
+    def _save_diagnostic_plots(self, output_dir: str, model_name: str = None):
+        """
+        Save diagnostic plots to the specified directory.
+        
+        Args:
+            output_dir: Directory to save plots
+            model_name: Name of the model (for plot titles)
+        """
+        if model_name is None:
+            model_name = self.__class__.__name__
+        
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create diagnostic plots
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # Gradient norms
+        if self.diagnostic_history['gradient_norms']:
+            axes[0, 0].plot(self.diagnostic_history['gradient_norms'])
+            axes[0, 0].set_title('Gradient Norms')
+            axes[0, 0].set_xlabel('Epoch')
+            axes[0, 0].set_ylabel('Gradient Norm')
+            axes[0, 0].grid(True)
+        
+        # Weight norms
+        if self.diagnostic_history['weight_norms']:
+            axes[0, 1].plot(self.diagnostic_history['weight_norms'])
+            axes[0, 1].set_title('Weight Norms')
+            axes[0, 1].set_xlabel('Epoch')
+            axes[0, 1].set_ylabel('Weight Norm')
+            axes[0, 1].grid(True)
+        
+        # Dead neuron counts
+        if self.diagnostic_history['dead_neuron_counts']:
+            axes[0, 2].plot(self.diagnostic_history['dead_neuron_counts'])
+            axes[0, 2].set_title('Dead Neuron Counts')
+            axes[0, 2].set_xlabel('Epoch')
+            axes[0, 2].set_ylabel('Dead Neurons')
+            axes[0, 2].grid(True)
+        
+        # Pathway balance
+        if self.diagnostic_history['pathway_balance']:
+            axes[1, 0].plot(self.diagnostic_history['pathway_balance'])
+            axes[1, 0].set_title('Pathway Balance')
+            axes[1, 0].set_xlabel('Epoch')
+            axes[1, 0].set_ylabel('Balance Ratio')
+            axes[1, 0].grid(True)
+        
+        # Epoch times
+        if self.diagnostic_history['epoch_times']:
+            axes[1, 1].plot(self.diagnostic_history['epoch_times'])
+            axes[1, 1].set_title('Epoch Times')
+            axes[1, 1].set_xlabel('Epoch')
+            axes[1, 1].set_ylabel('Time (seconds)')
+            axes[1, 1].grid(True)
+        
+        # Learning rates
+        if self.diagnostic_history['learning_rates']:
+            axes[1, 2].plot(self.diagnostic_history['learning_rates'])
+            axes[1, 2].set_title('Learning Rates')
+            axes[1, 2].set_xlabel('Epoch')
+            axes[1, 2].set_ylabel('Learning Rate')
+            axes[1, 2].grid(True)
+        
+        plt.suptitle(f'{model_name} - Diagnostic History')
+        plt.tight_layout()
+        
+        # Save plot
+        plot_path = output_path / f"{model_name}_diagnostics.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"📊 Diagnostic plots saved to {plot_path}")
+    
+    def get_diagnostic_summary(self) -> Dict[str, Any]:
+        """
+        Get a summary of diagnostic information.
+        
+        Returns:
+            Dictionary with diagnostic summary
+        """
+        summary = {
+            'model_name': self.__class__.__name__,
+            'total_parameters': sum(p.numel() for p in self.parameters()),
+            'trainable_parameters': sum(p.numel() for p in self.parameters() if p.requires_grad),
+            'diagnostic_history': self.diagnostic_history.copy(),
+            'final_stats': {}
+        }
+        
+        # Add final statistics
+        if self.diagnostic_history['gradient_norms']:
+            summary['final_stats']['final_gradient_norm'] = self.diagnostic_history['gradient_norms'][-1]
+            summary['final_stats']['avg_gradient_norm'] = np.mean(self.diagnostic_history['gradient_norms'])
+        
+        if self.diagnostic_history['weight_norms']:
+            summary['final_stats']['final_weight_norm'] = self.diagnostic_history['weight_norms'][-1]
+            summary['final_stats']['avg_weight_norm'] = np.mean(self.diagnostic_history['weight_norms'])
+        
+        if self.diagnostic_history['pathway_balance']:
+            summary['final_stats']['final_pathway_balance'] = self.diagnostic_history['pathway_balance'][-1]
+            summary['final_stats']['avg_pathway_balance'] = np.mean(self.diagnostic_history['pathway_balance'])
+        
+        if self.diagnostic_history['epoch_times']:
+            summary['final_stats']['total_training_time'] = sum(self.diagnostic_history['epoch_times'])
+            summary['final_stats']['avg_epoch_time'] = np.mean(self.diagnostic_history['epoch_times'])
+        
+        return summary
     
     @abstractmethod
     def _build_network(self):
@@ -299,9 +574,15 @@ class BaseMultiStreamModel(nn.Module, ABC):
         return self
 
     @abstractmethod
-    def fit(self, *args, **kwargs):
+    def fit(self, *args, enable_diagnostics: bool = False, diagnostic_output_dir: str = "diagnostics", **kwargs):
         """
         Fit the model to data. Must be implemented by subclasses.
+        
+        Args:
+            *args: Variable positional arguments specific to each model
+            enable_diagnostics: Enable comprehensive diagnostic tracking and reporting
+            diagnostic_output_dir: Directory to save diagnostic outputs when diagnostics are enabled
+            **kwargs: Variable keyword arguments specific to each model
         """
         raise NotImplementedError("Subclasses must implement fit() method.")
 
@@ -437,3 +718,333 @@ class BaseMultiStreamModel(nn.Module, ABC):
         # Move model to device and optimize
         self.to(self.device)
         self.device_manager.optimize_for_device(self)
+    
+    # === DIAGNOSTIC METHODS ===
+    
+    def enable_diagnostics(self):
+        """Enable comprehensive diagnostic tracking during training."""
+        self.diagnostic_mode = True
+        self.diagnostic_history = {
+            'gradient_norms': [],
+            'weight_norms': [],
+            'pathway_balance': [],
+            'dead_neurons': [],
+            'epoch_times': []
+        }
+        self._add_diagnostic_hooks()
+    
+    def disable_diagnostics(self):
+        """Disable diagnostic tracking and remove hooks."""
+        self.diagnostic_mode = False
+        self._remove_diagnostic_hooks()
+    
+    def _add_diagnostic_hooks(self):
+        """Add hooks for monitoring gradients and activations."""
+        from ..utils.debug_utils import add_diagnostic_hooks
+        self.diagnostic_hooks = add_diagnostic_hooks(self)
+    
+    def _remove_diagnostic_hooks(self):
+        """Remove diagnostic hooks."""
+        for hook in self.diagnostic_hooks:
+            hook.remove()
+        self.diagnostic_hooks = []
+    
+    def calculate_gradient_norm(self) -> float:
+        """Calculate total gradient norm across all parameters."""
+        total_norm = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+    
+    def calculate_weight_norm(self) -> float:
+        """Calculate total weight norm across all parameters."""
+        total_norm = 0.0
+        for p in self.parameters():
+            param_norm = p.data.norm(2)
+            total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+    
+    def count_dead_neurons(self) -> int:
+        """Count neurons that are always inactive (simplified implementation)."""
+        # This is a simplified check - proper implementation would track activations
+        dead_count = 0
+        for name, module in self.named_modules():
+            if isinstance(module, nn.ReLU):
+                # Placeholder - proper implementation would track activations over time
+                pass
+        return dead_count
+    
+    def analyze_pathway_balance(self) -> float:
+        """Analyze balance between pathways (model-specific implementation)."""
+        try:
+            if hasattr(self, 'analyze_pathway_weights'):
+                weights = self.analyze_pathway_weights()
+                return weights.get('balance_ratio', 1.0)
+        except Exception:
+            pass
+        return 1.0
+    
+    def record_diagnostic_metrics(self, epoch_time: float = 0.0):
+        """Record diagnostic metrics for current training step."""
+        if not self.diagnostic_mode:
+            return
+        
+        self.diagnostic_history['gradient_norms'].append(self.calculate_gradient_norm())
+        self.diagnostic_history['weight_norms'].append(self.calculate_weight_norm())
+        self.diagnostic_history['pathway_balance'].append(self.analyze_pathway_balance())
+        self.diagnostic_history['dead_neurons'].append(self.count_dead_neurons())
+        self.diagnostic_history['epoch_times'].append(epoch_time)
+    
+    def get_diagnostic_history(self) -> Dict[str, List[float]]:
+        """Get complete diagnostic history."""
+        return self.diagnostic_history.copy()
+    
+    def save_diagnostic_plots(self, output_path: str, model_name: str = None):
+        """Save diagnostic plots to file."""
+        if not self.diagnostic_mode:
+            print("⚠️ Diagnostics not enabled. Call enable_diagnostics() first.")
+            return
+        
+        model_name = model_name or self.__class__.__name__
+        
+        try:
+            from ..utils.debug_utils import plot_diagnostic_history
+            plot_diagnostic_history(self.diagnostic_history, output_path, model_name)
+            print(f"✅ Diagnostic plots saved to {output_path}")
+        except ImportError:
+            print("⚠️ Diagnostic plotting not available. Install matplotlib.")
+        except Exception as e:
+            print(f"❌ Error saving diagnostic plots: {e}")
+    
+    def generate_diagnostic_report(self) -> Dict[str, Any]:
+        """Generate comprehensive diagnostic report."""
+        if not self.diagnostic_mode:
+            return {"error": "Diagnostics not enabled"}
+        
+        history = self.diagnostic_history
+        if not history['gradient_norms']:
+            return {"error": "No diagnostic data recorded"}
+        
+        report = {
+            "model_name": self.__class__.__name__,
+            "total_epochs": len(history['gradient_norms']),
+            "final_gradient_norm": history['gradient_norms'][-1] if history['gradient_norms'] else 0,
+            "final_weight_norm": history['weight_norms'][-1] if history['weight_norms'] else 0,
+            "final_pathway_balance": history['pathway_balance'][-1] if history['pathway_balance'] else 1.0,
+            "average_epoch_time": np.mean(history['epoch_times']) if history['epoch_times'] else 0,
+            "gradient_norm_trend": self._analyze_trend(history['gradient_norms']),
+            "weight_norm_trend": self._analyze_trend(history['weight_norms']),
+            "diagnostic_summary": self._generate_diagnostic_summary()
+        }
+        
+        return report
+    
+    def _analyze_trend(self, values: List[float]) -> str:
+        """Analyze trend in a list of values."""
+        if len(values) < 2:
+            return "insufficient_data"
+        
+        # Simple trend analysis
+        first_half = np.mean(values[:len(values)//2])
+        second_half = np.mean(values[len(values)//2:])
+        
+        if second_half > first_half * 1.1:
+            return "increasing"
+        elif second_half < first_half * 0.9:
+            return "decreasing"
+        else:
+            return "stable"
+    
+    def _generate_diagnostic_summary(self) -> str:
+        """Generate human-readable diagnostic summary."""
+        history = self.diagnostic_history
+        
+        if not history['gradient_norms']:
+            return "No training data available"
+        
+        grad_trend = self._analyze_trend(history['gradient_norms'])
+        weight_trend = self._analyze_trend(history['weight_norms'])
+        
+        summary = f"Training completed over {len(history['gradient_norms'])} epochs. "
+        summary += f"Gradient norms are {grad_trend}, weight norms are {weight_trend}. "
+        
+        final_balance = history['pathway_balance'][-1] if history['pathway_balance'] else 1.0
+        if abs(final_balance - 1.0) > 0.2:
+            summary += "Pathway imbalance detected. "
+        else:
+            summary += "Pathways appear balanced. "
+        
+        return summary
+
+    def _collect_validation_diagnostics(self, val_loader: DataLoader, epoch: int) -> Dict[str, float]:
+        """
+        Collect comprehensive validation diagnostics including loss analysis, 
+        gradient flow, and pathway balance during validation.
+        
+        Args:
+            val_loader: Validation data loader
+            epoch: Current epoch number
+            
+        Returns:
+            Dictionary with validation diagnostic metrics
+        """
+        self.eval()
+        val_diagnostics = {
+            'epoch': epoch,
+            'val_loss': 0.0,
+            'val_accuracy': 0.0,
+            'val_samples': 0,
+            'prediction_confidence': [],
+            'class_predictions': [],
+            'pathway_activations': {'color': [], 'brightness': []},
+            'layer_activations': {},
+            'gradient_flow': {},
+            'dead_neurons_detected': 0,
+            'pathway_balance': 1.0
+        }
+        
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        
+        # Setup hooks for activation tracking during validation
+        activation_hooks = []
+        
+        def make_activation_hook(name):
+            def hook(module, input, output):
+                if isinstance(output, torch.Tensor):
+                    # Store activation statistics
+                    val_diagnostics['layer_activations'][name] = {
+                        'mean': output.mean().item(),
+                        'std': output.std().item(),
+                        'max': output.max().item(),
+                        'min': output.min().item(),
+                        'zeros_percent': (output == 0).float().mean().item() * 100
+                    }
+                elif isinstance(output, tuple) and len(output) == 2:
+                    # Multi-channel output
+                    color_out, brightness_out = output
+                    val_diagnostics['layer_activations'][name] = {
+                        'color': {
+                            'mean': color_out.mean().item(),
+                            'std': color_out.std().item(),
+                            'zeros_percent': (color_out == 0).float().mean().item() * 100
+                        },
+                        'brightness': {
+                            'mean': brightness_out.mean().item(),
+                            'std': brightness_out.std().item(),
+                            'zeros_percent': (brightness_out == 0).float().mean().item() * 100
+                        }
+                    }
+            return hook
+        
+        # Register hooks for key layers
+        for name, module in self.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear, nn.ReLU, nn.BatchNorm2d)):
+                hook = module.register_forward_hook(make_activation_hook(name))
+                activation_hooks.append(hook)
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_loader):
+                if len(batch) == 3:
+                    color_data, brightness_data, targets = batch
+                else:
+                    # Handle different batch formats
+                    color_data, brightness_data = batch[0], batch[1]
+                    targets = batch[2] if len(batch) > 2 else None
+                
+                # Move to device
+                color_data = color_data.to(self.device)
+                brightness_data = brightness_data.to(self.device)
+                if targets is not None:
+                    targets = targets.to(self.device)
+                
+                # Forward pass
+                outputs = self.forward(color_data, brightness_data)
+                
+                if targets is not None:
+                    # Calculate loss
+                    if not hasattr(self, 'criterion') or self.criterion is None:
+                        criterion = nn.CrossEntropyLoss()
+                    else:
+                        criterion = self.criterion
+                    
+                    loss = criterion(outputs, targets)
+                    total_loss += loss.item()
+                    
+                    # Calculate accuracy
+                    _, predicted = torch.max(outputs, 1)
+                    correct += (predicted == targets).sum().item()
+                    total += targets.size(0)
+                    
+                    # Store predictions and confidence
+                    probs = torch.softmax(outputs, dim=1)
+                    max_probs, _ = torch.max(probs, dim=1)
+                    val_diagnostics['prediction_confidence'].extend(max_probs.cpu().numpy().tolist())
+                    val_diagnostics['class_predictions'].extend(predicted.cpu().numpy().tolist())
+                
+                # Analyze pathway outputs for balance
+                try:
+                    if hasattr(self, 'analyze_pathways'):
+                        color_out, brightness_out = self.analyze_pathways(color_data, brightness_data)
+                        
+                        # Store pathway activation statistics
+                        val_diagnostics['pathway_activations']['color'].append({
+                            'mean': color_out.mean().item(),
+                            'std': color_out.std().item(),
+                            'max': color_out.max().item()
+                        })
+                        val_diagnostics['pathway_activations']['brightness'].append({
+                            'mean': brightness_out.mean().item(),
+                            'std': brightness_out.std().item(),
+                            'max': brightness_out.max().item()
+                        })
+                except Exception as e:
+                    # Skip if pathway analysis fails
+                    pass
+                
+                # Limit validation analysis to prevent excessive memory usage
+                if batch_idx >= 10:  # Analyze first 10 batches
+                    break
+        
+        # Calculate final metrics
+        if total > 0:
+            val_diagnostics['val_loss'] = total_loss / len(val_loader)
+            val_diagnostics['val_accuracy'] = correct / total
+            val_diagnostics['val_samples'] = total
+        
+        # Analyze prediction confidence
+        if val_diagnostics['prediction_confidence']:
+            confidences = val_diagnostics['prediction_confidence']
+            val_diagnostics['avg_confidence'] = np.mean(confidences)
+            val_diagnostics['low_confidence_percent'] = (np.array(confidences) < 0.5).mean() * 100
+        
+        # Analyze pathway balance
+        try:
+            val_diagnostics['pathway_balance'] = self._analyze_pathway_balance()
+        except Exception:
+            val_diagnostics['pathway_balance'] = 1.0
+        
+        # Check for dead neurons using a sample batch
+        try:
+            if len(val_loader) > 0:
+                sample_batch = next(iter(val_loader))
+                if len(sample_batch) >= 2:
+                    sample_color = sample_batch[0][:4].to(self.device)  # Small sample
+                    sample_brightness = sample_batch[1][:4].to(self.device)
+                    val_diagnostics['dead_neurons_detected'] = self._count_dead_neurons(
+                        (sample_color, sample_brightness)
+                    )
+        except Exception:
+            val_diagnostics['dead_neurons_detected'] = 0
+        
+        # Clean up hooks
+        for hook in activation_hooks:
+            try:
+                hook.remove()
+            except Exception:
+                pass
+        
+        return val_diagnostics

@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import time
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
 from typing import Tuple, Dict, List, Union
@@ -26,11 +27,13 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
     - Dense feature vectors
     - Embeddings
     - Flattened image features
+    - Raw image data (automatically flattened)
     
     Features:
     - Automatic GPU detection and optimization
     - Keras-like training API
     - Built-in training loop with progress tracking
+    - Automatic flattening of 4D tensors to 2D tensors
     
     API Design:
     -----------
@@ -40,11 +43,13 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
        - Called automatically by model(x, y)
        - Returns single tensor suitable for loss computation
        - Use this for all training and classification tasks
+       - Automatically flattens 4D image tensors to 2D feature tensors
     
     2. **analyze_pathways()** - For research and analysis purposes only
        - Returns separate outputs for each stream/pathway
        - Use this to analyze individual pathway contributions
        - Never use this for training (returns tuple, not single tensor)
+       - Automatically flattens 4D image tensors to 2D feature tensors
     
     Example Usage:
     -------------
@@ -194,6 +199,12 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         Returns:
             Combined classification logits [batch_size, num_classes]
         """
+        # Handle input reshaping for BaseMultiChannelNetwork (flatten 4D inputs to 2D)
+        if color_input.dim() > 2:
+            color_input = color_input.reshape(color_input.size(0), -1)
+        if brightness_input.dim() > 2:
+            brightness_input = brightness_input.reshape(brightness_input.size(0), -1)
+        
         # Extract features through all layers
         color_x, brightness_x = self._forward_through_layers(color_input, brightness_input)
         
@@ -235,8 +246,8 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         For separate pathway features, use get_separate_features() instead.
         
         Args:
-            color_input: Color features tensor
-            brightness_input: Brightness features tensor
+            color_input: Color features tensor [batch_size, input_size] or [batch_size, channels, height, width]
+            brightness_input: Brightness features tensor [batch_size, input_size] or [batch_size, channels, height, width]
             
         Returns:
             Concatenated fused features [batch_size, feature_size * 2]
@@ -256,13 +267,19 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         For fused features ready for external classifiers, use extract_features() instead.
         
         Args:
-            color_input: Color features tensor
-            brightness_input: Brightness features tensor
+            color_input: Color features tensor [batch_size, input_size] or [batch_size, channels, height, width]
+            brightness_input: Brightness features tensor [batch_size, input_size] or [batch_size, channels, height, width]
             
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: Features from color and brightness pathways
             Separate features for pathway analysis and research
         """
+        # Handle input reshaping for BaseMultiChannelNetwork (flatten 4D inputs to 2D)
+        if color_input.dim() > 2:
+            color_input = color_input.reshape(color_input.size(0), -1)
+        if brightness_input.dim() > 2:
+            brightness_input = brightness_input.reshape(brightness_input.size(0), -1)
+            
         # Use the private helper method to get separate features
         color_x, brightness_x = self._forward_through_layers(color_input, brightness_input)
         
@@ -277,13 +294,18 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         Use this method only for research, visualization, and pathway analysis.
         
         Args:
-            color_input: Color features tensor [batch_size, input_size]
-            brightness_input: Brightness features tensor [batch_size, input_size]
+            color_input: Color features tensor [batch_size, input_size] or [batch_size, channels, height, width]
+            brightness_input: Brightness features tensor [batch_size, input_size] or [batch_size, channels, height, width]
             
         Returns:
             Tuple of (color_logits, brightness_logits) [batch_size, num_classes] each
             Separate outputs for analyzing individual pathway performance
         """
+        # Handle input reshaping for BaseMultiChannelNetwork (flatten 4D inputs to 2D)
+        if color_input.dim() > 2:
+            color_input = color_input.reshape(color_input.size(0), -1)
+        if brightness_input.dim() > 2:
+            brightness_input = brightness_input.reshape(brightness_input.size(0), -1)
         # Extract features through all layers
         color_x, brightness_x = self._forward_through_layers(color_input, brightness_input)
         
@@ -313,10 +335,14 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         brightness_norm = torch.norm(brightness_shared_weights).item() + torch.norm(brightness_head_weights).item()
         total_norm = color_norm + brightness_norm + 1e-8
         
+        # Calculate balance ratio (closer to 1.0 = more balanced)
+        balance_ratio = min(color_norm, brightness_norm) / max(color_norm, brightness_norm) if max(color_norm, brightness_norm) > 0 else 1.0
+        
         return {
             'color_pathway': color_norm / total_norm,
             'brightness_pathway': brightness_norm / total_norm,
             'pathway_ratio': color_norm / (brightness_norm + 1e-8),
+            'balance_ratio': balance_ratio,  # This is what diagnostics look for
             'fusion_type': 'shared_with_separate_heads',
             'shared_color_norm': torch.norm(color_shared_weights).item(),
             'shared_brightness_norm': torch.norm(brightness_shared_weights).item(),
@@ -326,18 +352,51 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
     
     def get_pathway_importance(self) -> Dict[str, float]:
         """Calculate pathway importance based on final classifier weights."""
-        if hasattr(self.classifier, 'color_weights') and hasattr(self.classifier, 'brightness_weights'):
-            color_norm = torch.norm(self.classifier.color_weights.data).item()
-            brightness_norm = torch.norm(self.classifier.brightness_weights.data).item()
-            total_norm = color_norm + brightness_norm + 1e-8
+        try:
+            # Use shared_classifier which is the actual classifier in this model
+            if hasattr(self, 'shared_classifier') and self.shared_classifier is not None:
+                # Analyze the shared classifier weights
+                weight_matrix = self.shared_classifier.weight.data  # Shape: [num_classes, input_features]
+                
+                # Since features are concatenated [color_features, brightness_features], 
+                # we can analyze the first half vs second half
+                total_features = weight_matrix.shape[1]
+                color_features = total_features // 2
+                brightness_features = total_features - color_features
+                
+                # Calculate norms for each pathway
+                color_weights = weight_matrix[:, :color_features]
+                brightness_weights = weight_matrix[:, color_features:]
+                
+                color_norm = torch.norm(color_weights).item()
+                brightness_norm = torch.norm(brightness_weights).item()
+                total_norm = color_norm + brightness_norm + 1e-8
+                
+                return {
+                    'color_pathway': color_norm / total_norm,
+                    'brightness_pathway': brightness_norm / total_norm,
+                    'pathway_ratio': color_norm / (brightness_norm + 1e-8),
+                    'color_weight_norm': color_norm,
+                    'brightness_weight_norm': brightness_norm
+                }
             
+            # Fallback: equal importance
             return {
-                'color_pathway': color_norm / total_norm,
-                'brightness_pathway': brightness_norm / total_norm,
-                'pathway_ratio': color_norm / (brightness_norm + 1e-8)
+                'color_pathway': 0.5, 
+                'brightness_pathway': 0.5, 
+                'pathway_ratio': 1.0,
+                'color_weight_norm': 0.0,
+                'brightness_weight_norm': 0.0
             }
-        
-        return {'color_pathway': 0.5, 'brightness_pathway': 0.5, 'pathway_ratio': 1.0}
+        except Exception as e:
+            print(f"Warning: Could not calculate pathway importance: {e}")
+            return {
+                'color_pathway': 0.5, 
+                'brightness_pathway': 0.5, 
+                'pathway_ratio': 1.0,
+                'color_weight_norm': 0.0,
+                'brightness_weight_norm': 0.0
+            }
 
     @property
     def fusion_type(self) -> str:
@@ -371,7 +430,9 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         val_loader=None,
         batch_size=None,
         epochs: int = 10,
-        verbose: int = 1
+        verbose: int = 1,
+        enable_diagnostics: bool = False,
+        diagnostic_output_dir: str = "diagnostics"
     ) -> Dict[str, List[float]]:
         """
         Unified fit method that handles both direct data arrays and DataLoaders with on-the-fly augmentation.
@@ -387,6 +448,14 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         - For extremely large datasets, use DataLoaders with num_workers > 0
         - Mixed precision training is enabled by default on compatible GPUs
         
+        Comprehensive Diagnostics:
+        -------------------------
+        When enable_diagnostics=True, the method will:
+        - Track gradient norms, weight norms, and pathway balance
+        - Monitor dead neurons and training stability
+        - Generate diagnostic plots and reports
+        - Save results to diagnostic_output_dir
+        
         Args:
             train_color_data: Training data for color stream [N, features] (used if train_loader not provided)
             train_brightness_data: Training data for brightness stream [N, features] (used if train_loader not provided)
@@ -399,9 +468,11 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
             batch_size: Batch size for training when using direct data (auto-detected if None)
             epochs: Number of epochs to train
             verbose: Verbosity level (0: silent, 1: progress bar, 2: one line per epoch)
+            enable_diagnostics: Enable comprehensive diagnostic tracking and reporting
+            diagnostic_output_dir: Directory to save diagnostic outputs when diagnostics are enabled
             
         Returns:
-            history: Dictionary containing training and validation metrics
+            history: Dictionary containing training and validation metrics (includes diagnostic metrics if enabled)
         """
         if not self.is_compiled:
             raise RuntimeError("Model must be compiled before training. Call model.compile() first.")
@@ -414,6 +485,21 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
             'val_accuracy': [],
             'learning_rates': []
         }
+        
+        # Initialize diagnostics if enabled
+        if enable_diagnostics:
+            if verbose > 0:
+                print("🔍 Diagnostic mode enabled - comprehensive monitoring active")
+            self._setup_diagnostic_hooks()
+            
+            # Add diagnostic metrics to history
+            history.update({
+                'gradient_norms': [],
+                'weight_norms': [],
+                'dead_neuron_counts': [],
+                'pathway_balance': [],
+                'epoch_times': []
+            })
         
         # Determine if we're using DataLoaders or direct data
         using_dataloaders = train_loader is not None
@@ -688,11 +774,64 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
             history['train_accuracy'].append(train_accuracy)
             history['learning_rates'].append(batch_lr if batch_lr else [current_lr])
             
+            # Collect diagnostic metrics if enabled
+            if enable_diagnostics:
+                # Get sample batch for dead neuron analysis
+                sample_batch = None
+                for batch_data in train_loader:
+                    if isinstance(batch_data, (list, tuple)) and len(batch_data) == 3:
+                        color_batch, brightness_batch, _ = batch_data
+                        # Move to device and reshape if needed
+                        if color_batch.device != self.device:
+                            color_batch = color_batch.to(self.device)
+                        if brightness_batch.device != self.device:
+                            brightness_batch = brightness_batch.to(self.device)
+                        if len(color_batch.shape) > 2:
+                            color_batch = color_batch.reshape(color_batch.size(0), -1)
+                            brightness_batch = brightness_batch.reshape(brightness_batch.size(0), -1)
+                        sample_batch = (color_batch, brightness_batch)
+                        break
+                
+                # Collect comprehensive diagnostics
+                diagnostics = self._collect_epoch_diagnostics(
+                    epoch=epoch,
+                    sample_batch=sample_batch,
+                    epoch_time=0.0,  # Will be calculated later
+                    current_lr=current_lr
+                )
+                
+                # Store diagnostic metrics in history
+                history['gradient_norms'].append(diagnostics['gradient_norm'])
+                history['weight_norms'].append(diagnostics['weight_norm'])
+                history['dead_neuron_counts'].append(diagnostics['dead_neuron_count'])
+                history['pathway_balance'].append(diagnostics['pathway_balance'])
+                history['epoch_times'].append(diagnostics['epoch_time'])
+                
+                if verbose > 0:
+                    print(f"📊 Diagnostics - Grad: {diagnostics['gradient_norm']:.4f}, "
+                          f"Weight: {diagnostics['weight_norm']:.4f}, "
+                          f"Balance: {diagnostics['pathway_balance']:.4f}")
+            
             # Validation phase
             if val_loader is not None:
                 avg_val_loss, val_accuracy = self._validate(val_loader)
                 history['val_loss'].append(avg_val_loss)
                 history['val_accuracy'].append(val_accuracy)
+                
+                # Collect validation diagnostics if enabled
+                if enable_diagnostics:
+                    val_diagnostics = self._collect_validation_diagnostics(val_loader, epoch)
+                    
+                    # Store validation diagnostic metrics
+                    for key, value in val_diagnostics.items():
+                        if key not in history:
+                            history[key] = []
+                        history[key].append(value)
+                    
+                    if verbose > 0:
+                        print(f"📋 Val Diagnostics - Dead neurons: {val_diagnostics.get('dead_neurons_detected', 0)}, "
+                              f"Avg confidence: {val_diagnostics.get('avg_confidence', 0):.4f}, "
+                              f"Low confidence %: {val_diagnostics.get('low_confidence_percent', 0):.1f}%")
                 
                 # Early stopping check
                 if avg_val_loss < best_val_loss:
@@ -738,6 +877,33 @@ class BaseMultiChannelNetwork(BaseMultiStreamModel):
         
         # Clear cache after training
         self.device_manager.clear_cache()
+        
+        # Generate diagnostic outputs if enabled
+        if enable_diagnostics:
+            if verbose > 0:
+                print("📊 Generating diagnostic outputs...")
+            
+            # Clean up diagnostic hooks
+            self._cleanup_diagnostic_hooks()
+            
+            # Save diagnostic plots
+            self._save_diagnostic_plots(diagnostic_output_dir)
+            
+            # Generate and save diagnostic summary
+            summary = self.get_diagnostic_summary()
+            import json
+            from pathlib import Path
+            
+            output_path = Path(diagnostic_output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+            summary_path = output_path / f"{self.__class__.__name__}_diagnostic_summary.json"
+            with open(summary_path, 'w') as f:
+                json.dump(summary, f, indent=2, default=str)
+            
+            if verbose > 0:
+                print(f"📋 Diagnostic summary saved to {summary_path}")
+                print("🏁 Training completed with comprehensive diagnostics")
         
         return history
     

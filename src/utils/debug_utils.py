@@ -420,3 +420,47 @@ def add_diagnostic_hooks(model: nn.Module) -> List[torch.utils.hooks.RemovableHa
             hooks.append(module.register_forward_hook(check_nan_inf_hook))
     
     return hooks
+
+
+def plot_diagnostic_history(history: Dict[str, List[float]], output_path: str, model_name: str):
+    """Plot diagnostic history from training."""
+    import matplotlib.pyplot as plt
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Gradient norms
+    if history['gradient_norms']:
+        axes[0, 0].plot(history['gradient_norms'])
+        axes[0, 0].set_title('Gradient Norms')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('Gradient Norm')
+        axes[0, 0].grid(True)
+    
+    # Weight norms
+    if history['weight_norms']:
+        axes[0, 1].plot(history['weight_norms'])
+        axes[0, 1].set_title('Weight Norms')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Weight Norm')
+        axes[0, 1].grid(True)
+    
+    # Pathway balance
+    if history['pathway_balance']:
+        axes[1, 0].plot(history['pathway_balance'])
+        axes[1, 0].set_title('Pathway Balance')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Balance Ratio')
+        axes[1, 0].grid(True)
+    
+    # Epoch times
+    if history['epoch_times']:
+        axes[1, 1].plot(history['epoch_times'])
+        axes[1, 1].set_title('Epoch Times')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('Time (seconds)')
+        axes[1, 1].grid(True)
+    
+    plt.suptitle(f'{model_name} - Diagnostic History')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
