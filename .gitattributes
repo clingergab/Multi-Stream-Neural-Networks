@@ -1,0 +1,19 @@
+# Handle large files with Git LFS
+*.pth filter=lfs diff=lfs merge=lfs -text
+*.pt filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
+*.csv filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text
+*.jpg filter=lfs diff=lfs merge=lfs -text
+*.jpeg filter=lfs diff=lfs merge=lfs -text
+
+# Large data directories
+data/MNIST/* filter=lfs diff=lfs merge=lfs -text
+data/cifar-100/* filter=lfs diff=lfs merge=lfs -text
+data/cifar-100-python/* filter=lfs diff=lfs merge=lfs -text
+data/ImageNet/* filter=lfs diff=lfs merge=lfs -text
+
+# Model checkpoints
+saved_models/* filter=lfs diff=lfs merge=lfs -text
+checkpoints/* filter=lfs diff=lfs merge=lfs -text
