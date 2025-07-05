@@ -554,8 +554,9 @@ class BaseMultiStreamModel(nn.Module, ABC):
             self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=30, gamma=0.1)
         elif self.scheduler_type == 'onecycle':
             # Will be properly configured in fit() with actual steps_per_epoch and epochs
+            # Default max_lr set higher than initial learning rate for proper cycling
             self.scheduler = optim.lr_scheduler.OneCycleLR(
-                self.optimizer, max_lr=learning_rate,
+                self.optimizer, max_lr=learning_rate * 10,  # Higher max_lr for proper cycling
                 steps_per_epoch=500,  # Placeholder - will be updated in fit()
                 epochs=100,  # Placeholder - will be updated in fit()
                 pct_start=0.3

@@ -735,10 +735,11 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 )
             elif self.scheduler_type == 'onecycle':
                 # Reconfigure OneCycle scheduler with actual steps
-                current_lr = self.optimizer.param_groups[0]['lr']
+                # For OneCycle, we need a higher max_lr than the initial lr
+                max_lr = 0.001  # A more appropriate max_lr for OneCycle with ResNet
                 self.scheduler = optim.lr_scheduler.OneCycleLR(
                     self.optimizer, 
-                    max_lr=current_lr,
+                    max_lr=max_lr,
                     steps_per_epoch=len(train_loader),
                     epochs=epochs,
                     pct_start=0.3

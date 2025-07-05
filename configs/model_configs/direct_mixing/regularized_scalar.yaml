@@ -1,0 +1,64 @@
+"""
+Training configuration for reducing overfitting in Multi-Stream Neural Networks.
+This configuration provides strong regularization to improve validation accuracy.
+"""
+
+# Extend the base configuration
+extends: "configs/base_config.yaml"
+
+# Model-specific overrides
+model:
+  model_type: "direct_mixing"
+  variant: "scalar"
+  hidden_size: 512
+  num_classes: 100  # For CIFAR-100
+  
+  # Integration parameters
+  alpha_init: 1.0
+  beta_init: 1.0
+  gamma_init: 0.2
+  
+  # Scalar mixing specific parameters
+  use_learnable_weights: true
+  normalize_weights: true
+  fusion_activation: "sigmoid"
+  
+  # Regularization parameters
+  dropout_rate: 0.3  # Add dropout for regularization
+  weight_standardization: true  # Use weight standardization in convolutions
+  stochastic_depth_prob: 0.1  # Add stochastic depth (randomly drop layers during training)
+
+# Training configuration
+training:
+  batch_size: 64  # Reduced batch size can help generalization
+  learning_rate: 0.001
+  weight_decay: 0.0005  # Increased weight decay for stronger regularization
+  epochs: 200  # Train longer with early stopping
+  early_stopping_patience: 20  # Stop if validation accuracy doesn't improve
+  optimizer: "adamw"  # Use AdamW for better regularization
+  scheduler: "cosine"  # Use cosine annealing for learning rate
+  warmup_epochs: 5  # Add warmup period
+  label_smoothing: 0.1  # Add label smoothing
+  gradient_clip_val: 1.0  # Add gradient clipping
+  ema_decay: 0.999  # Use exponential moving average of weights
+  swa_start_epoch: 100  # Use stochastic weight averaging
+  swa_lr: 0.0001  # SWA learning rate
+
+# Data configuration override
+data:
+  dataset: "cifar100"
+  augmentation: true
+  
+  # CIFAR-100 specific preprocessing
+  cifar_brightness_mode: "luminance"  # Options: luminance, grayscale, value
+  
+  # Advanced augmentation settings
+  cutout_prob: 0.5
+  cutout_size: 16
+  mixup_alpha: 0.2
+  cutmix_alpha: 1.0
+  
+# Evaluation settings
+evaluation:
+  metrics: ["accuracy", "top5_accuracy", "loss"]
+  compute_pathway_importance: true
