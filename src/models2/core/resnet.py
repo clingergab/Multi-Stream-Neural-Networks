@@ -644,31 +644,13 @@ class ResNet(nn.Module):
             # Create progress bar for the entire epoch
             if verbose:
                 # Configure tqdm for better notebook compatibility
-                tqdm_kwargs = {
-                    'total': total_steps,
-                    'desc': f"Epoch {epoch+1}/{epochs}",
-                    'leave': True,
-                    'dynamic_ncols': True,
-                    'bar_format': '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]',
-                    'mininterval': 0.1,  # Update every 0.1 seconds
-                    'miniters': 1,       # Update every iteration
-                    'ascii': False,      # Use Unicode characters
-                }
-                
-                # Check if we're in a Jupyter notebook environment
-                try:
-                    from IPython import get_ipython
-                    if get_ipython() is not None:
-                        # We're in Jupyter, add notebook-specific settings
-                        tqdm_kwargs.update({
-                            'file': None,  # Use default output
-                            'ncols': 100,  # Fixed width
-                            'position': 0, # Top position
-                        })
-                except:
-                    pass
-                
-                pbar = tqdm(**tqdm_kwargs)
+                pbar = tqdm(
+                    total=total_steps,
+                    desc=f"Epoch {epoch+1}/{epochs}",
+                    leave=True,
+                    dynamic_ncols=True,
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
+                )
             else:
                 pbar = None
             
