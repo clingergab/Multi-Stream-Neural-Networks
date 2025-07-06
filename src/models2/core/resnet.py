@@ -81,6 +81,9 @@ class ResNet(nn.Module):
         self.scheduler = None
         self.scheduler_type = None
         self.device = None
+        # GPU optimization components
+        self.use_amp = False
+        self.scaler = None
     
     def _build_network(self):
         """Build the ResNet network architecture."""
@@ -227,6 +230,7 @@ class ResNet(nn.Module):
         weight_decay: float = 1e-5,
         device: Optional[str] = None,
         scheduler: Optional[str] = None,
+        use_amp: bool = False,  # Enable automatic mixed precision by default
         **kwargs
     ) -> None:
         """
@@ -239,15 +243,32 @@ class ResNet(nn.Module):
             weight_decay: Weight decay (L2 regularization)
             device: Device to use for computation ('cpu', 'cuda', 'mps', etc.)
             scheduler: Type of learning rate scheduler ('cosine', 'step', 'plateau', 'onecycle', or None)
+            use_amp: Whether to use automatic mixed precision training (only for CUDA)
             **kwargs: Additional arguments to pass to the optimizer or loss function
         """
-        # Set device
+        # Set device with improved detection
         if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+            else:
+                self.device = torch.device("cpu")
         else:
             self.device = torch.device(device)
         
         self.to(self.device)
+        
+        # Set up automatic mixed precision (AMP) for CUDA
+        if self.device.type == 'cuda' and use_amp:
+            self.use_amp = True
+            self.scaler = torch.cuda.amp.GradScaler()
+            print(f"✅ Enabled Automatic Mixed Precision (AMP) training on {self.device}")
+        else:
+            self.use_amp = False
+            self.scaler = None
+            if use_amp and self.device.type != 'cuda':
+                print(f"⚠️  AMP requested but not available on {self.device.type}, using standard precision")
         
         # Store scheduler type for use in fit method
         self.scheduler_type = scheduler
@@ -328,17 +349,18 @@ class ResNet(nn.Module):
             gamma = scheduler_kwargs.get('gamma', 0.1)
             self.scheduler = StepLR(self.optimizer, step_size=step_size, gamma=gamma)
         elif self.scheduler_type == 'plateau':
-            patience = scheduler_kwargs.get('patience', 10)
+            # Use scheduler_patience if provided, otherwise fall back to patience from scheduler_kwargs
+            scheduler_patience = scheduler_kwargs.get('scheduler_patience', scheduler_kwargs.get('patience', 10))
             factor = scheduler_kwargs.get('factor', 0.5)
             self.scheduler = ReduceLROnPlateau(
-                self.optimizer, mode='min', patience=patience, factor=factor
+                self.optimizer, mode='min', patience=scheduler_patience, factor=factor
             )
         else:
             raise ValueError(f"Unsupported scheduler type: {self.scheduler_type}")
     
     def _train_epoch(self, train_loader: DataLoader, history: dict, pbar: Optional[tqdm] = None) -> tuple:
         """
-        Train the model for one epoch.
+        Train the model for one epoch with GPU optimizations.
         
         Args:
             train_loader: DataLoader for training data
@@ -356,21 +378,34 @@ class ResNet(nn.Module):
         
         for batch_idx, batch in enumerate(train_loader):
             if isinstance(batch, dict):
-                inputs = batch['input'].to(self.device)
-                targets = batch['target'].to(self.device)
+                # GPU optimization: non-blocking transfer
+                inputs = batch['input'].to(self.device, non_blocking=True)
+                targets = batch['target'].to(self.device, non_blocking=True)
             else:
                 inputs, targets = batch
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
+                # GPU optimization: non-blocking transfer
+                inputs = inputs.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
             
-            # Forward pass
+            # Forward pass with optional AMP
             self.optimizer.zero_grad()
-            outputs = self(inputs)
-            loss = self.criterion(outputs, targets)
             
-            # Backward pass
-            loss.backward()
-            self.optimizer.step()
+            if self.use_amp:
+                # Use automatic mixed precision
+                with torch.amp.autocast(device_type='cuda'):
+                    outputs = self(inputs)
+                    loss = self.criterion(outputs, targets)
+                
+                # Scale loss and backward pass
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                # Standard precision training
+                outputs = self(inputs)
+                loss = self.criterion(outputs, targets)
+                loss.backward()
+                self.optimizer.step()
             
             # Step OneCycleLR scheduler after each batch
             if self.scheduler is not None and isinstance(self.scheduler, OneCycleLR):
@@ -386,6 +421,10 @@ class ResNet(nn.Module):
                 _, predicted = torch.max(outputs, 1)
                 train_total += targets.size(0)
                 train_correct += (predicted == targets).sum().item()
+            
+            # GPU memory management: clear cache periodically
+            if batch_idx % 50 == 0 and self.device.type == 'cuda':
+                torch.cuda.empty_cache()
             
             # Update progress bar if provided
             if pbar is not None:
@@ -468,10 +507,16 @@ class ResNet(nn.Module):
         callbacks: Optional[list] = None,
         verbose: bool = True,
         save_path: Optional[str] = None,
+        # Early stopping parameters
+        early_stopping: bool = False,
+        patience: int = 10,
+        min_delta: float = 0.001,
+        monitor: str = 'val_loss',  # 'val_loss' or 'val_accuracy'
+        restore_best_weights: bool = True,
         **scheduler_kwargs
     ) -> dict:
         """
-        Train the model.
+        Train the model with optional early stopping.
         
         Args:
             train_loader: DataLoader for training data OR tensor of training inputs
@@ -483,10 +528,16 @@ class ResNet(nn.Module):
             callbacks: List of callbacks to apply during training
             verbose: Whether to print progress
             save_path: Path to save best model checkpoint
+            early_stopping: Whether to enable early stopping
+            patience: Number of epochs to wait for improvement before stopping
+            min_delta: Minimum change to qualify as an improvement
+            monitor: Metric to monitor ('val_loss' or 'val_accuracy')
+            restore_best_weights: Whether to restore best weights when early stopping
             **scheduler_kwargs: Additional arguments for the scheduler:
                 - For 'step' scheduler: step_size, gamma
                 - For 'cosine' scheduler: t_max
-                - For 'plateau' scheduler: patience, factor
+                - For 'plateau' scheduler: scheduler_patience (or patience), factor
+                  Note: Use 'scheduler_patience' to avoid conflict with early stopping patience
                 - For 'onecycle' scheduler: steps_per_epoch (required), max_lr, pct_start, 
                   anneal_strategy, div_factor, final_div_factor
             
@@ -512,6 +563,31 @@ class ResNet(nn.Module):
             )
         
         callbacks = callbacks or []
+        
+        # Early stopping setup
+        if early_stopping and val_loader is None:
+            print("⚠️  Early stopping requested but no validation data provided. Disabling early stopping.")
+            early_stopping = False
+        
+        # Initialize early stopping variables
+        if early_stopping:
+            if monitor == 'val_loss':
+                best_metric = float('inf')
+                is_better = lambda current, best: current < (best - min_delta)
+            elif monitor == 'val_accuracy':
+                best_metric = 0.0
+                is_better = lambda current, best: current > (best + min_delta)
+            else:
+                raise ValueError(f"Unsupported monitor metric: {monitor}. Use 'val_loss' or 'val_accuracy'.")
+            
+            patience_counter = 0
+            best_epoch = 0
+            best_weights = None
+            
+            if verbose:
+                print(f"🛑 Early stopping enabled: monitoring {monitor} with patience={patience}, min_delta={min_delta}")
+        
+        # Legacy best model saving (preserve existing functionality)
         best_val_acc = 0.0
         
         # Initialize training history
@@ -562,10 +638,44 @@ class ResNet(nn.Module):
                 history['val_loss'].append(val_loss)
                 history['val_accuracy'].append(val_acc)
                 
-                # Save best model
+                # Legacy save best model (preserve existing functionality)
                 if save_path and val_acc > best_val_acc:
                     best_val_acc = val_acc
                     self._save_checkpoint(save_path, history)
+                
+                # Early stopping logic
+                if early_stopping:
+                    current_metric = val_loss if monitor == 'val_loss' else val_acc
+                    
+                    if is_better(current_metric, best_metric):
+                        best_metric = current_metric
+                        best_epoch = epoch
+                        patience_counter = 0
+                        
+                        # Save best weights for restoration
+                        if restore_best_weights:
+                            best_weights = {k: v.cpu().clone() for k, v in self.state_dict().items()}
+                        
+                        if verbose:
+                            print(f"✅ New best {monitor}: {current_metric:.4f}")
+                    else:
+                        patience_counter += 1
+                        if verbose:
+                            print(f"⏳ No improvement for {patience_counter}/{patience} epochs (best {monitor}: {best_metric:.4f} at epoch {best_epoch + 1})")
+                    
+                    # Check if we should stop early
+                    if patience_counter >= patience:
+                        if verbose:
+                            print(f"🛑 Early stopping triggered after {epoch + 1} epochs")
+                            print(f"   Best {monitor}: {best_metric:.4f} at epoch {best_epoch + 1}")
+                        
+                        # Restore best weights if requested
+                        if restore_best_weights and best_weights is not None:
+                            self.load_state_dict({k: v.to(self.device) for k, v in best_weights.items()})
+                            if verbose:
+                                print("🔄 Restored best model weights")
+                        
+                        break
             
             # Update learning rate scheduler
             self._update_scheduler(val_loss)
@@ -599,6 +709,20 @@ class ResNet(nn.Module):
                     'val_accuracy': val_acc
                 })
         
+        # Final early stopping summary
+        if early_stopping and val_loader is not None:
+            history['early_stopping'] = {
+                'stopped_early': patience_counter >= patience,
+                'best_epoch': best_epoch + 1,
+                'best_metric': best_metric,
+                'monitor': monitor,
+                'patience': patience,
+                'min_delta': min_delta
+            }
+            
+            if verbose and patience_counter < patience:
+                print(f"🏁 Training completed without early stopping. Best {monitor}: {best_metric:.4f} at epoch {best_epoch + 1}")
+        
         return history
     
     def predict(self, data_loader: Union[torch.utils.data.DataLoader, torch.Tensor], 
@@ -629,9 +753,9 @@ class ResNet(nn.Module):
         with torch.no_grad():
             for batch in data_loader:
                 if isinstance(batch, dict):
-                    inputs = batch['input'].to(self.device)
+                    inputs = batch['input'].to(self.device, non_blocking=True)
                 else:
-                    inputs = batch[0].to(self.device)
+                    inputs = batch[0].to(self.device, non_blocking=True)
                 
                 outputs = self(inputs)
                 _, predictions = torch.max(outputs, 1)
@@ -674,7 +798,7 @@ class ResNet(nn.Module):
                   targets: Optional[torch.Tensor] = None, batch_size: int = 32, 
                   pbar: Optional[tqdm] = None) -> tuple:
         """
-        Validate the model on the given data.
+        Validate the model on the given data with GPU optimizations.
         
         Args:
             data_loader: DataLoader containing input data and targets OR tensor of input data
@@ -701,20 +825,32 @@ class ResNet(nn.Module):
         with torch.no_grad():
             for batch_idx, batch in enumerate(data_loader):
                 if isinstance(batch, dict):
-                    inputs = batch['input'].to(self.device)
-                    targets = batch['target'].to(self.device)
+                    # GPU optimization: non-blocking transfer
+                    inputs = batch['input'].to(self.device, non_blocking=True)
+                    targets = batch['target'].to(self.device, non_blocking=True)
                 else:
                     inputs, targets = batch
-                    inputs = inputs.to(self.device)
-                    targets = targets.to(self.device)
+                    # GPU optimization: non-blocking transfer
+                    inputs = inputs.to(self.device, non_blocking=True)
+                    targets = targets.to(self.device, non_blocking=True)
                 
-                outputs = self(inputs)
-                loss = self.criterion(outputs, targets)
+                # Use AMP for validation if enabled
+                if self.use_amp:
+                    with torch.amp.autocast(device_type='cuda'):
+                        outputs = self(inputs)
+                        loss = self.criterion(outputs, targets)
+                else:
+                    outputs = self(inputs)
+                    loss = self.criterion(outputs, targets)
                 
                 total_loss += loss.item()
                 _, predicted = torch.max(outputs, 1)
                 total += targets.size(0)
                 correct += (predicted == targets).sum().item()
+                
+                # GPU memory management: clear cache periodically
+                if batch_idx % 20 == 0 and self.device.type == 'cuda':
+                    torch.cuda.empty_cache()
                 
                 # Update progress bar if provided
                 if pbar is not None:
@@ -772,7 +908,7 @@ class ResNet(nn.Module):
     def _create_dataloader_from_tensors(self, X: torch.Tensor, y: Optional[torch.Tensor] = None, 
                                        batch_size: int = 32, shuffle: bool = False) -> DataLoader:
         """
-        Create a DataLoader from tensor data.
+        Create a GPU-optimized DataLoader from tensor data.
         
         Args:
             X: Input tensor data
@@ -781,7 +917,7 @@ class ResNet(nn.Module):
             shuffle: Whether to shuffle the data
             
         Returns:
-            DataLoader containing the tensor data
+            DataLoader containing the tensor data with GPU optimizations
         """
         from torch.utils.data import TensorDataset
         
@@ -790,7 +926,32 @@ class ResNet(nn.Module):
         else:
             dataset = TensorDataset(X)
         
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+        # GPU-optimized DataLoader settings
+        if self.device.type == 'cuda':
+            return DataLoader(
+                dataset, 
+                batch_size=batch_size, 
+                shuffle=shuffle,
+                num_workers=4,  # Use multiple workers for CUDA
+                pin_memory=True,  # Pin memory for faster GPU transfer
+                persistent_workers=True  # Keep workers alive between epochs
+            )
+        elif self.device.type == 'mps':
+            return DataLoader(
+                dataset, 
+                batch_size=batch_size, 
+                shuffle=shuffle,
+                num_workers=0,  # MPS works better with num_workers=0
+                pin_memory=False  # Pin memory not beneficial for MPS
+            )
+        else:
+            return DataLoader(
+                dataset, 
+                batch_size=batch_size, 
+                shuffle=shuffle,
+                num_workers=0,  # CPU training
+                pin_memory=False
+            )
 
 
 def _resnet(

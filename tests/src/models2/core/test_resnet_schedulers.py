@@ -106,7 +106,7 @@ class TestResNetSchedulers(unittest.TestCase):
             self.train_loader,  # Use same as val_loader
             epochs=3,
             verbose=False,
-            patience=2,
+            scheduler_patience=2,  # Scheduler patience (renamed to avoid conflict with early stopping)
             factor=0.8
         )
         
