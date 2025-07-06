@@ -1,0 +1,22 @@
+# ResNet50 CIFAR-100 Training Configuration
+model:
+  name: resnet50
+  num_classes: 100
+  
+data:
+  dataset: cifar100
+  batch_size: 128
+  num_workers: 4
+  
+training:
+  epochs: 200
+  optimizer: 
+    name: sgd
+    lr: 0.1
+    momentum: 0.9
+    weight_decay: 5e-4
+  scheduler:
+    name: cosine
+    T_max: 200
+  
+device: cuda

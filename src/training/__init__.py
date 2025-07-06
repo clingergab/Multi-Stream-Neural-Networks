@@ -2,14 +2,13 @@
 Training utilities and loops for Multi-Stream Neural Networks.
 """
 
-from .trainer import MSNNTrainer
-from .losses import MSNNLoss
+from .trainer import MultiStreamTrainer
+from .losses import FocalLoss, MultiStreamLoss
 from .optimizers import create_optimizer
-from .schedulers import create_scheduler
 
 __all__ = [
-    'MSNNTrainer',
-    'MSNNLoss',
-    'create_optimizer',
-    'create_scheduler'
+    'MultiStreamTrainer',
+    'FocalLoss',
+    'MultiStreamLoss',
+    'create_optimizer'
 ]
