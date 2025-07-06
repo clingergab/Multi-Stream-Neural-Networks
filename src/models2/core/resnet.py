@@ -656,23 +656,38 @@ class ResNet(nn.Module):
                         if restore_best_weights:
                             best_weights = {k: v.cpu().clone() for k, v in self.state_dict().items()}
                         
-                        if verbose:
+                        if verbose and pbar is None:  # Only print if no progress bar
                             print(f"✅ New best {monitor}: {current_metric:.4f}")
                     else:
                         patience_counter += 1
-                        if verbose:
+                        if verbose and pbar is None:  # Only print if no progress bar
                             print(f"⏳ No improvement for {patience_counter}/{patience} epochs (best {monitor}: {best_metric:.4f} at epoch {best_epoch + 1})")
                     
                     # Check if we should stop early
                     if patience_counter >= patience:
-                        if verbose:
+                        # Update progress bar with final early stopping status before closing
+                        if pbar is not None:
+                            final_postfix = {
+                                'train_loss': f'{avg_train_loss:.4f}',
+                                'train_acc': f'{train_accuracy:.4f}',
+                                'val_loss': f'{val_loss:.4f}',
+                                'val_acc': f'{val_acc:.4f}',
+                                'early_stop': 'TRIGGERED',
+                                'lr': f'{current_lr:.6f}'
+                            }
+                            pbar.set_postfix(final_postfix)
+                            pbar.refresh()
+                            pbar.close()
+                            pbar = None  # Prevent double closing
+                        
+                        if verbose and pbar is None:  # Only print if no progress bar was used
                             print(f"🛑 Early stopping triggered after {epoch + 1} epochs")
                             print(f"   Best {monitor}: {best_metric:.4f} at epoch {best_epoch + 1}")
                         
                         # Restore best weights if requested
                         if restore_best_weights and best_weights is not None:
                             self.load_state_dict({k: v.to(self.device) for k, v in best_weights.items()})
-                            if verbose:
+                            if verbose and pbar is None:  # Only print if no progress bar
                                 print("🔄 Restored best model weights")
                         
                         break
@@ -683,7 +698,7 @@ class ResNet(nn.Module):
             current_lr = self.optimizer.param_groups[0]['lr']
             history['learning_rates'].append(current_lr)
             
-            # Update progress bar with final epoch metrics
+            # Update progress bar with final epoch metrics and close it (if not already closed by early stopping)
             if pbar is not None:
                 final_postfix = {
                     'train_loss': f'{avg_train_loss:.4f}',
@@ -694,11 +709,23 @@ class ResNet(nn.Module):
                         'val_loss': f'{val_loss:.4f}',
                         'val_acc': f'{val_acc:.4f}'
                     })
+                
+                # Add early stopping info to progress bar
+                if early_stopping and val_loader is not None:
+                    if patience_counter >= patience:
+                        final_postfix['early_stop'] = 'TRIGGERED'
+                    elif patience_counter > 0:
+                        final_postfix['patience'] = f'{patience_counter}/{patience}'
+                    else:
+                        final_postfix['best'] = f'{best_metric:.4f}'
+                
                 # Add lr at the end
                 final_postfix['lr'] = f'{current_lr:.6f}'
                 
                 pbar.set_postfix(final_postfix)
+                pbar.refresh()  # Force update before closing
                 pbar.close()
+                pbar = None  # Ensure we don't try to close it again
             
             # Call callbacks
             for callback in callbacks:
