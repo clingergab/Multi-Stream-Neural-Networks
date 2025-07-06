@@ -10,7 +10,30 @@ import sys
 import time
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast
-from tqdm import tqdm
+
+# Smart tqdm import - detect notebook environment
+def _get_tqdm():
+    """Get the appropriate tqdm based on environment."""
+    try:
+        # Check if we're in a Jupyter notebook
+        from IPython import get_ipython
+        if get_ipython() is not None:
+            # We're in IPython/Jupyter, check if it's a notebook
+            ipython = get_ipython()
+            if hasattr(ipython, 'kernel'):
+                # We're in a Jupyter notebook, use notebook tqdm
+                from tqdm.notebook import tqdm
+                return tqdm
+    except ImportError:
+        pass
+    
+    # Fallback to regular tqdm
+    from tqdm import tqdm
+    return tqdm
+
+# Get the appropriate tqdm for our environment
+tqdm = _get_tqdm()
+
 from typing import Dict, List, Any, Union
 from src.models.base import BaseMultiStreamModel
 from src.utils.grad_utils import safe_clip_grad_norm
@@ -769,29 +792,41 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
         patience_counter = 0
         
         for epoch in range(epochs):
-            # Clear any existing tqdm instances and ensure clean state
-            try:
-                # Force close any existing instances
-                tqdm._instances.clear() if hasattr(tqdm, '_instances') else None
-                # Flush stdout to clear any remaining output
-                sys.stdout.flush()
-                sys.stderr.flush()
-            except Exception:
-                pass  # Ignore any errors in cleaning up
-                
-            # Single progress bar for training
+            epoch_start_time = time.time()
+            
+            # Create progress bar for this epoch with notebook-aware tqdm
             epoch_pbar = None
             if verbose == 1:
-                epoch_pbar = tqdm(
-                    total=len(train_loader), 
-                    desc=f"Epoch {epoch+1}/{epochs}",
-                    leave=False,  # Don't leave the progress bar after completion
-                    dynamic_ncols=True,  # Dynamically adjust width
-                    file=sys.stdout,  # Ensure output goes to stdout
-                    position=0,  # Position at top
-                    ascii=False,  # Use unicode characters
-                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
-                )
+                # Detect if we're in a notebook and configure accordingly
+                try:
+                    from IPython import get_ipython
+                    if get_ipython() is not None and hasattr(get_ipython(), 'kernel'):
+                        # We're in a Jupyter notebook
+                        epoch_pbar = tqdm(
+                            total=len(train_loader), 
+                            desc=f"Epoch {epoch+1}/{epochs}",
+                            leave=False,
+                            position=0,
+                            dynamic_ncols=True
+                        )
+                    else:
+                        # We're in IPython terminal or regular Python
+                        epoch_pbar = tqdm(
+                            total=len(train_loader), 
+                            desc=f"Epoch {epoch+1}/{epochs}",
+                            leave=False,
+                            dynamic_ncols=True,
+                            file=sys.stdout
+                        )
+                except ImportError:
+                    # No IPython, use regular tqdm
+                    epoch_pbar = tqdm(
+                        total=len(train_loader), 
+                        desc=f"Epoch {epoch+1}/{epochs}",
+                        leave=False,
+                        dynamic_ncols=True,
+                        file=sys.stdout
+                    )
                 
             # Training phase
             self.train()
@@ -873,17 +908,23 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                 if self.use_mixed_precision and self.scaler is not None and batch_idx % 20 == 0:
                     torch.cuda.empty_cache()  # Periodic cache clearing for large datasets
                 
-                # Update progress bar
+                # Update progress bar with notebook-friendly approach
                 if verbose == 1 and epoch_pbar is not None:
                     try:
                         current_lr = self.optimizer.param_groups[0]['lr']
-                        epoch_pbar.set_postfix({
+                        postfix = {
                             'loss': f'{total_loss / (batch_idx + 1):.4f}',
                             'acc': f'{correct/total:.4f}',
                             'lr': f'{current_lr:.6f}'
-                        })
+                        }
+                        epoch_pbar.set_postfix(postfix)
                         epoch_pbar.update(1)
-                        epoch_pbar.refresh()  # Force refresh to ensure proper display
+                        
+                        # Force display update for notebooks
+                        try:
+                            epoch_pbar.refresh()
+                        except:
+                            pass
                     except Exception:
                         # If progress bar fails, continue without it
                         pass
@@ -892,8 +933,6 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
             if verbose == 1 and epoch_pbar is not None:
                 try:
                     epoch_pbar.close()
-                    # Add a small delay to ensure proper cleanup
-                    sys.stdout.flush()
                 except Exception:
                     pass
             
@@ -980,23 +1019,29 @@ class MultiChannelResNetNetwork(BaseMultiStreamModel):
                     if verbose > 0:
                         print(f"⏳ No improvement for {patience_counter}/{self.early_stopping_patience} epochs")
                     
+                # Calculate epoch time
+                epoch_time = time.time() - epoch_start_time
+                
                 # Print epoch summary
                 if verbose > 0:
                     print(f"Epoch {epoch+1}/{epochs} - "
                           f"loss: {avg_train_loss:.4f}, acc: {train_accuracy:.4f}, "
                           f"val_loss: {val_loss:.4f}, val_acc: {val_accuracy:.4f}, "
-                          f"lr: {current_lr:.6f}")
+                          f"lr: {current_lr:.6f}, time: {epoch_time:.1f}s")
                     
                 # Check for early stopping
                 if patience_counter >= self.early_stopping_patience:
                     print(f"🛑 Early stopping triggered after {epoch+1} epochs.")
                     break
             else:
+                # Calculate epoch time
+                epoch_time = time.time() - epoch_start_time
+                
                 # Print epoch summary without validation metrics
                 if verbose > 0:
                     print(f"Epoch {epoch+1}/{epochs} - "
                           f"loss: {avg_train_loss:.4f}, acc: {train_accuracy:.4f}, "
-                          f"lr: {current_lr:.6f}")
+                          f"lr: {current_lr:.6f}, time: {epoch_time:.1f}s")
                 
                 # Store empty validation metrics for consistency
                 history['val_loss'].append(None)

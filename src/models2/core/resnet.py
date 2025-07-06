@@ -15,7 +15,30 @@ from torch.optim.lr_scheduler import (
     ReduceLROnPlateau, 
     OneCycleLR
 )
-from tqdm import tqdm
+try:
+    # Check if we're in a proper Jupyter environment with widgets support
+    from IPython import get_ipython
+    if get_ipython() is not None and get_ipython().__class__.__name__ == 'ZMQInteractiveShell':
+        # We're in Jupyter, try to use notebook tqdm with ipywidgets
+        try:
+            from tqdm.notebook import tqdm
+            # Test if widgets work by creating a dummy progress bar
+            test_bar = tqdm(total=1, disable=True)
+            test_bar.close()
+        except ImportError:
+            # ipywidgets not available, fall back to regular tqdm
+            from tqdm import tqdm
+    else:
+        # Not in Jupyter, use regular tqdm
+        from tqdm import tqdm
+except:
+    # Any other issue, fall back to regular tqdm
+    from tqdm import tqdm
+
+# For type hints
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from tqdm import tqdm as TqdmType
 
 from .conv import conv1x1, conv3x3
 from .blocks import BasicBlock, Bottleneck
@@ -358,7 +381,7 @@ class ResNet(nn.Module):
         else:
             raise ValueError(f"Unsupported scheduler type: {self.scheduler_type}")
     
-    def _train_epoch(self, train_loader: DataLoader, history: dict, pbar: Optional[tqdm] = None) -> tuple:
+    def _train_epoch(self, train_loader: DataLoader, history: dict, pbar: Optional['TqdmType'] = None) -> tuple:
         """
         Train the model for one epoch with GPU optimizations.
         
@@ -450,6 +473,12 @@ class ResNet(nn.Module):
                 
                 pbar.set_postfix(postfix)
                 pbar.update(1)
+                
+                # Force refresh for better notebook display
+                try:
+                    pbar.refresh()
+                except:
+                    print("⚠️  Failed to refresh progress bar, continuing without it.")
         
         avg_train_loss = train_loss / train_batches
         train_accuracy = train_correct / train_total
@@ -614,13 +643,32 @@ class ResNet(nn.Module):
             
             # Create progress bar for the entire epoch
             if verbose:
-                pbar = tqdm(
-                    total=total_steps,
-                    desc=f"Epoch {epoch+1}/{epochs}",
-                    leave=True,
-                    dynamic_ncols=True,
-                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
-                )
+                # Configure tqdm for better notebook compatibility
+                tqdm_kwargs = {
+                    'total': total_steps,
+                    'desc': f"Epoch {epoch+1}/{epochs}",
+                    'leave': True,
+                    'dynamic_ncols': True,
+                    'bar_format': '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]',
+                    'mininterval': 0.1,  # Update every 0.1 seconds
+                    'miniters': 1,       # Update every iteration
+                    'ascii': False,      # Use Unicode characters
+                }
+                
+                # Check if we're in a Jupyter notebook environment
+                try:
+                    from IPython import get_ipython
+                    if get_ipython() is not None:
+                        # We're in Jupyter, add notebook-specific settings
+                        tqdm_kwargs.update({
+                            'file': None,  # Use default output
+                            'ncols': 100,  # Fixed width
+                            'position': 0, # Top position
+                        })
+                except:
+                    pass
+                
+                pbar = tqdm(**tqdm_kwargs)
             else:
                 pbar = None
             
@@ -823,7 +871,7 @@ class ResNet(nn.Module):
     
     def _validate(self, data_loader: Union[DataLoader, torch.Tensor], 
                   targets: Optional[torch.Tensor] = None, batch_size: int = 32, 
-                  pbar: Optional[tqdm] = None) -> tuple:
+                  pbar: Optional['TqdmType'] = None) -> tuple:
         """
         Validate the model on the given data with GPU optimizations.
         
