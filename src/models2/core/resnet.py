@@ -1,19 +1,23 @@
-from functools import partial
 from typing import Any, Callable, Optional, Union
-import os
 import time
-import numpy as np
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader
 from torch.optim import Adam, SGD, AdamW
-from torch.optim.lr_scheduler import (
-    StepLR, 
-    CosineAnnealingLR, 
-    ReduceLROnPlateau, 
-    OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR
+from src.models2.common import (
+    setup_scheduler,
+    update_scheduler,
+    save_checkpoint,
+    create_dataloader_from_tensors,
+    setup_early_stopping,
+    early_stopping_initiated,
+    finalize_early_stopping,
+    create_progress_bar,
+    finalize_progress_bar,
+    update_history
 )
 try:
     # Check if we're in a proper Jupyter environment with widgets support
@@ -331,55 +335,225 @@ class ResNet(nn.Module):
         else:
             raise ValueError(f"Unsupported loss function: {loss}")
     
-    def _setup_scheduler(self, epochs: int, train_loader_len: int, **scheduler_kwargs) -> None:
+    def fit(
+        self,
+        train_loader: Union[torch.utils.data.DataLoader, torch.Tensor],
+        val_loader: Optional[Union[torch.utils.data.DataLoader, torch.Tensor]] = None,
+        train_targets: Optional[torch.Tensor] = None,
+        val_targets: Optional[torch.Tensor] = None,
+        epochs: int = 10,
+        batch_size: int = 32,
+        callbacks: Optional[list] = None,
+        verbose: bool = True,
+        save_path: Optional[str] = None,
+        early_stopping: bool = False,
+        patience: int = 10,
+        min_delta: float = 0.001,
+        monitor: str = 'val_loss',  # 'val_loss' or 'val_accuracy'
+        restore_best_weights: bool = True,
+        **scheduler_kwargs
+    ) -> dict:
         """
-        Set up the learning rate scheduler based on the scheduler type.
+        Train the model with optional early stopping.
         
         Args:
-            epochs: Number of training epochs
-            train_loader_len: Length of the training data loader
-            **scheduler_kwargs: Additional arguments for the scheduler
+            train_loader: DataLoader for training data OR tensor of training inputs
+            val_loader: DataLoader for validation data OR tensor of validation inputs (optional)
+            train_targets: Training targets (required if train_loader is a tensor)
+            val_targets: Validation targets (required if val_loader is a tensor)
+            epochs: Number of epochs to train
+            batch_size: Batch size (used when creating DataLoaders from tensors)
+            callbacks: List of callbacks to apply during training
+            verbose: Whether to print progress
+            save_path: Path to save best model checkpoint
+            early_stopping: Whether to enable early stopping
+            patience: Number of epochs to wait for improvement before stopping
+            min_delta: Minimum change to qualify as an improvement
+            monitor: Metric to monitor ('val_loss' or 'val_accuracy')
+            restore_best_weights: Whether to restore best weights when early stopping
+            **scheduler_kwargs: Additional arguments for the scheduler:
+                - For 'step' scheduler: step_size, gamma
+                - For 'cosine' scheduler: t_max
+                - For 'plateau' scheduler: scheduler_patience (or patience), factor
+                  Note: Use 'scheduler_patience' to avoid conflict with early stopping patience
+                - For 'onecycle' scheduler: steps_per_epoch (required), max_lr, pct_start, 
+                  anneal_strategy, div_factor, final_div_factor
+            
+        Returns:
+            Training history dictionary
         """
-        if not self.scheduler_type:
-            self.scheduler = None
-            return
-            
-        if self.scheduler_type == 'cosine':
-            # Default t_max is set to number of epochs
-            t_max = scheduler_kwargs.get('t_max', epochs)
-            self.scheduler = CosineAnnealingLR(self.optimizer, T_max=t_max)
-        elif self.scheduler_type == 'onecycle':
-            # For OneCycleLR, we need total number of steps (epochs * steps_per_epoch)
-            steps_per_epoch = scheduler_kwargs.get('steps_per_epoch', train_loader_len)
-            max_lr = scheduler_kwargs.get('max_lr', self.optimizer.param_groups[0]['lr'] * 10)
-            pct_start = scheduler_kwargs.get('pct_start', 0.3)
-            anneal_strategy = scheduler_kwargs.get('anneal_strategy', 'cos')
-            div_factor = scheduler_kwargs.get('div_factor', 25.0)
-            final_div_factor = scheduler_kwargs.get('final_div_factor', 1e4)
-            
-            # Create the OneCycleLR scheduler with calculated total_steps
-            self.scheduler = OneCycleLR(
-                self.optimizer, 
-                max_lr=max_lr,
-                total_steps=epochs * steps_per_epoch,
-                pct_start=pct_start,
-                anneal_strategy=anneal_strategy,
-                div_factor=div_factor,
-                final_div_factor=final_div_factor
+        if self.optimizer is None or self.criterion is None:
+            raise ValueError("Model not compiled. Call compile() before fit().")
+        
+        # Handle tensor inputs by converting to DataLoaders
+        if isinstance(train_loader, torch.Tensor):
+            if train_targets is None:
+                raise ValueError("train_targets must be provided when train_loader is a tensor")
+            train_loader = create_dataloader_from_tensors(
+                self, train_loader, train_targets, batch_size=batch_size, shuffle=True
             )
-        elif self.scheduler_type == 'step':
-            step_size = scheduler_kwargs.get('step_size', 30)
-            gamma = scheduler_kwargs.get('gamma', 0.1)
-            self.scheduler = StepLR(self.optimizer, step_size=step_size, gamma=gamma)
-        elif self.scheduler_type == 'plateau':
-            # Use scheduler_patience if provided, otherwise fall back to patience from scheduler_kwargs
-            scheduler_patience = scheduler_kwargs.get('scheduler_patience', scheduler_kwargs.get('patience', 10))
-            factor = scheduler_kwargs.get('factor', 0.5)
-            self.scheduler = ReduceLROnPlateau(
-                self.optimizer, mode='min', patience=scheduler_patience, factor=factor
+        
+        if isinstance(val_loader, torch.Tensor):
+            if val_targets is None:
+                raise ValueError("val_targets must be provided when val_loader is a tensor")
+            val_loader = create_dataloader_from_tensors(
+                self, val_loader, val_targets, batch_size=batch_size, shuffle=False
             )
-        else:
-            raise ValueError(f"Unsupported scheduler type: {self.scheduler_type}")
+        
+        callbacks = callbacks or []
+        
+        # Early stopping setup
+        early_stopping_state = setup_early_stopping(self, early_stopping, val_loader, monitor, patience, min_delta, verbose)
+        
+        # Legacy best model saving (preserve existing functionality)
+        best_val_acc = 0.0
+        
+        # Initialize training history
+        history = {
+            'train_loss': [], 
+            'val_loss': [], 
+            'train_accuracy': [],
+            'val_accuracy': [],
+            'learning_rates': []
+        }
+        
+        # Set up scheduler
+        setup_scheduler(self, epochs, len(train_loader), **scheduler_kwargs)
+        
+        for epoch in range(epochs):
+            # Calculate total steps for this epoch (training + validation)
+            total_steps = len(train_loader)
+            if val_loader:
+                total_steps += len(val_loader)
+            
+            # Create progress bar for the entire epoch
+            pbar = create_progress_bar(self, verbose, epoch, epochs, total_steps)
+            
+            # Training phase - use helper method
+            avg_train_loss, train_accuracy = self._train_epoch(train_loader, history, pbar)
+            
+            # Validation phase
+            val_loss = 0.0
+            val_acc = 0.0
+            
+            if val_loader:
+                val_loss, val_acc = self._validate(val_loader, pbar=pbar)
+                
+                # Legacy save best model (preserve existing functionality)
+                if save_path and val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    save_checkpoint(self, save_path, history)
+                
+                # Check for early stopping
+                if early_stopping_initiated(
+                    self, early_stopping_state, val_loss, val_acc, epoch, pbar, verbose, restore_best_weights
+                ):
+                    break
+            
+            # Update learning rate scheduler and get current LR
+            update_scheduler(self, val_loss)
+            current_lr = self.optimizer.param_groups[0]['lr']
+            
+            # Update history and finalize progress bar
+            update_history(self, history, avg_train_loss, train_accuracy, val_loss, val_acc, current_lr, bool(val_loader))
+            finalize_progress_bar(
+                self, pbar, avg_train_loss, train_accuracy, val_loader, 
+                val_loss, val_acc, early_stopping_state, current_lr
+            )
+            
+            # Call callbacks
+            for callback in callbacks:
+                callback.on_epoch_end(epoch, {
+                    'train_loss': avg_train_loss,
+                    'train_accuracy': train_accuracy,
+                    'val_loss': val_loss,
+                    'val_accuracy': val_acc
+                })
+        
+        # Final early stopping summary
+        if early_stopping_state['enabled'] and val_loader is not None:
+            history['early_stopping'] = {
+                'stopped_early': early_stopping_state['patience_counter'] >= early_stopping_state['patience'],
+                'best_epoch': early_stopping_state['best_epoch'] + 1,
+                'best_metric': early_stopping_state['best_metric'],
+                'monitor': early_stopping_state['monitor'],
+                'patience': early_stopping_state['patience'],
+                'min_delta': early_stopping_state['min_delta']
+            }
+            
+            if verbose and early_stopping_state['patience_counter'] < early_stopping_state['patience']:
+                print(f"🏁 Training completed without early stopping. Best {early_stopping_state['monitor']}: {early_stopping_state['best_metric']:.4f} at epoch {early_stopping_state['best_epoch'] + 1}")
+        
+        return history
+    
+    def predict(self, data_loader: Union[torch.utils.data.DataLoader, torch.Tensor], 
+                batch_size: int = 32) -> torch.Tensor:
+        """
+        Generate predictions for the input data.
+        
+        Args:
+            data_loader: DataLoader containing input data OR tensor of input data
+            batch_size: Batch size (used when creating DataLoader from tensor)
+            
+        Returns:
+            Tensor of predicted classes
+        """
+        if self.device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.to(self.device)
+        
+        # Handle tensor input by converting to DataLoader
+        if isinstance(data_loader, torch.Tensor):
+            data_loader = create_dataloader_from_tensors(
+                self, data_loader, batch_size=batch_size, shuffle=False
+            )
+        
+        self.eval()
+        all_predictions = []
+        
+        with torch.no_grad():
+            for batch in data_loader:
+                if isinstance(batch, dict):
+                    inputs = batch['input'].to(self.device, non_blocking=True)
+                else:
+                    inputs = batch[0].to(self.device, non_blocking=True)
+                
+                outputs = self(inputs)
+                _, predictions = torch.max(outputs, 1)
+                all_predictions.append(predictions.cpu())
+        
+        return torch.cat(all_predictions, dim=0)
+    
+    def evaluate(self, data_loader: Union[torch.utils.data.DataLoader, torch.Tensor], 
+                 targets: Optional[torch.Tensor] = None, batch_size: int = 32) -> dict:
+        """
+        Evaluate the model on the given data.
+        
+        Args:
+            data_loader: DataLoader containing input data and targets OR tensor of input data
+            targets: Target tensor (required if data_loader is a tensor)
+            batch_size: Batch size (used when creating DataLoader from tensor)
+            
+        Returns:
+            Dictionary containing evaluation metrics
+        """
+        if self.criterion is None:
+            raise ValueError("Model not compiled. Call compile() before evaluate().")
+        
+        # Handle tensor input by converting to DataLoader
+        if isinstance(data_loader, torch.Tensor):
+            if targets is None:
+                raise ValueError("targets must be provided when data_loader is a tensor")
+            data_loader = create_dataloader_from_tensors(
+                self, data_loader, targets, batch_size=batch_size, shuffle=False
+            )
+        
+        loss, accuracy = self._validate(data_loader)
+        
+        return {
+            'loss': loss,
+            'accuracy': accuracy
+        }
     
     def _train_epoch(self, train_loader: DataLoader, history: dict, pbar: Optional['TqdmType'] = None) -> tuple:
         """
@@ -485,372 +659,6 @@ class ResNet(nn.Module):
         
         return avg_train_loss, train_accuracy
     
-    def _update_scheduler(self, val_loss: float) -> None:
-        """
-        Update the learning rate scheduler.
-        
-        Args:
-            val_loss: Validation loss for plateau scheduler
-        """
-        if self.scheduler is not None:
-            # Skip OneCycleLR as it's updated after each batch
-            if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.scheduler.step(val_loss)
-            elif not isinstance(self.scheduler, OneCycleLR):
-                self.scheduler.step()
-    
-    def _print_epoch_progress(self, epoch: int, epochs: int, epoch_time: float, 
-                             avg_train_loss: float, train_accuracy: float,
-                             val_loss: float, val_acc: float, val_loader: bool) -> None:
-        """
-        Print training progress for the current epoch.
-        
-        Args:
-            epoch: Current epoch number (0-based)
-            epochs: Total number of epochs
-            epoch_time: Time taken for this epoch
-            avg_train_loss: Average training loss
-            train_accuracy: Training accuracy
-            val_loss: Validation loss
-            val_acc: Validation accuracy
-            val_loader: Whether validation loader was provided
-        """
-        print(f"Epoch {epoch+1}/{epochs} - "
-              f"Time: {epoch_time:.2f}s - "
-              f"Train Loss: {avg_train_loss:.4f} - "
-              f"Train Acc: {train_accuracy*100:.2f}%", end="")
-        
-        if val_loader:
-            print(f" - Val Loss: {val_loss:.4f} - Val Acc: {val_acc:.2f}%")
-        else:
-            print("")
-    
-    def fit(
-        self,
-        train_loader: Union[torch.utils.data.DataLoader, torch.Tensor],
-        val_loader: Optional[Union[torch.utils.data.DataLoader, torch.Tensor]] = None,
-        train_targets: Optional[torch.Tensor] = None,
-        val_targets: Optional[torch.Tensor] = None,
-        epochs: int = 10,
-        batch_size: int = 32,
-        callbacks: Optional[list] = None,
-        verbose: bool = True,
-        save_path: Optional[str] = None,
-        # Early stopping parameters
-        early_stopping: bool = False,
-        patience: int = 10,
-        min_delta: float = 0.001,
-        monitor: str = 'val_loss',  # 'val_loss' or 'val_accuracy'
-        restore_best_weights: bool = True,
-        **scheduler_kwargs
-    ) -> dict:
-        """
-        Train the model with optional early stopping.
-        
-        Args:
-            train_loader: DataLoader for training data OR tensor of training inputs
-            val_loader: DataLoader for validation data OR tensor of validation inputs (optional)
-            train_targets: Training targets (required if train_loader is a tensor)
-            val_targets: Validation targets (required if val_loader is a tensor)
-            epochs: Number of epochs to train
-            batch_size: Batch size (used when creating DataLoaders from tensors)
-            callbacks: List of callbacks to apply during training
-            verbose: Whether to print progress
-            save_path: Path to save best model checkpoint
-            early_stopping: Whether to enable early stopping
-            patience: Number of epochs to wait for improvement before stopping
-            min_delta: Minimum change to qualify as an improvement
-            monitor: Metric to monitor ('val_loss' or 'val_accuracy')
-            restore_best_weights: Whether to restore best weights when early stopping
-            **scheduler_kwargs: Additional arguments for the scheduler:
-                - For 'step' scheduler: step_size, gamma
-                - For 'cosine' scheduler: t_max
-                - For 'plateau' scheduler: scheduler_patience (or patience), factor
-                  Note: Use 'scheduler_patience' to avoid conflict with early stopping patience
-                - For 'onecycle' scheduler: steps_per_epoch (required), max_lr, pct_start, 
-                  anneal_strategy, div_factor, final_div_factor
-            
-        Returns:
-            Training history dictionary
-        """
-        if self.optimizer is None or self.criterion is None:
-            raise ValueError("Model not compiled. Call compile() before fit().")
-        
-        # Handle tensor inputs by converting to DataLoaders
-        if isinstance(train_loader, torch.Tensor):
-            if train_targets is None:
-                raise ValueError("train_targets must be provided when train_loader is a tensor")
-            train_loader = self._create_dataloader_from_tensors(
-                train_loader, train_targets, batch_size=batch_size, shuffle=True
-            )
-        
-        if isinstance(val_loader, torch.Tensor):
-            if val_targets is None:
-                raise ValueError("val_targets must be provided when val_loader is a tensor")
-            val_loader = self._create_dataloader_from_tensors(
-                val_loader, val_targets, batch_size=batch_size, shuffle=False
-            )
-        
-        callbacks = callbacks or []
-        
-        # Early stopping setup
-        if early_stopping and val_loader is None:
-            print("⚠️  Early stopping requested but no validation data provided. Disabling early stopping.")
-            early_stopping = False
-        
-        # Initialize early stopping variables
-        if early_stopping:
-            if monitor == 'val_loss':
-                best_metric = float('inf')
-                is_better = lambda current, best: current < (best - min_delta)
-            elif monitor == 'val_accuracy':
-                best_metric = 0.0
-                is_better = lambda current, best: current > (best + min_delta)
-            else:
-                raise ValueError(f"Unsupported monitor metric: {monitor}. Use 'val_loss' or 'val_accuracy'.")
-            
-            patience_counter = 0
-            best_epoch = 0
-            best_weights = None
-            
-            if verbose:
-                print(f"🛑 Early stopping enabled: monitoring {monitor} with patience={patience}, min_delta={min_delta}")
-        
-        # Legacy best model saving (preserve existing functionality)
-        best_val_acc = 0.0
-        
-        # Initialize training history
-        history = {
-            'train_loss': [], 
-            'val_loss': [], 
-            'train_accuracy': [],
-            'val_accuracy': [],
-            'learning_rates': []
-        }
-
-        history['learning_rates'] = []
-        
-        # Set up scheduler
-        self._setup_scheduler(epochs, len(train_loader), **scheduler_kwargs)
-        
-        for epoch in range(epochs):
-            epoch_start = time.time()
-            
-            # Calculate total steps for this epoch (training + validation)
-            total_steps = len(train_loader)
-            if val_loader:
-                total_steps += len(val_loader)
-            
-            # Create progress bar for the entire epoch
-            if verbose:
-                # Configure tqdm for better notebook compatibility
-                pbar = tqdm(
-                    total=total_steps,
-                    desc=f"Epoch {epoch+1}/{epochs}",
-                    leave=True,
-                    dynamic_ncols=True,
-                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
-                )
-            else:
-                pbar = None
-            
-            # Training phase - use helper method
-            avg_train_loss, train_accuracy = self._train_epoch(train_loader, history, pbar)
-            history['train_loss'].append(avg_train_loss)
-            history['train_accuracy'].append(train_accuracy)
-            
-            # Validation phase
-            val_loss = 0.0
-            val_acc = 0.0
-            
-            if val_loader:
-                val_loss, val_acc = self._validate(val_loader, pbar=pbar)
-                history['val_loss'].append(val_loss)
-                history['val_accuracy'].append(val_acc)
-                
-                # Legacy save best model (preserve existing functionality)
-                if save_path and val_acc > best_val_acc:
-                    best_val_acc = val_acc
-                    self._save_checkpoint(save_path, history)
-                
-                # Early stopping logic
-                if early_stopping:
-                    current_metric = val_loss if monitor == 'val_loss' else val_acc
-                    
-                    if is_better(current_metric, best_metric):
-                        best_metric = current_metric
-                        best_epoch = epoch
-                        patience_counter = 0
-                        
-                        # Save best weights for restoration
-                        if restore_best_weights:
-                            best_weights = {k: v.cpu().clone() for k, v in self.state_dict().items()}
-                        
-                        if verbose and pbar is None:  # Only print if no progress bar
-                            print(f"✅ New best {monitor}: {current_metric:.4f}")
-                    else:
-                        patience_counter += 1
-                        if verbose and pbar is None:  # Only print if no progress bar
-                            print(f"⏳ No improvement for {patience_counter}/{patience} epochs (best {monitor}: {best_metric:.4f} at epoch {best_epoch + 1})")
-                    
-                    # Check if we should stop early
-                    if patience_counter >= patience:
-                        # Update progress bar with final early stopping status before closing
-                        if pbar is not None:
-                            final_postfix = {
-                                'train_loss': f'{avg_train_loss:.4f}',
-                                'train_acc': f'{train_accuracy:.4f}',
-                                'val_loss': f'{val_loss:.4f}',
-                                'val_acc': f'{val_acc:.4f}',
-                                'early_stop': 'TRIGGERED',
-                                'lr': f'{current_lr:.6f}'
-                            }
-                            pbar.set_postfix(final_postfix)
-                            pbar.refresh()
-                            pbar.close()
-                            pbar = None  # Prevent double closing
-                        
-                        if verbose and pbar is None:  # Only print if no progress bar was used
-                            print(f"🛑 Early stopping triggered after {epoch + 1} epochs")
-                            print(f"   Best {monitor}: {best_metric:.4f} at epoch {best_epoch + 1}")
-                        
-                        # Restore best weights if requested
-                        if restore_best_weights and best_weights is not None:
-                            self.load_state_dict({k: v.to(self.device) for k, v in best_weights.items()})
-                            if verbose and pbar is None:  # Only print if no progress bar
-                                print("🔄 Restored best model weights")
-                        
-                        break
-            
-            # Update learning rate scheduler
-            self._update_scheduler(val_loss)
-                    
-            current_lr = self.optimizer.param_groups[0]['lr']
-            history['learning_rates'].append(current_lr)
-            
-            # Update progress bar with final epoch metrics and close it (if not already closed by early stopping)
-            if pbar is not None:
-                final_postfix = {
-                    'train_loss': f'{avg_train_loss:.4f}',
-                    'train_acc': f'{train_accuracy:.4f}'
-                }
-                if val_loader:
-                    final_postfix.update({
-                        'val_loss': f'{val_loss:.4f}',
-                        'val_acc': f'{val_acc:.4f}'
-                    })
-                
-                # Add early stopping info to progress bar
-                if early_stopping and val_loader is not None:
-                    if patience_counter >= patience:
-                        final_postfix['early_stop'] = 'TRIGGERED'
-                    elif patience_counter > 0:
-                        final_postfix['patience'] = f'{patience_counter}/{patience}'
-                    else:
-                        final_postfix['best'] = f'{best_metric:.4f}'
-                
-                # Add lr at the end
-                final_postfix['lr'] = f'{current_lr:.6f}'
-                
-                pbar.set_postfix(final_postfix)
-                pbar.refresh()  # Force update before closing
-                pbar.close()
-                pbar = None  # Ensure we don't try to close it again
-            
-            # Call callbacks
-            for callback in callbacks:
-                callback.on_epoch_end(epoch, {
-                    'train_loss': avg_train_loss,
-                    'train_accuracy': train_accuracy,
-                    'val_loss': val_loss,
-                    'val_accuracy': val_acc
-                })
-        
-        # Final early stopping summary
-        if early_stopping and val_loader is not None:
-            history['early_stopping'] = {
-                'stopped_early': patience_counter >= patience,
-                'best_epoch': best_epoch + 1,
-                'best_metric': best_metric,
-                'monitor': monitor,
-                'patience': patience,
-                'min_delta': min_delta
-            }
-            
-            if verbose and patience_counter < patience:
-                print(f"🏁 Training completed without early stopping. Best {monitor}: {best_metric:.4f} at epoch {best_epoch + 1}")
-        
-        return history
-    
-    def predict(self, data_loader: Union[torch.utils.data.DataLoader, torch.Tensor], 
-                batch_size: int = 32) -> torch.Tensor:
-        """
-        Generate predictions for the input data.
-        
-        Args:
-            data_loader: DataLoader containing input data OR tensor of input data
-            batch_size: Batch size (used when creating DataLoader from tensor)
-            
-        Returns:
-            Tensor of predicted classes
-        """
-        if self.device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.to(self.device)
-        
-        # Handle tensor input by converting to DataLoader
-        if isinstance(data_loader, torch.Tensor):
-            data_loader = self._create_dataloader_from_tensors(
-                data_loader, batch_size=batch_size, shuffle=False
-            )
-        
-        self.eval()
-        all_predictions = []
-        
-        with torch.no_grad():
-            for batch in data_loader:
-                if isinstance(batch, dict):
-                    inputs = batch['input'].to(self.device, non_blocking=True)
-                else:
-                    inputs = batch[0].to(self.device, non_blocking=True)
-                
-                outputs = self(inputs)
-                _, predictions = torch.max(outputs, 1)
-                all_predictions.append(predictions.cpu())
-        
-        return torch.cat(all_predictions, dim=0)
-    
-    def evaluate(self, data_loader: Union[torch.utils.data.DataLoader, torch.Tensor], 
-                 targets: Optional[torch.Tensor] = None, batch_size: int = 32) -> dict:
-        """
-        Evaluate the model on the given data.
-        
-        Args:
-            data_loader: DataLoader containing input data and targets OR tensor of input data
-            targets: Target tensor (required if data_loader is a tensor)
-            batch_size: Batch size (used when creating DataLoader from tensor)
-            
-        Returns:
-            Dictionary containing evaluation metrics
-        """
-        if self.criterion is None:
-            raise ValueError("Model not compiled. Call compile() before evaluate().")
-        
-        # Handle tensor input by converting to DataLoader
-        if isinstance(data_loader, torch.Tensor):
-            if targets is None:
-                raise ValueError("targets must be provided when data_loader is a tensor")
-            data_loader = self._create_dataloader_from_tensors(
-                data_loader, targets, batch_size=batch_size, shuffle=False
-            )
-        
-        loss, accuracy = self._validate(data_loader)
-        
-        return {
-            'loss': loss,
-            'accuracy': accuracy
-        }
-    
     def _validate(self, data_loader: Union[DataLoader, torch.Tensor], 
                   targets: Optional[torch.Tensor] = None, batch_size: int = 32, 
                   pbar: Optional['TqdmType'] = None) -> tuple:
@@ -870,8 +678,8 @@ class ResNet(nn.Module):
         if isinstance(data_loader, torch.Tensor):
             if targets is None:
                 raise ValueError("targets must be provided when data_loader is a tensor")
-            data_loader = self._create_dataloader_from_tensors(
-                data_loader, targets, batch_size=batch_size, shuffle=False
+            data_loader = create_dataloader_from_tensors(
+                self, data_loader, targets, batch_size=batch_size, shuffle=False
             )
         
         self.eval()
@@ -938,79 +746,6 @@ class ResNet(nn.Module):
         accuracy = correct / total
         
         return avg_loss, accuracy
-    
-    def _save_checkpoint(self, path: str, history: Optional[dict] = None) -> None:
-        """
-        Save model checkpoint.
-        
-        Args:
-            path: Path to save checkpoint
-            history: Training history to save (optional)
-        """
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        
-        checkpoint = {
-            'model_state_dict': self.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer else None,
-            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
-        }
-        
-        # Add history if provided
-        if history is not None:
-            checkpoint['history'] = history
-        
-        torch.save(checkpoint, path)
-
-    def _create_dataloader_from_tensors(self, X: torch.Tensor, y: Optional[torch.Tensor] = None, 
-                                       batch_size: int = 32, shuffle: bool = False) -> DataLoader:
-        """
-        Create a GPU-optimized DataLoader from tensor data.
-        
-        Args:
-            X: Input tensor data
-            y: Target tensor data (optional for prediction)
-            batch_size: Batch size for the DataLoader
-            shuffle: Whether to shuffle the data
-            
-        Returns:
-            DataLoader containing the tensor data with GPU optimizations
-        """
-        from torch.utils.data import TensorDataset
-        
-        if y is not None:
-            dataset = TensorDataset(X, y)
-        else:
-            dataset = TensorDataset(X)
-        
-        # GPU-optimized DataLoader settings
-        if self.device.type == 'cuda':
-            return DataLoader(
-                dataset, 
-                batch_size=batch_size, 
-                shuffle=shuffle,
-                num_workers=4,  # Use multiple workers for CUDA
-                pin_memory=True,  # Pin memory for faster GPU transfer
-                persistent_workers=True  # Keep workers alive between epochs
-            )
-        elif self.device.type == 'mps':
-            return DataLoader(
-                dataset, 
-                batch_size=batch_size, 
-                shuffle=shuffle,
-                num_workers=0,  # MPS works better with num_workers=0
-                pin_memory=False  # Pin memory not beneficial for MPS
-            )
-        else:
-            return DataLoader(
-                dataset, 
-                batch_size=batch_size, 
-                shuffle=shuffle,
-                num_workers=0,  # CPU training
-                pin_memory=False
-            )
-
-
 def _resnet(
     block: type[Union[BasicBlock, Bottleneck]],
     layers: list[int],

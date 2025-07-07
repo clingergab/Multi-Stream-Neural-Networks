@@ -138,26 +138,3 @@ CIFAR100_FINE_LABELS = [
     'worm'
 ]
 
-
-def load_cifar100_numpy(data_dir: Union[str, Path] = "./data/cifar-100", normalize: bool = True, verbose: bool = True):
-    """
-    Backward compatibility wrapper for load_cifar100_data with numpy return type.
-    
-    Args:
-        data_dir: Path to CIFAR-100 data directory
-        normalize: Whether to normalize pixel values to [0, 1]
-        verbose: Whether to print loading progress
-        
-    Returns:
-        Tuple of (train_data, train_labels, test_data, test_labels, label_names)
-        All arrays are numpy arrays.
-    """
-    train_data, train_labels, test_data, test_labels = load_cifar100_data(
-        data_dir=data_dir,
-        return_type='numpy',
-        normalize=normalize,
-        verbose=verbose
-    )
-    
-    return train_data, train_labels, test_data, test_labels, CIFAR100_FINE_LABELS
-

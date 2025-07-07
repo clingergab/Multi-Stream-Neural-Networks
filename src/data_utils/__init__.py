@@ -22,7 +22,6 @@ from .data_helpers import (
 # Dataset utilities and CIFAR-100 loading
 from .dataset_utils import (
     load_cifar100_data,
-    load_cifar100_numpy,  # Backward compatibility
     CIFAR100_FINE_LABELS
 )
 
@@ -48,7 +47,6 @@ __all__ = [
     
     # Dataset utilities and CIFAR-100 loading
     'load_cifar100_data',
-    'load_cifar100_numpy',
     'CIFAR100_FINE_LABELS',
     
     # Transform utilities and dataset processing
