@@ -44,7 +44,7 @@ from src.models.basic_multi_channel import (
     MultiChannelResNetNetwork
 )
 from src.models.builders.model_factory import create_model
-from src.transforms.rgb_to_rgbl import RGBtoRGBL
+from src.data_utils.rgb_to_rgbl import RGBtoRGBL
 
 
 class TestConfig:

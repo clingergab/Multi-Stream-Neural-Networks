@@ -8,9 +8,9 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 import torch
-from src.models.basic_multi_channel.multi_channel_model import multi_channel_18
-from src.transforms.rgb_to_rgbl import RGBtoRGBL
-from src.data_utils.dataloaders import create_train_dataloader
+from torch.utils.data import DataLoader
+from models.builders.model_factory import create_model
+from training.trainer import MultiStreamTrainer
 
 
 def main():
@@ -46,8 +46,8 @@ def main():
     
     # 3. Create data loaders
     print("3. Creating data loaders...")
-    train_loader = MultiStreamDataLoader(train_dataset, batch_size=8, shuffle=True)
-    val_loader = MultiStreamDataLoader(val_dataset, batch_size=8, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
     
     # 4. Create trainer
     print("4. Setting up trainer...")

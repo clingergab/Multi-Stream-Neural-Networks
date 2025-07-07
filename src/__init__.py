@@ -16,11 +16,6 @@ except ImportError:
     pass
 
 try:
-    from . import datasets
-except ImportError:
-    pass
-
-try:
     from . import training
 except ImportError:
     pass

@@ -14,11 +14,11 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import our utilities and models
-from src.utils.cifar100_loader import load_cifar100_numpy
+from src.data_utils.dataset_utils import load_cifar100_numpy
 from src.models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork
 from src.models.basic_multi_channel.multi_channel_resnet_network import MultiChannelResNetNetwork
-from src.transforms.rgb_to_rgbl import RGBtoRGBL
-from src.transforms.dataset_utils import process_dataset_to_streams, create_dataloader_with_streams
+from src.data_utils.rgb_to_rgbl import RGBtoRGBL
+from src.data_utils.rgb_to_rgbl import process_dataset_to_streams
 from torch.utils.data import TensorDataset
 
 # This function is no longer needed as we use process_dataset_to_streams instead
@@ -441,7 +441,7 @@ def test_model_consistency(data):
     print("✅ Both models have consistent APIs and architecture-specific defaults!")
 
 def test_dataloader_integration(data_splits):
-    """Test using our create_dataloader_with_streams utility with models."""
+    """Test using standard PyTorch DataLoader with models."""
     print("\n" + "="*60)
     print("TESTING DATALOADER INTEGRATION")
     print("="*60)
@@ -449,17 +449,19 @@ def test_dataloader_integration(data_splits):
     # data_splits already contains TensorDatasets ready to use
     print("Using pre-processed TensorDatasets from fixture")
     
-    # Create DataLoaders using our utility function
+    # Create DataLoaders using standard PyTorch DataLoader
+    from torch.utils.data import DataLoader
     dataloaders = {}
     batch_sizes = {'train': 32, 'validation': 32, 'test': 32}
     
     for split_name in ['train', 'validation', 'test']:
-        dataloaders[split_name] = create_dataloader_with_streams(
-            data_splits[split_name],
+        # Use standard DataLoader
+        dataloaders[split_name] = DataLoader(
+            dataset=data_splits[split_name],
             batch_size=batch_sizes[split_name],
             shuffle=(split_name == 'train'),  # Only shuffle training data
             num_workers=2,
-            pin_memory=False  # Set to True if using GPU
+            pin_memory=False,  # Set to True if using GPU
         )
     
     print("Created DataLoaders with the following batch sizes:")

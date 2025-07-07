@@ -15,7 +15,7 @@ import torchvision.transforms as transforms
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.models.builders.model_factory import create_model
-from src.transforms.rgb_to_rgbl import RGBtoRGBL
+from src.data_utils.rgb_to_rgbl import RGBtoRGBL
 
 
 def test_resnet_on_mnist():

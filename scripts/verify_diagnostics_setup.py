@@ -19,8 +19,8 @@ def verify_imports():
     try:
         from src.models.basic_multi_channel.multi_channel_resnet_network import multi_channel_resnet50
         from src.models.basic_multi_channel.base_multi_channel_network import base_multi_channel_large
-        from src.utils.cifar100_loader import get_cifar100_datasets, create_validation_split
-        from src.transforms.rgb_to_rgbl import RGBtoRGBL
+        from src.data_utils.dataset_utils import get_cifar100_datasets, create_validation_split
+        from src.data_utils.rgb_to_rgbl import RGBtoRGBL
         print("✅ All imports successful")
         return True
     except ImportError as e:
@@ -117,7 +117,7 @@ def verify_data_loading():
             return False
         
         # Test data loading
-        from src.utils.cifar100_loader import get_cifar100_datasets, create_validation_split
+        from src.data_utils.dataset_utils import get_cifar100_datasets, create_validation_split
         
         train_dataset, test_dataset, class_names = get_cifar100_datasets(data_dir="data/cifar-100")
         train_dataset, val_dataset = create_validation_split(train_dataset, val_split=0.1)
@@ -138,7 +138,7 @@ def verify_transforms():
     print("🎨 Verifying transforms...")
     
     try:
-        from src.transforms.rgb_to_rgbl import RGBtoRGBL
+        from src.data_utils.rgb_to_rgbl import RGBtoRGBL
         
         # Test transform
         transform = RGBtoRGBL()

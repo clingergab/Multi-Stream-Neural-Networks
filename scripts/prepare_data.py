@@ -8,7 +8,7 @@ import sys
 
 sys.path.append(str(Path(__file__).parent.parent / "src"))
 
-from datasets.derived_brightness import DerivedBrightnessDataset
+from data_utils import DualChannelDataset
 from data_utils.data_helpers import DataHelper, split_dataset
 
 
@@ -25,7 +25,7 @@ def main():
     print(f"Preparing {args.dataset_type} dataset...")
     
     # Create dataset
-    dataset = DerivedBrightnessDataset(
+    dataset = DualChannelDataset(
         root=args.data_root,
         train=True,
         download=args.download,

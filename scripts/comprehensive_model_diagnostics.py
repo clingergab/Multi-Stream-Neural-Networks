@@ -35,8 +35,8 @@ if project_root not in sys.path:
 try:
     from src.models.basic_multi_channel.multi_channel_resnet_network import multi_channel_resnet50
     from src.models.basic_multi_channel.base_multi_channel_network import base_multi_channel_large
-    from src.utils.cifar100_loader import get_cifar100_datasets
-    from src.transforms.rgb_to_rgbl import RGBtoRGBL
+    from src.data_utils.dataset_utils import get_cifar100_datasets
+    from src.data_utils.rgb_to_rgbl import RGBtoRGBL
     from src.utils.debug_utils import (
         analyze_gradient_flow, 
         analyze_parameter_magnitudes,

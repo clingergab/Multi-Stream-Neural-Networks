@@ -12,8 +12,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from models.builders.model_factory import create_model
-from datasets import DerivedBrightnessDataset
-from data_utils import create_test_dataloader
+from data_utils import DualChannelDataset, create_dual_channel_dataloaders
 from evaluation import evaluate_model, calculate_metrics
 
 
@@ -47,7 +46,7 @@ def load_model(config, checkpoint_path, device):
 def create_dataset(config, data_root):
     """Create test dataset."""
     dataset_config = config['dataset']
-    dataset = DerivedBrightnessDataset(
+    dataset = DualChannelDataset(
         root=data_root,
         train=False,
         **dataset_config
@@ -72,7 +71,13 @@ def main():
     # Create dataset and dataloader
     print("Creating dataset...")
     test_dataset = create_dataset(config, args.data_root)
-    test_loader = create_test_dataloader(test_dataset, batch_size=args.batch_size)
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
     
     # Evaluate model
     print("Evaluating model...")

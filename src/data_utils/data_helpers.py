@@ -56,54 +56,19 @@ def get_class_weights(dataset) -> torch.Tensor:
         
         class_counts[target] = class_counts.get(target, 0) + 1
     
+    if len(class_counts) == 0:
+        return torch.zeros(0)
+    
+    # Get the maximum class index to determine tensor size
+    max_class_idx = max(class_counts.keys())
     num_classes = len(class_counts)
     total_samples = sum(class_counts.values())
     
-    # Calculate inverse frequency weights
-    weights = torch.zeros(num_classes)
+    # Create weights tensor with size based on max class index + 1
+    weights = torch.zeros(max_class_idx + 1)
+    
+    # Calculate inverse frequency weights only for existing classes
     for class_idx, count in class_counts.items():
         weights[class_idx] = total_samples / (num_classes * count)
     
     return weights
-
-
-def create_data_splits(dataset, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1, 
-                      random_seed=42) -> Tuple[torch.utils.data.Dataset, ...]:
-    """Split dataset into train/val/test sets."""
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
-        "Split ratios must sum to 1.0"
-    
-    torch.manual_seed(random_seed)
-    dataset_size = len(dataset)
-    indices = torch.randperm(dataset_size).tolist()
-    
-    train_size = int(train_ratio * dataset_size)
-    val_size = int(val_ratio * dataset_size)
-    
-    train_indices = indices[:train_size]
-    val_indices = indices[train_size:train_size + val_size]
-    test_indices = indices[train_size + val_size:]
-    
-    from torch.utils.data import Subset
-    train_dataset = Subset(dataset, train_indices)
-    val_dataset = Subset(dataset, val_indices)
-    test_dataset = Subset(dataset, test_indices)
-    
-    return train_dataset, val_dataset, test_dataset
-
-
-def save_dataset_info(dataset_stats: Dict[str, Any], save_path: str):
-    """Save dataset statistics to file."""
-    import json
-    
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    with open(save_path, 'w') as f:
-        json.dump(dataset_stats, f, indent=2)
-
-
-def load_dataset_info(info_path: str) -> Dict[str, Any]:
-    """Load dataset statistics from file."""
-    import json
-    
-    with open(info_path, 'r') as f:
-        return json.load(f)

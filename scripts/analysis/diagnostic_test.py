@@ -12,7 +12,7 @@ import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.models.builders.model_factory import create_model
-from src.transforms.rgb_to_rgbl import RGBtoRGBL
+from src.data_utils.rgb_to_rgbl import RGBtoRGBL
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset

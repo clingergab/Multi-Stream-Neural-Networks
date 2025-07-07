@@ -8,7 +8,7 @@ import torchvision
 import torchvision.transforms as transforms
 import numpy as np
 from typing import Tuple, Dict, Any
-from ..transforms.rgb_to_rgbl import RGBtoRGBL
+from ..data_utils.rgb_to_rgbl import RGBtoRGBL
 
 
 def load_mnist(flatten: bool = True, normalize: bool = True) -> Tuple[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]]:
@@ -157,44 +157,6 @@ def prepare_multi_channel_data(rgb_data: np.ndarray, flatten_for_dense: bool = F
         raise ValueError(f"Unsupported data shape: {data_tensor.shape}")
     
     return color_data.numpy(), brightness_data.numpy()
-
-
-def create_sample_data(n_samples: int = 1000, input_size: int = 784, num_classes: int = 10, 
-                      for_cnn: bool = False) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], 
-                                                      Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """
-    Create sample multi-channel data for testing.
-    
-    Args:
-        n_samples: Number of samples to generate
-        input_size: Input size for dense models (ignored if for_cnn=True)
-        num_classes: Number of classes
-        for_cnn: Whether to generate CNN-compatible data
-        
-    Returns:
-        Tuple of ((train_color, train_brightness, train_labels), (test_color, test_brightness, test_labels))
-    """
-    if for_cnn:
-        # Generate image-like data [N, C, H, W]
-        train_color = np.random.randn(n_samples, 3, 32, 32).astype(np.float32)
-        train_brightness = np.random.randn(n_samples, 1, 32, 32).astype(np.float32)
-        test_color = np.random.randn(n_samples // 5, 3, 32, 32).astype(np.float32)
-        test_brightness = np.random.randn(n_samples // 5, 1, 32, 32).astype(np.float32)
-    else:
-        # Generate dense data
-        color_size = (input_size * 3) // 4  # 3/4 of features for color
-        brightness_size = input_size - color_size  # Remaining for brightness
-        
-        train_color = np.random.randn(n_samples, color_size).astype(np.float32)
-        train_brightness = np.random.randn(n_samples, brightness_size).astype(np.float32)
-        test_color = np.random.randn(n_samples // 5, color_size).astype(np.float32)
-        test_brightness = np.random.randn(n_samples // 5, brightness_size).astype(np.float32)
-    
-    # Generate labels
-    train_labels = np.random.randint(0, num_classes, size=n_samples)
-    test_labels = np.random.randint(0, num_classes, size=n_samples // 5)
-    
-    return (train_color, train_brightness, train_labels), (test_color, test_brightness, test_labels)
 
 
 def load_and_prepare_mnist_for_dense() -> Dict[str, Any]:

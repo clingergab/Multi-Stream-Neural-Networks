@@ -10,8 +10,6 @@ from pathlib import Path
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent.parent.parent.parent / "src"))
 
-from src.models2.multi_channel.layers import *  # Import multi-channel layers as they are implemented
-
 
 class TestMultiChannelLayers(unittest.TestCase):
     """Test cases for multi-channel layers."""

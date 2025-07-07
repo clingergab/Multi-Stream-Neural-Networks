@@ -58,7 +58,7 @@ outputs = model.forward_combined(color_data, brightness_data)
 The project includes robust CIFAR-100 data loading utilities that work directly with pickle files:
 
 ```python
-from src.utils.cifar100_loader import get_cifar100_datasets, CIFAR100_FINE_LABELS
+from src.data_utils.dataset_utils import get_cifar100_datasets, CIFAR100_FINE_LABELS
 
 # Load CIFAR-100 datasets
 train_dataset, test_dataset, class_names = get_cifar100_datasets()
