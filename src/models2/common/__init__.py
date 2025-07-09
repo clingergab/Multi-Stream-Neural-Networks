@@ -10,7 +10,6 @@ from .model_helpers import (
     create_dataloader_from_tensors,
     setup_early_stopping,
     early_stopping_initiated,
-    finalize_early_stopping,
     create_progress_bar,
     finalize_progress_bar,
     update_history
@@ -24,7 +23,6 @@ __all__ = [
     'create_dataloader_from_tensors',
     'setup_early_stopping',
     'early_stopping_initiated',
-    'finalize_early_stopping',
     'create_progress_bar',
     'finalize_progress_bar',
     'update_history'

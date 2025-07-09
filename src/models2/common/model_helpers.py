@@ -2,7 +2,8 @@
 Model helper utilities for training and management.
 
 This module provides common functionality that can be shared across different model architectures.
-These are utility functions that take a model instance as the first parameter.
+All functions are standalone utilities that don't require model instances, making them reusable
+across different model implementations.
 """
 
 import os
@@ -16,39 +17,42 @@ from torch.optim.lr_scheduler import (
     ReduceLROnPlateau
 )
 from tqdm import tqdm
-from typing import Optional, Union, Dict, Any
+from typing import Optional, Union, Dict, Any, Callable
 
 
-def setup_scheduler(model, epochs: int, train_loader_len: int, **scheduler_kwargs) -> None:
+def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_len: int, **scheduler_kwargs):
     """
-    Set up the learning rate scheduler based on the scheduler type.
+    Set up and return the learning rate scheduler based on the scheduler type.
     
     Args:
-        model: The model instance
+        optimizer: The optimizer instance
+        scheduler_type: Type of scheduler ('cosine', 'onecycle', 'step', 'plateau', or None)
         epochs: Number of training epochs
         train_loader_len: Length of the training data loader
         **scheduler_kwargs: Additional arguments for the scheduler
-    """
-    if not model.scheduler_type:
-        model.scheduler = None
-        return
         
-    if model.scheduler_type == 'cosine':
+    Returns:
+        Scheduler instance or None if no scheduler requested
+    """
+    if not scheduler_type:
+        return None
+        
+    if scheduler_type == 'cosine':
         # Default t_max is set to number of epochs
         t_max = scheduler_kwargs.get('t_max', epochs)
-        model.scheduler = CosineAnnealingLR(model.optimizer, T_max=t_max)
-    elif model.scheduler_type == 'onecycle':
+        return CosineAnnealingLR(optimizer, T_max=t_max)
+    elif scheduler_type == 'onecycle':
         # For OneCycleLR, we need total number of steps (epochs * steps_per_epoch)
         steps_per_epoch = scheduler_kwargs.get('steps_per_epoch', train_loader_len)
-        max_lr = scheduler_kwargs.get('max_lr', model.optimizer.param_groups[0]['lr'] * 10)
+        max_lr = scheduler_kwargs.get('max_lr', optimizer.param_groups[0]['lr'] * 10)
         pct_start = scheduler_kwargs.get('pct_start', 0.3)
         anneal_strategy = scheduler_kwargs.get('anneal_strategy', 'cos')
         div_factor = scheduler_kwargs.get('div_factor', 25.0)
         final_div_factor = scheduler_kwargs.get('final_div_factor', 1e4)
         
         # Create the OneCycleLR scheduler with calculated total_steps
-        model.scheduler = OneCycleLR(
-            model.optimizer, 
+        return OneCycleLR(
+            optimizer, 
             max_lr=max_lr,
             total_steps=epochs * steps_per_epoch,
             pct_start=pct_start,
@@ -56,43 +60,42 @@ def setup_scheduler(model, epochs: int, train_loader_len: int, **scheduler_kwarg
             div_factor=div_factor,
             final_div_factor=final_div_factor
         )
-    elif model.scheduler_type == 'step':
+    elif scheduler_type == 'step':
         step_size = scheduler_kwargs.get('step_size', 30)
         gamma = scheduler_kwargs.get('gamma', 0.1)
-        model.scheduler = StepLR(model.optimizer, step_size=step_size, gamma=gamma)
-    elif model.scheduler_type == 'plateau':
+        return StepLR(optimizer, step_size=step_size, gamma=gamma)
+    elif scheduler_type == 'plateau':
         # Use scheduler_patience if provided, otherwise fall back to patience from scheduler_kwargs
         scheduler_patience = scheduler_kwargs.get('scheduler_patience', scheduler_kwargs.get('patience', 10))
         factor = scheduler_kwargs.get('factor', 0.5)
-        model.scheduler = ReduceLROnPlateau(
-            model.optimizer, mode='min', patience=scheduler_patience, factor=factor
+        return ReduceLROnPlateau(
+            optimizer, mode='min', patience=scheduler_patience, factor=factor
         )
     else:
-        raise ValueError(f"Unsupported scheduler type: {model.scheduler_type}")
+        raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
 
-def update_scheduler(model, val_loss: float) -> None:
+def update_scheduler(scheduler, val_loss: float) -> None:
     """
     Update the learning rate scheduler.
     
     Args:
-        model: The model instance
+        scheduler: The scheduler instance
         val_loss: Validation loss for plateau scheduler
     """
-    if model.scheduler is not None:
+    if scheduler is not None:
         # Skip OneCycleLR as it's updated after each batch
-        if isinstance(model.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            model.scheduler.step(val_loss)
-        elif not isinstance(model.scheduler, OneCycleLR):
-            model.scheduler.step()
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(val_loss)
+        elif not isinstance(scheduler, OneCycleLR):
+            scheduler.step()
 
-def print_epoch_progress(model, epoch: int, epochs: int, epoch_time: float, 
+def print_epoch_progress(epoch: int, epochs: int, epoch_time: float, 
                        avg_train_loss: float, train_accuracy: float,
                        val_loss: float, val_acc: float, val_loader: bool) -> None:
     """
     Print training progress for the current epoch.
     
     Args:
-        model: The model instance (not used but kept for consistency)
         epoch: Current epoch number (0-based)
         epochs: Total number of epochs
         epoch_time: Time taken for this epoch
@@ -112,12 +115,18 @@ def print_epoch_progress(model, epoch: int, epochs: int, epoch_time: float,
     else:
         print("")
 
-def save_checkpoint(model, path: str, history: Optional[Dict[str, Any]] = None) -> None:
+def save_checkpoint(model_state_dict: Dict[str, torch.Tensor], 
+                   optimizer_state_dict: Optional[Dict[str, Any]] = None,
+                   scheduler_state_dict: Optional[Dict[str, Any]] = None,
+                   path: str = None, 
+                   history: Optional[Dict[str, Any]] = None) -> None:
     """
     Save model checkpoint.
     
     Args:
-        model: The model instance
+        model_state_dict: The model's state dictionary
+        optimizer_state_dict: The optimizer's state dictionary (optional)
+        scheduler_state_dict: The scheduler's state dictionary (optional)
         path: Path to save checkpoint
         history: Training history to save (optional)
     """
@@ -125,9 +134,9 @@ def save_checkpoint(model, path: str, history: Optional[Dict[str, Any]] = None) 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     
     checkpoint = {
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': model.optimizer.state_dict() if model.optimizer else None,
-        'scheduler_state_dict': model.scheduler.state_dict() if model.scheduler else None,
+        'model_state_dict': model_state_dict,
+        'optimizer_state_dict': optimizer_state_dict,
+        'scheduler_state_dict': scheduler_state_dict,
     }
     
     # Add history if provided
@@ -136,17 +145,29 @@ def save_checkpoint(model, path: str, history: Optional[Dict[str, Any]] = None) 
     
     torch.save(checkpoint, path)
 
-def create_dataloader_from_tensors(model, X: torch.Tensor, y: Optional[torch.Tensor] = None, 
-                                 batch_size: int = 32, shuffle: bool = False) -> DataLoader:
+def create_dataloader_from_tensors(X: torch.Tensor, 
+                                y: torch.Tensor, 
+                                batch_size: int = 32,
+                                shuffle: bool = True,
+                                device: Optional[torch.device] = None,
+                                num_workers: Optional[int] = None,
+                                pin_memory: Optional[bool] = None,
+                                persistent_workers: Optional[bool] = None,
+                                prefetch_factor: int = 2) -> DataLoader:
     """
     Create a GPU-optimized DataLoader from tensor data.
     
     Args:
-        model: The model instance
         X: Input tensor data
         y: Target tensor data (optional for prediction)
         batch_size: Batch size for the DataLoader
         shuffle: Whether to shuffle the data
+        device: Device to optimize DataLoader for (if None, will auto-detect)
+        num_workers: Number of parallel data loading workers (if None, will auto-select based on device:
+                    CUDA: 8, MPS: 2, CPU: 2)
+        pin_memory: Whether to pin memory for faster CPU→GPU transfer (if None, True for CUDA, False otherwise)
+        persistent_workers: Whether to keep workers alive between epochs (if None, True for CUDA, False otherwise)
+        prefetch_factor: Number of batches to prefetch per worker
         
     Returns:
         DataLoader containing the tensor data with GPU optimizations
@@ -156,40 +177,70 @@ def create_dataloader_from_tensors(model, X: torch.Tensor, y: Optional[torch.Ten
     else:
         dataset = TensorDataset(X)
     
-    # GPU-optimized DataLoader settings
-    if model.device.type == 'cuda':
+    # Auto-detect device if not provided
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    
+    # Set device-specific defaults if not provided
+    if num_workers is None:
+        if device.type == 'cuda':
+            num_workers = 8  # CUDA can handle more workers efficiently
+        elif device.type == 'mps':
+            num_workers = 2  # MPS works better with fewer workers
+        else:
+            num_workers = 2  # Conservative default for CPU
+    
+    if pin_memory is None:
+        pin_memory = device.type == 'cuda'  # Only beneficial for CUDA
+    
+    if persistent_workers is None:
+        persistent_workers = device.type == 'cuda'  # Most beneficial for CUDA
+    
+    # Device-specific optimizations
+    if device.type == 'cuda':
         return DataLoader(
             dataset, 
             batch_size=batch_size, 
             shuffle=shuffle,
-            num_workers=4,  # Use multiple workers for CUDA
-            pin_memory=True,  # Pin memory for faster GPU transfer
-            persistent_workers=True  # Keep workers alive between epochs
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers and num_workers > 0,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None
         )
-    elif model.device.type == 'mps':
+    elif device.type == 'mps':
+        # MPS works better with limited workers
         return DataLoader(
             dataset, 
             batch_size=batch_size, 
             shuffle=shuffle,
-            num_workers=0,  # MPS works better with num_workers=0
-            pin_memory=False  # Pin memory not beneficial for MPS
+            num_workers=min(num_workers, 2),  # MPS works better with fewer workers
+            pin_memory=False,  # Pin memory not beneficial for MPS
+            persistent_workers=False,  # MPS doesn't benefit from persistent workers
+            prefetch_factor=prefetch_factor if num_workers > 0 else None
         )
     else:
+        # CPU training
         return DataLoader(
             dataset, 
             batch_size=batch_size, 
             shuffle=shuffle,
-            num_workers=0,  # CPU training
-            pin_memory=False
+            num_workers=num_workers,
+            pin_memory=False,  # No GPU transfer needed
+            persistent_workers=persistent_workers and num_workers > 0,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None
         )
 
-def setup_early_stopping(model, early_stopping: bool, val_loader, monitor: str, 
+def setup_early_stopping(early_stopping: bool, val_loader, monitor: str, 
                        patience: int, min_delta: float, verbose: bool) -> Dict[str, Any]:
     """
     Set up early stopping configuration and state.
     
     Args:
-        model: The model instance (not used but kept for consistency)
         early_stopping: Whether to enable early stopping
         val_loader: Validation data loader
         monitor: Metric to monitor ('val_loss' or 'val_accuracy')
@@ -232,20 +283,21 @@ def setup_early_stopping(model, early_stopping: bool, val_loader, monitor: str,
         'best_weights': None
     }
 
-def early_stopping_initiated(model, early_stopping_state: Dict[str, Any], val_loss: float, val_acc: float,
-                           epoch: int, pbar, verbose: bool, restore_best_weights: bool) -> bool:
+def early_stopping_initiated(model_state_dict: Dict[str, torch.Tensor], early_stopping_state: Dict[str, Any], 
+                           val_loss: float, val_acc: float, epoch: int, pbar, verbose: bool, 
+                           restore_best_weights: bool) -> bool:
     """
     Handle early stopping logic and return whether training should stop.
     
     Args:
-        model: The model instance
+        model_state_dict: The model's current state dictionary
         early_stopping_state: Early stopping state dictionary
         val_loss: Current validation loss
         val_acc: Current validation accuracy
         epoch: Current epoch number
         pbar: Progress bar object
         verbose: Whether to print progress
-        restore_best_weights: Whether to restore best weights
+        restore_best_weights: Whether to save best weights for restoration
     
     Returns:
         True if training should stop, False otherwise
@@ -264,7 +316,7 @@ def early_stopping_initiated(model, early_stopping_state: Dict[str, Any], val_lo
         # Save best weights for restoration
         if restore_best_weights:
             early_stopping_state['best_weights'] = {
-                k: v.cpu().clone() for k, v in model.state_dict().items()
+                k: v.cpu().clone() for k, v in model_state_dict.items()
             }
         
         if verbose and pbar is None:
@@ -276,45 +328,19 @@ def early_stopping_initiated(model, early_stopping_state: Dict[str, Any], val_lo
     
     # Check if we should stop early
     if early_stopping_state['patience_counter'] >= early_stopping_state['patience']:
-        # Handle early stopping termination
-        finalize_early_stopping(model, early_stopping_state, epoch, pbar, verbose, restore_best_weights)
+        # Print early stopping info but don't restore weights here
+        if verbose and pbar is None:
+            print(f"🛑 Early stopping triggered after {epoch + 1} epochs")
+            print(f"   Best {monitor}: {early_stopping_state['best_metric']:.4f} at epoch {early_stopping_state['best_epoch'] + 1}")
         return True
         
     return False
 
-def finalize_early_stopping(model, early_stopping_state: Dict[str, Any], epoch: int, pbar, 
-                          verbose: bool, restore_best_weights: bool) -> None:
-    """
-    Handle final early stopping procedures.
-    
-    Args:
-        model: The model instance
-        early_stopping_state: Early stopping state dictionary
-        epoch: Current epoch number
-        pbar: Progress bar object
-        verbose: Whether to print progress
-        restore_best_weights: Whether to restore best weights
-    """
-    monitor = early_stopping_state['monitor']
-    
-    if verbose and pbar is None:
-        print(f"🛑 Early stopping triggered after {epoch + 1} epochs")
-        print(f"   Best {monitor}: {early_stopping_state['best_metric']:.4f} at epoch {early_stopping_state['best_epoch'] + 1}")
-    
-    # Restore best weights if requested
-    if restore_best_weights and early_stopping_state['best_weights'] is not None:
-        model.load_state_dict({
-            k: v.to(model.device) for k, v in early_stopping_state['best_weights'].items()
-        })
-        if verbose and pbar is None:
-            print("🔄 Restored best model weights")
-
-def create_progress_bar(model, verbose: bool, epoch: int, epochs: int, total_steps: int):
+def create_progress_bar(verbose: bool, epoch: int, epochs: int, total_steps: int):
     """
     Create and configure progress bar for epoch.
     
     Args:
-        model: The model instance (not used but kept for consistency)
         verbose: Whether to show progress bar
         epoch: Current epoch number (0-based)
         epochs: Total number of epochs
@@ -334,14 +360,13 @@ def create_progress_bar(model, verbose: bool, epoch: int, epochs: int, total_ste
         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
     )
 
-def finalize_progress_bar(model, pbar, avg_train_loss: float, train_accuracy: float,
+def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
                         val_loader, val_loss: float, val_acc: float, 
                         early_stopping_state: Dict[str, Any], current_lr: float) -> None:
     """
     Update and close progress bar with final epoch metrics.
     
     Args:
-        model: The model instance (not used but kept for consistency)
         pbar: Progress bar object
         avg_train_loss: Average training loss
         train_accuracy: Training accuracy
@@ -381,14 +406,13 @@ def finalize_progress_bar(model, pbar, avg_train_loss: float, train_accuracy: fl
     pbar.refresh()
     pbar.close()
 
-def update_history(model, history: Dict[str, Any], avg_train_loss: float, train_accuracy: float,
+def update_history(history: Dict[str, Any], avg_train_loss: float, train_accuracy: float,
                   val_loss: float = 0.0, val_acc: float = 0.0, current_lr: float = 0.0,
                   has_validation: bool = False) -> None:
     """
     Update training history with current epoch metrics.
     
     Args:
-        model: The model instance (not used but kept for consistency)
         history: Training history dictionary
         avg_train_loss: Average training loss
         train_accuracy: Training accuracy

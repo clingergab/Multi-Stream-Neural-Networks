@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..', 'sr
 
 from src.data_utils.dual_channel_dataset import (
     DualChannelDataset, 
-    create_dual_channel_dataloaders
+    create_dual_channel_dataloaders,
+    create_dual_channel_dataloader
 )
 
 
@@ -385,8 +386,10 @@ class TestCreateDualChannelDataloaders:
         
         train_loader, val_loader = create_dual_channel_dataloaders(
             train_rgb=train_rgb,
+            train_brightness=None,  # Auto-compute
             train_labels=train_labels,
             val_rgb=val_rgb,
+            val_brightness=None,  # Auto-compute
             val_labels=val_labels,
             batch_size=4
         )
@@ -400,7 +403,7 @@ class TestCreateDualChannelDataloaders:
         # Test val loader
         val_batch = next(iter(val_loader))
         assert len(val_batch) == 3
-        assert val_batch[0].shape[0] <= 4  # Batch size (might be smaller for last batch)
+        assert val_batch[0].shape[0] <= 8  # Validation uses batch_size*2 (might be smaller for last batch)
         assert val_batch[1].shape[1] == 1  # Brightness channel
     
     def test_create_dataloaders_provided_brightness(self, sample_train_val_data):
@@ -427,7 +430,7 @@ class TestCreateDualChannelDataloaders:
         assert len(train_batch) == 3
         assert len(val_batch) == 3
         assert train_batch[0].shape[0] == 4
-        assert val_batch[0].shape[0] <= 4
+        assert val_batch[0].shape[0] <= 8  # Validation uses batch_size*2
     
     def test_create_dataloaders_no_augmentation(self, sample_train_val_data):
         """Test creating dataloaders without augmentation."""
@@ -435,8 +438,10 @@ class TestCreateDualChannelDataloaders:
         
         train_loader, val_loader = create_dual_channel_dataloaders(
             train_rgb=train_rgb,
+            train_brightness=None,  # Auto-compute
             train_labels=train_labels,
             val_rgb=val_rgb,
+            val_brightness=None,  # Auto-compute
             val_labels=val_labels,
             batch_size=4
             # No augmentation - train_transform and val_transform are None by default
@@ -464,8 +469,10 @@ class TestCreateDualChannelDataloaders:
         
         train_loader, val_loader = create_dual_channel_dataloaders(
             train_rgb=train_rgb,
+            train_brightness=None,  # Auto-compute
             train_labels=train_labels,
             val_rgb=val_rgb,
+            val_brightness=None,  # Auto-compute
             val_labels=val_labels,
             batch_size=4,
             train_transform=train_transform,
@@ -481,11 +488,278 @@ class TestCreateDualChannelDataloaders:
         # Test val loader (should have different size due to CenterCrop)
         val_batch = next(iter(val_loader))
         assert len(val_batch) == 3
-        assert val_batch[0].shape[0] <= 4
+        assert val_batch[0].shape[0] <= 8  # Validation uses batch_size*2
         assert val_batch[1].shape[1] == 1
         # Validate crop was applied
         assert val_batch[0].shape[2] == 28, "CenterCrop should reduce height to 28"
         assert val_batch[0].shape[3] == 28, "CenterCrop should reduce width to 28"
+    
+    def test_create_dataloaders_gpu_optimization_params(self, sample_train_val_data):
+        """Test creating dataloaders with GPU optimization parameters."""
+        train_rgb, train_labels, val_rgb, val_labels = sample_train_val_data
+        
+        train_loader, val_loader = create_dual_channel_dataloaders(
+            train_rgb=train_rgb,
+            train_brightness=None,  # Auto-compute
+            train_labels=train_labels,
+            val_rgb=val_rgb,
+            val_brightness=None,  # Auto-compute
+            val_labels=val_labels,
+            batch_size=4,
+            num_workers=6,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=3
+        )
+        
+        # Test that GPU optimization parameters are applied
+        assert train_loader.num_workers == 6
+        assert train_loader.pin_memory == True
+        assert train_loader.persistent_workers == True
+        
+        assert val_loader.num_workers == 6
+        assert val_loader.pin_memory == True
+        assert val_loader.persistent_workers == True
+        
+        # Test data still flows correctly
+        train_batch = next(iter(train_loader))
+        val_batch = next(iter(val_loader))
+        
+        assert len(train_batch) == 3
+        assert len(val_batch) == 3
+
+    def test_create_dataloaders_no_workers_disables_persistent(self, sample_train_val_data):
+        """Test that num_workers=0 properly disables persistent_workers."""
+        train_rgb, train_labels, val_rgb, val_labels = sample_train_val_data
+        
+        train_loader, val_loader = create_dual_channel_dataloaders(
+            train_rgb=train_rgb,
+            train_brightness=None,  # Auto-compute
+            train_labels=train_labels,
+            val_rgb=val_rgb,
+            val_brightness=None,  # Auto-compute
+            val_labels=val_labels,
+            batch_size=4,
+            num_workers=0,
+            persistent_workers=True  # Should be overridden to False
+        )
+        
+        # persistent_workers should be disabled when num_workers=0
+        assert train_loader.num_workers == 0
+        assert train_loader.persistent_workers == False
+        
+        assert val_loader.num_workers == 0
+        assert val_loader.persistent_workers == False
+
+    def test_create_dataloaders_custom_dataloader_params(self, sample_train_val_data):
+        """Test creating dataloaders with custom DataLoader parameters."""
+        train_rgb, train_labels, val_rgb, val_labels = sample_train_val_data
+        
+        train_loader, val_loader = create_dual_channel_dataloaders(
+            train_rgb=train_rgb,
+            train_brightness=None,  # Auto-compute
+            train_labels=train_labels,
+            val_rgb=val_rgb,
+            val_brightness=None,  # Auto-compute
+            val_labels=val_labels,
+            batch_size=2,
+            num_workers=2,
+            pin_memory=False,
+            persistent_workers=False,
+            prefetch_factor=1
+        )
+        
+        # Check all custom parameters
+        assert train_loader.batch_size == 2
+        assert train_loader.num_workers == 2
+        assert train_loader.pin_memory == False
+        assert train_loader.persistent_workers == False
+        
+        assert val_loader.batch_size == 4  # Validation uses batch_size*2
+        assert val_loader.num_workers == 2
+        assert val_loader.pin_memory == False
+        assert val_loader.persistent_workers == False
+
+    def test_create_dataloaders_different_batch_sizes(self, sample_train_val_data):
+        """
+        Test that training and validation dataloaders use different batch sizes.
+        
+        This is a best practice: validation can use larger batch sizes than training
+        because we don't compute gradients during validation, allowing more samples
+        to fit in memory and faster validation processing.
+        
+        Expected behavior:
+        - Training dataloader uses the specified batch_size
+        - Validation dataloader uses batch_size * 2
+        """
+        train_rgb, train_labels, val_rgb, val_labels = sample_train_val_data
+        
+        batch_size = 8  # Use a specific batch size for clear testing
+        train_loader, val_loader = create_dual_channel_dataloaders(
+            train_rgb=train_rgb,
+            train_brightness=None,  # Auto-compute
+            train_labels=train_labels,
+            val_rgb=val_rgb,
+            val_brightness=None,  # Auto-compute
+            val_labels=val_labels,
+            batch_size=batch_size
+        )
+        
+        # Verify that training uses the specified batch size
+        assert train_loader.batch_size == batch_size, f"Training batch size should be {batch_size}, got {train_loader.batch_size}"
+        
+        # Verify that validation uses 2x the batch size
+        expected_val_batch_size = batch_size * 2
+        assert val_loader.batch_size == expected_val_batch_size, f"Validation batch size should be {expected_val_batch_size}, got {val_loader.batch_size}"
+        
+        # Verify actual batch loading behavior
+        train_batch = next(iter(train_loader))
+        val_batch = next(iter(val_loader))
+        
+        # Training batch should match the specified batch size
+        assert train_batch[0].shape[0] == batch_size, f"Actual training batch size is {train_batch[0].shape[0]}, expected {batch_size}"
+        
+        # Validation batch should be larger (up to 2x, depending on dataset size)
+        assert val_batch[0].shape[0] <= expected_val_batch_size, f"Validation batch size {val_batch[0].shape[0]} exceeds expected max {expected_val_batch_size}"
+        assert val_batch[0].shape[0] > batch_size, f"Validation batch size {val_batch[0].shape[0]} should be larger than training batch size {batch_size}"
+
+
+class TestCreateDualChannelDataloader:
+    """Test cases for create_dual_channel_dataloader convenience function."""
+    
+    @pytest.fixture
+    def sample_data(self):
+        """Create sample data for single dataloader."""
+        rgb_data = torch.randn(15, 3, 32, 32)
+        brightness_data = torch.randn(15, 1, 32, 32)
+        labels = torch.randint(0, 10, (15,))
+        return rgb_data, brightness_data, labels
+    
+    def test_create_single_dataloader_basic(self, sample_data):
+        """Test creating a single dataloader with basic parameters."""
+        rgb_data, brightness_data, labels = sample_data
+        
+        dataloader = create_dual_channel_dataloader(
+            rgb_data=rgb_data,
+            brightness_data=brightness_data,
+            labels=labels,
+            batch_size=5
+        )
+        
+        assert isinstance(dataloader, DataLoader)
+        assert dataloader.batch_size == 5
+        
+        # Test data flow
+        batch = next(iter(dataloader))
+        assert len(batch) == 3  # RGB, brightness, labels
+        assert batch[0].shape[0] == 5  # Batch size
+        assert batch[0].shape[1] == 3  # RGB channels
+        assert batch[1].shape[1] == 1  # Brightness channel
+        assert batch[2].shape[0] == 5  # Labels
+
+    def test_create_single_dataloader_no_shuffle(self, sample_data):
+        """Test creating a single dataloader with shuffle=False."""
+        rgb_data, brightness_data, labels = sample_data
+        
+        dataloader = create_dual_channel_dataloader(
+            rgb_data=rgb_data,
+            brightness_data=brightness_data,
+            labels=labels,
+            batch_size=5,
+            shuffle=False
+        )
+        
+        # Should still work correctly
+        batch = next(iter(dataloader))
+        assert len(batch) == 3
+        assert batch[0].shape[0] == 5
+
+    def test_create_single_dataloader_gpu_params(self, sample_data):
+        """Test creating a single dataloader with GPU optimization parameters."""
+        rgb_data, brightness_data, labels = sample_data
+        
+        dataloader = create_dual_channel_dataloader(
+            rgb_data=rgb_data,
+            brightness_data=brightness_data,
+            labels=labels,
+            batch_size=3,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2
+        )
+        
+        # Check GPU optimization parameters
+        assert dataloader.batch_size == 3
+        assert dataloader.num_workers == 4
+        assert dataloader.pin_memory == True
+        assert dataloader.persistent_workers == True
+        
+        # Test data flow
+        batch = next(iter(dataloader))
+        assert len(batch) == 3
+        assert batch[0].shape[0] == 3
+
+    def test_create_single_dataloader_with_transform(self, sample_data):
+        """Test creating a single dataloader with transforms."""
+        rgb_data, brightness_data, labels = sample_data
+        
+        transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+        ])
+        
+        dataloader = create_dual_channel_dataloader(
+            rgb_data=rgb_data,
+            brightness_data=brightness_data,
+            labels=labels,
+            batch_size=5,
+            transform=transform
+        )
+        
+        # Should work with transforms
+        batch = next(iter(dataloader))
+        assert len(batch) == 3
+        assert batch[0].shape[0] == 5
+
+    def test_create_single_dataloader_zero_workers(self, sample_data):
+        """Test that num_workers=0 properly disables persistent_workers in single dataloader."""
+        rgb_data, brightness_data, labels = sample_data
+        
+        dataloader = create_dual_channel_dataloader(
+            rgb_data=rgb_data,
+            brightness_data=brightness_data,
+            labels=labels,
+            batch_size=5,
+            num_workers=0,
+            persistent_workers=True  # Should be overridden to False
+        )
+        
+        # persistent_workers should be disabled when num_workers=0
+        assert dataloader.num_workers == 0
+        assert dataloader.persistent_workers == False
+        
+        # Data should still flow correctly
+        batch = next(iter(dataloader))
+        assert len(batch) == 3
+
+    def test_create_single_dataloader_auto_brightness(self):
+        """Test creating a single dataloader that auto-computes brightness."""
+        rgb_data = torch.randn(10, 3, 32, 32)
+        labels = torch.randint(0, 10, (10,))
+        
+        # Pass None for brightness_data to test auto-computation
+        dataloader = create_dual_channel_dataloader(
+            rgb_data=rgb_data,
+            brightness_data=None,
+            labels=labels,
+            batch_size=5
+        )
+        
+        # Should work and auto-compute brightness
+        batch = next(iter(dataloader))
+        assert len(batch) == 3
+        assert batch[0].shape[1] == 3  # RGB channels
+        assert batch[1].shape[1] == 1  # Auto-computed brightness channel
 
 
 if __name__ == "__main__":
