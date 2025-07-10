@@ -106,18 +106,22 @@ class MCResNet(BaseModel):
         replace_stride_with_dilation: list[bool]
     ):
         """Build the Multi-Channel ResNet network architecture."""
+        # BaseModel already initialized self.color_inplanes and self.brightness_inplanes to 64
+        # for equal scaling, so we can use them directly
+        
         # Network architecture - exactly like ResNet but with multi-channel components
         self.conv1 = MCConv2d(
-            self.color_input_channels, self.brightness_input_channels, self.inplanes,
+            self.color_input_channels, self.brightness_input_channels, 
+            self.color_inplanes, self.brightness_inplanes,
             kernel_size=7, stride=2, padding=3, bias=False
         )
-        self.bn1 = self._norm_layer(self.inplanes)
+        self.bn1 = self._norm_layer(self.color_inplanes, self.brightness_inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = MCMaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+        self.layer1 = self._make_layer(block, 64, 64, layers[0])       # Equal scaling: 64, 64
+        self.layer2 = self._make_layer(block, 128, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])  # Equal scaling: 128, 128
+        self.layer3 = self._make_layer(block, 256, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])  # Equal scaling: 256, 256
+        self.layer4 = self._make_layer(block, 512, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])  # Equal scaling: 512, 512
         self.avgpool = MCAdaptiveAvgPool2d((1, 1))
         
         # Single classifier for integrated features
@@ -153,14 +157,15 @@ class MCResNet(BaseModel):
     def _make_layer(
         self,
         block: type[Union[MCBasicBlock, MCBottleneck]],
-        planes: int,
+        color_planes: int,
+        brightness_planes: int,
         blocks: int,
         stride: int = 1,
         dilate: bool = False,
     ) -> MCSequential:
         """
         Create a layer composed of multiple residual blocks.
-        Fully compliant with ResNet implementation but using multi-channel blocks.
+        Fully compliant with ResNet implementation but using multi-channel blocks with separate channel tracking.
         """
         norm_layer = self._norm_layer
         downsample = None
@@ -168,19 +173,30 @@ class MCResNet(BaseModel):
         if dilate:
             self.dilation *= stride
             stride = 1
-        if stride != 1 or self.inplanes != planes * block.expansion:
+        
+        # Check if downsampling is needed for either pathway
+        need_downsample = (stride != 1 or 
+                          self.color_inplanes != color_planes * block.expansion or
+                          self.brightness_inplanes != brightness_planes * block.expansion)
+        
+        if need_downsample:
             downsample = MCSequential(
-                MCConv2d(self.inplanes, self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
-                norm_layer(planes * block.expansion)
+                MCConv2d(
+                    self.color_inplanes, self.brightness_inplanes, 
+                    color_planes * block.expansion, brightness_planes * block.expansion,
+                    kernel_size=1, stride=stride, bias=False
+                ),
+                norm_layer(color_planes * block.expansion, brightness_planes * block.expansion)
             )
 
         layers = []
         # First block with potential downsampling - pass parameters exactly like ResNet
         layers.append(
             block(
-                self.inplanes, 
-                self.inplanes, 
-                planes, 
+                self.color_inplanes, 
+                self.brightness_inplanes, 
+                color_planes,
+                brightness_planes,
                 stride, 
                 downsample, 
                 self.groups,
@@ -189,15 +205,19 @@ class MCResNet(BaseModel):
                 norm_layer
             )
         )
-        self.inplanes = planes * block.expansion
+        
+        # Update channel tracking
+        self.color_inplanes = color_planes * block.expansion
+        self.brightness_inplanes = brightness_planes * block.expansion
         
         # Remaining blocks
         for _ in range(1, blocks):
             layers.append(
                 block(
-                    self.inplanes,
-                    self.inplanes,
-                    planes,
+                    self.color_inplanes,
+                    self.brightness_inplanes,
+                    color_planes,
+                    brightness_planes,
                     groups=self.groups,
                     base_width=self.base_width,
                     dilation=self.dilation,
@@ -803,7 +823,348 @@ class MCResNet(BaseModel):
         brightness_x = torch.flatten(brightness_x, 1)
         
         return brightness_x
+
+    def analyze_pathways(self, 
+                        data_loader: Optional[torch.utils.data.DataLoader] = None,
+                        color_data: Optional[torch.Tensor] = None,
+                        brightness_data: Optional[torch.Tensor] = None,
+                        targets: Optional[torch.Tensor] = None,
+                        batch_size: int = 32,
+                        num_samples: int = 100) -> dict:
+        """
+        Analyze the contribution and performance of individual pathways.
+        
+        Args:
+            data_loader: DataLoader containing dual-channel input data
+            color_data: Color/RGB input data (if not using data_loader)
+            brightness_data: Brightness input data (if not using data_loader)
+            targets: Target tensor (required if not using data_loader)
+            batch_size: Batch size for analysis
+            num_samples: Number of samples to analyze (for efficiency)
+            
+        Returns:
+            Dictionary containing pathway analysis results
+        """
+        if self.criterion is None:
+            raise ValueError("Model not compiled. Call compile() before analyze_pathways().")
+            
+        # Handle tensor input by converting to DataLoader
+        if data_loader is None:
+            if color_data is None or brightness_data is None or targets is None:
+                raise ValueError("Either provide data_loader or all of color_data, brightness_data, and targets")
+            
+            # Limit samples for efficiency
+            if len(color_data) > num_samples:
+                indices = torch.randperm(len(color_data))[:num_samples]
+                color_data = color_data[indices]
+                brightness_data = brightness_data[indices]
+                targets = targets[indices]
+            
+            data_loader = create_dual_channel_dataloader(
+                color_data, brightness_data, targets,
+                batch_size=batch_size, num_workers=0
+            )
+        
+        self.eval()
+        
+        # Initialize metrics
+        full_model_correct = 0
+        color_only_correct = 0
+        brightness_only_correct = 0
+        total_samples = 0
+        
+        full_model_loss = 0.0
+        color_only_loss = 0.0
+        brightness_only_loss = 0.0
+        
+        color_feature_norms = []
+        brightness_feature_norms = []
+        
+        with torch.no_grad():
+            for rgb_batch, brightness_batch, targets_batch in data_loader:
+                # Move to device
+                rgb_batch = rgb_batch.to(self.device, non_blocking=True)
+                brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+                targets_batch = targets_batch.to(self.device, non_blocking=True)
+                
+                batch_size_actual = rgb_batch.size(0)
+                total_samples += batch_size_actual
+                
+                # Full model prediction
+                full_outputs = self(rgb_batch, brightness_batch)
+                full_loss = self.criterion(full_outputs, targets_batch)
+                full_model_loss += full_loss.item() * batch_size_actual
+                
+                _, full_predicted = torch.max(full_outputs, 1)
+                full_model_correct += (full_predicted == targets_batch).sum().item()
+                
+                # Color pathway only
+                color_features = self._forward_color_pathway(rgb_batch)
+                color_feature_norms.append(torch.norm(color_features, dim=1).cpu())
+                
+                # Create dummy brightness features with same shape for FC layer
+                brightness_dummy = torch.zeros_like(color_features)
+                color_fused = torch.cat([color_features, brightness_dummy], dim=1)
+                color_outputs = self.fc(color_fused)
+                color_loss = self.criterion(color_outputs, targets_batch)
+                color_only_loss += color_loss.item() * batch_size_actual
+                
+                _, color_predicted = torch.max(color_outputs, 1)
+                color_only_correct += (color_predicted == targets_batch).sum().item()
+                
+                # Brightness pathway only
+                brightness_features = self._forward_brightness_pathway(brightness_batch)
+                brightness_feature_norms.append(torch.norm(brightness_features, dim=1).cpu())
+                
+                # Create dummy color features with same shape for FC layer
+                color_dummy = torch.zeros_like(brightness_features)
+                brightness_fused = torch.cat([color_dummy, brightness_features], dim=1)
+                brightness_outputs = self.fc(brightness_fused)
+                brightness_loss = self.criterion(brightness_outputs, targets_batch)
+                brightness_only_loss += brightness_loss.item() * batch_size_actual
+                
+                _, brightness_predicted = torch.max(brightness_outputs, 1)
+                brightness_only_correct += (brightness_predicted == targets_batch).sum().item()
+        
+        # Calculate metrics
+        full_accuracy = full_model_correct / total_samples
+        color_accuracy = color_only_correct / total_samples
+        brightness_accuracy = brightness_only_correct / total_samples
+        
+        avg_full_loss = full_model_loss / total_samples
+        avg_color_loss = color_only_loss / total_samples
+        avg_brightness_loss = brightness_only_loss / total_samples
+        
+        # Feature analysis
+        color_norms = torch.cat(color_feature_norms, dim=0)
+        brightness_norms = torch.cat(brightness_feature_norms, dim=0)
+        
+        return {
+            'accuracy': {
+                'full_model': full_accuracy,
+                'color_only': color_accuracy,
+                'brightness_only': brightness_accuracy,
+                'color_contribution': color_accuracy / full_accuracy if full_accuracy > 0 else 0,
+                'brightness_contribution': brightness_accuracy / full_accuracy if full_accuracy > 0 else 0
+            },
+            'loss': {
+                'full_model': avg_full_loss,
+                'color_only': avg_color_loss,
+                'brightness_only': avg_brightness_loss
+            },
+            'feature_norms': {
+                'color_mean': color_norms.mean().item(),
+                'color_std': color_norms.std().item(),
+                'brightness_mean': brightness_norms.mean().item(),
+                'brightness_std': brightness_norms.std().item(),
+                'color_to_brightness_ratio': (color_norms.mean() / brightness_norms.mean()).item()
+            },
+            'samples_analyzed': total_samples
+        }
     
+    def analyze_pathway_weights(self) -> dict:
+        """
+        Analyze the weight distributions and magnitudes across pathways.
+        
+        Returns:
+            Dictionary containing weight analysis for color and brightness pathways
+        """
+        color_weights = {}
+        brightness_weights = {}
+        
+        # Analyze multi-channel layers - look for modules with color_weight and brightness_weight
+        for name, module in self.named_modules():
+            if hasattr(module, 'color_weight') and hasattr(module, 'brightness_weight'):
+                # MCConv2d and MCBatchNorm2d modules
+                color_weight = module.color_weight
+                brightness_weight = module.brightness_weight
+                
+                color_weights[name] = {
+                    'mean': color_weight.mean().item(),
+                    'std': color_weight.std().item(),
+                    'norm': torch.norm(color_weight).item(),
+                    'shape': list(color_weight.shape)
+                }
+                
+                brightness_weights[name] = {
+                    'mean': brightness_weight.mean().item(),
+                    'std': brightness_weight.std().item(),
+                    'norm': torch.norm(brightness_weight).item(),
+                    'shape': list(brightness_weight.shape)
+                }
+        
+        # Calculate overall statistics
+        color_norms = [w['norm'] for w in color_weights.values()]
+        brightness_norms = [w['norm'] for w in brightness_weights.values()]
+        
+        return {
+            'color_pathway': {
+                'layer_weights': color_weights,
+                'total_norm': sum(color_norms),
+                'mean_norm': sum(color_norms) / len(color_norms) if color_norms else 0,
+                'num_layers': len(color_weights)
+            },
+            'brightness_pathway': {
+                'layer_weights': brightness_weights,
+                'total_norm': sum(brightness_norms),
+                'mean_norm': sum(brightness_norms) / len(brightness_norms) if brightness_norms else 0,
+                'num_layers': len(brightness_weights)
+            },
+            'ratio_analysis': {
+                'color_to_brightness_norm_ratio': (sum(color_norms) / sum(brightness_norms)) if brightness_norms else float('inf'),
+                'layer_ratios': {
+                    name: color_weights[name]['norm'] / brightness_weights[name]['norm'] 
+                    if name in brightness_weights and brightness_weights[name]['norm'] > 0 else float('inf')
+                    for name in color_weights.keys()
+                    if name in brightness_weights
+                }
+            }
+        }
+    
+    def get_pathway_importance(self, 
+                              data_loader: Optional[torch.utils.data.DataLoader] = None,
+                              color_data: Optional[torch.Tensor] = None,
+                              brightness_data: Optional[torch.Tensor] = None,
+                              targets: Optional[torch.Tensor] = None,
+                              batch_size: int = 32,
+                              method: str = 'gradient') -> dict:
+        """
+        Calculate pathway importance using different methods.
+        
+        Args:
+            data_loader: DataLoader containing dual-channel input data
+            color_data: Color/RGB input data (if not using data_loader)
+            brightness_data: Brightness input data (if not using data_loader)
+            targets: Target tensor (required if not using data_loader)
+            batch_size: Batch size for analysis
+            method: Method for importance calculation ('gradient', 'ablation', 'feature_norm')
+            
+        Returns:
+            Dictionary containing pathway importance scores
+        """
+        if method == 'gradient':
+            return self._calculate_gradient_importance(data_loader, color_data, brightness_data, targets, batch_size)
+        elif method == 'ablation':
+            return self._calculate_ablation_importance(data_loader, color_data, brightness_data, targets, batch_size)
+        elif method == 'feature_norm':
+            return self._calculate_feature_norm_importance(data_loader, color_data, brightness_data, targets, batch_size)
+        else:
+            raise ValueError(f"Unknown importance method: {method}. Choose from 'gradient', 'ablation', 'feature_norm'")
+    
+    def _calculate_gradient_importance(self, data_loader, color_data, brightness_data, targets, batch_size):
+        """Calculate importance based on gradient magnitudes."""
+        if self.criterion is None:
+            raise ValueError("Model not compiled. Call compile() before calculating importance.")
+            
+        # Handle tensor input
+        if data_loader is None:
+            if color_data is None or brightness_data is None or targets is None:
+                raise ValueError("Either provide data_loader or all input tensors")
+                
+            # Use a subset for efficiency
+            num_samples = min(50, len(color_data))
+            indices = torch.randperm(len(color_data))[:num_samples]
+            data_loader = create_dual_channel_dataloader(
+                color_data[indices], brightness_data[indices], targets[indices],
+                batch_size=batch_size, num_workers=0
+            )
+        
+        self.train()  # Enable gradients
+        
+        color_gradients = []
+        brightness_gradients = []
+        
+        for rgb_batch, brightness_batch, targets_batch in data_loader:
+            rgb_batch = rgb_batch.to(self.device, non_blocking=True)
+            brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+            targets_batch = targets_batch.to(self.device, non_blocking=True)
+            
+            # Require gradients for inputs
+            rgb_batch.requires_grad_(True)
+            brightness_batch.requires_grad_(True)
+            
+            # Forward pass
+            outputs = self(rgb_batch, brightness_batch)
+            loss = self.criterion(outputs, targets_batch)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Calculate gradient norms - flatten and then compute norm
+            color_grad_norm = torch.norm(rgb_batch.grad.flatten(1), dim=1).mean().item()
+            brightness_grad_norm = torch.norm(brightness_batch.grad.flatten(1), dim=1).mean().item()
+            
+            color_gradients.append(color_grad_norm)
+            brightness_gradients.append(brightness_grad_norm)
+            
+            # Clear gradients
+            self.zero_grad()
+            rgb_batch.grad = None
+            brightness_batch.grad = None
+        
+        avg_color_grad = sum(color_gradients) / len(color_gradients)
+        avg_brightness_grad = sum(brightness_gradients) / len(brightness_gradients)
+        total_grad = avg_color_grad + avg_brightness_grad
+        
+        return {
+            'method': 'gradient',
+            'color_importance': avg_color_grad / total_grad if total_grad > 0 else 0.5,
+            'brightness_importance': avg_brightness_grad / total_grad if total_grad > 0 else 0.5,
+            'raw_gradients': {
+                'color_avg': avg_color_grad,
+                'brightness_avg': avg_brightness_grad
+            }
+        }
+    
+    def _calculate_ablation_importance(self, data_loader, color_data, brightness_data, targets, batch_size):
+        """Calculate importance based on performance drop when ablating each pathway."""
+        # Use the analyze_pathways method for ablation analysis
+        pathway_analysis = self.analyze_pathways(data_loader, color_data, brightness_data, targets, batch_size)
+        
+        full_accuracy = pathway_analysis['accuracy']['full_model']
+        color_accuracy = pathway_analysis['accuracy']['color_only']
+        brightness_accuracy = pathway_analysis['accuracy']['brightness_only']
+        
+        # Calculate importance as relative contribution to full model performance
+        color_drop = max(0, full_accuracy - brightness_accuracy)  # Performance drop without color
+        brightness_drop = max(0, full_accuracy - color_accuracy)  # Performance drop without brightness
+        
+        total_contribution = color_drop + brightness_drop
+        
+        return {
+            'method': 'ablation',
+            'color_importance': color_drop / total_contribution if total_contribution > 0 else 0.5,
+            'brightness_importance': brightness_drop / total_contribution if total_contribution > 0 else 0.5,
+            'performance_drops': {
+                'without_color': color_drop,
+                'without_brightness': brightness_drop
+            },
+            'individual_accuracies': {
+                'full_model': full_accuracy,
+                'color_only': color_accuracy,
+                'brightness_only': brightness_accuracy
+            }
+        }
+    
+    def _calculate_feature_norm_importance(self, data_loader, color_data, brightness_data, targets, batch_size):
+        """Calculate importance based on feature norm magnitudes."""
+        # Use the analyze_pathways method for feature analysis
+        pathway_analysis = self.analyze_pathways(data_loader, color_data, brightness_data, targets, batch_size)
+        
+        color_norm = pathway_analysis['feature_norms']['color_mean']
+        brightness_norm = pathway_analysis['feature_norms']['brightness_mean']
+        total_norm = color_norm + brightness_norm
+        
+        return {
+            'method': 'feature_norm',
+            'color_importance': color_norm / total_norm if total_norm > 0 else 0.5,
+            'brightness_importance': brightness_norm / total_norm if total_norm > 0 else 0.5,
+            'feature_norms': {
+                'color_mean': color_norm,
+                'brightness_mean': brightness_norm,
+                'ratio': color_norm / brightness_norm if brightness_norm > 0 else float('inf')
+            }
+        } 
 
 # Factory functions for common architectures
 def mc_resnet18(num_classes: int = 1000, **kwargs) -> MCResNet:

@@ -359,17 +359,6 @@ class TestCreateDataloaderFromTensors:
         assert dataloader.num_workers == 0
         assert dataloader.persistent_workers == False  # Should be disabled
     
-    def test_create_dataloader_no_targets(self):
-        """Test DataLoader creation without target tensors."""
-        X = torch.randn(100, 10)
-        
-        dataloader = create_dataloader_from_tensors(X, batch_size=16)
-        
-        assert isinstance(dataloader, DataLoader)
-        # Check that dataset has only one tensor
-        sample = next(iter(dataloader))
-        assert len(sample) == 1  # Only X, no y
-    
     def test_create_dataloader_with_targets(self):
         """Test DataLoader creation with target tensors."""
         X = torch.randn(100, 10)

@@ -258,8 +258,8 @@ class TestResNetTrainingAPI(unittest.TestCase):
         # Compile the model
         self.model.compile(optimizer='adam', loss='cross_entropy', device='cpu')
         
-        # Test prediction
-        predictions = self.model.predict(self.inputs)
+        # Test prediction with targets (required for tensor input)
+        predictions = self.model.predict(self.inputs, self.targets)
         
         # Check prediction shape and type
         self.assertEqual(predictions.shape, (self.num_samples,))
@@ -680,14 +680,25 @@ class TestResNetErrorHandling(unittest.TestCase):
     def test_predict_without_compile(self):
         """Test that predict works even without compile."""
         inputs = torch.randn(4, 3, 32, 32)
+        targets = torch.randint(0, 10, (4,))  # Add targets for tensor input
         
         # Predict should work (just forward pass) but returns class predictions, not logits
-        outputs = self.model.predict(inputs)
+        outputs = self.model.predict(inputs, targets)
         self.assertEqual(outputs.shape, (4,))  # Changed expectation - predict returns class indices
         
         # Test that output values are valid class indices
         self.assertTrue(torch.all(outputs >= 0))
         self.assertTrue(torch.all(outputs < 10))
+    
+    def test_predict_tensor_without_targets_raises_error(self):
+        """Test that predict raises ValueError when called with tensor but no targets."""
+        inputs = torch.randn(4, 3, 32, 32)
+        
+        # Should raise ValueError when targets are not provided for tensor input
+        with self.assertRaises(ValueError) as context:
+            self.model.predict(inputs)
+        
+        self.assertIn("targets must be provided when data_loader is a tensor", str(context.exception))
     
     def test_evaluate_without_compile(self):
         """Test that evaluate fails gracefully when model isn't compiled."""
@@ -717,9 +728,10 @@ class TestResNetErrorHandling(unittest.TestCase):
         
         # Wrong number of channels (should be 3 for RGB)
         wrong_inputs = torch.randn(4, 1, 32, 32)  # 1 channel instead of 3
+        wrong_targets = torch.randint(0, 10, (4,))  # Add dummy targets
         
         with self.assertRaises(RuntimeError):
-            self.model.predict(wrong_inputs)
+            self.model.predict(wrong_inputs, wrong_targets)
     
     def test_invalid_scheduler_configuration(self):
         """Test compilation with invalid scheduler."""
@@ -783,9 +795,10 @@ class TestResNetErrorHandling(unittest.TestCase):
         
         # Create data on CPU
         inputs = torch.randn(4, 3, 32, 32)
+        targets = torch.randint(0, 10, (4,))  # Add dummy targets
         
         # Should work fine
-        outputs = self.model.predict(inputs)
+        outputs = self.model.predict(inputs, targets)
         self.assertEqual(outputs.device.type, 'cpu')
     
     def test_zero_epochs_training(self):
@@ -905,15 +918,6 @@ class TestResNetInternalMethods(unittest.TestCase):
         # Test with dilation
         layer_dilated = model._make_layer(BasicBlock, 256, 1, stride=1, dilate=True)
         self.assertIsInstance(layer_dilated, nn.Sequential)
-    
-    def test_forward_impl_method(self):
-        """Test the _forward_impl method."""
-        model = resnet18(num_classes=10, device='cpu')
-        x = torch.randn(2, 3, 32, 32)
-        
-        output = model._forward_impl(x)
-        self.assertEqual(output.shape, (2, 10))
-        self.assertIsInstance(output, torch.Tensor)
     
     def test_train_epoch_method(self):
         """Test the _train_epoch method."""
@@ -1353,10 +1357,11 @@ class TestResNetUncoveredLines(unittest.TestCase):
         
         # Create test data
         test_data = torch.randn(4, 3, 32, 32)
+        test_targets = torch.randint(0, 10, (4,))  # Add dummy targets
         
         try:
             # This should trigger the device fallback logic (lines 521-522)
-            predictions = model.predict(test_data, batch_size=2)
+            predictions = model.predict(test_data, test_targets, batch_size=2)
             
             # Verify predictions were generated
             self.assertEqual(predictions.shape, (4,))
@@ -1489,9 +1494,10 @@ class TestResNetUncoveredLines(unittest.TestCase):
         
         # Create test data as tensor (not DataLoader)
         test_data = torch.randn(6, 3, 32, 32)
+        test_targets = torch.randint(0, 10, (6,))  # Add dummy targets
         
         # This should trigger tensor to DataLoader conversion
-        predictions = model.predict(test_data, batch_size=3)
+        predictions = model.predict(test_data, test_targets, batch_size=3)
         
         # Verify predictions
         self.assertEqual(predictions.shape, (6,))

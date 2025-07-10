@@ -5,7 +5,8 @@ from torch.utils.data import DataLoader
 # Modern dual-channel dataset (recommended approach)
 from .dual_channel_dataset import (
     DualChannelDataset,
-    create_dual_channel_dataloaders
+    create_dual_channel_dataloaders,
+    create_dual_channel_dataloader
 )
 
 # Collate function for multi-stream data (legacy support)
@@ -37,7 +38,8 @@ __all__ = [
     # Modern dual-channel dataset
     'DualChannelDataset',
     'create_dual_channel_dataloaders',
-    
+    'create_dual_channel_dataloader',
+
     # Legacy support
     'collate_with_streams',
     

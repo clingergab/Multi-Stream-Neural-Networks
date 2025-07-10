@@ -192,6 +192,18 @@ class MCSequential(Module):
             color_input, brightness_input = module(color_input, brightness_input)
         return color_input, brightness_input
 
+    def forward_color(self, color_input):
+        """Forward pass through color pathway only."""
+        for module in self:
+            color_input = module.forward_color(color_input)
+        return color_input
+    
+    def forward_brightness(self, brightness_input):
+        """Forward pass through brightness pathway only."""
+        for module in self:
+            brightness_input = module.forward_brightness(brightness_input)
+        return brightness_input
+
     def append(self, module: Module) -> "MCSequential":
         r"""Append a given module to the end.
 

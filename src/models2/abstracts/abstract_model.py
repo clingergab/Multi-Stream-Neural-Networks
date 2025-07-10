@@ -62,8 +62,10 @@ class BaseModel(nn.Module, ABC):
         # Norm layer setup
         self._norm_layer = norm_layer  # store as _norm_layer for ResNet compatibility
         
-        # Initialize internal parameters
-        self.inplanes = 64  # Standard ResNet starting planes
+        # Initialize internal parameters - always dual-channel tracking
+        self.color_inplanes = 64
+        self.brightness_inplanes = 64
+        
         self.dilation = 1   # Standard ResNet starting dilation
         
         # Process replace_stride_with_dilation parameter like PyTorch does (but don't store)

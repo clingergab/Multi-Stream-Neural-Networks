@@ -23,7 +23,7 @@ class _MCConvNd(nn.Module):
     
     __constants__ = [
         "stride", "padding", "dilation", "groups", "padding_mode",
-        "color_in_channels", "brightness_in_channels", "out_channels", "kernel_size",
+        "color_in_channels", "brightness_in_channels", "color_out_channels", "brightness_out_channels", "kernel_size",
     ]
     __annotations__ = {
         "color_bias": Optional[torch.Tensor],
@@ -38,7 +38,8 @@ class _MCConvNd(nn.Module):
     
     color_in_channels: int
     brightness_in_channels: int
-    out_channels: int
+    color_out_channels: int
+    brightness_out_channels: int
     kernel_size: tuple[int, ...]
     stride: tuple[int, ...]
     padding: Union[str, tuple[int, ...]]
@@ -54,7 +55,8 @@ class _MCConvNd(nn.Module):
         self,
         color_in_channels: int,
         brightness_in_channels: int,
-        out_channels: int,
+        color_out_channels: int,
+        brightness_out_channels: int,
         kernel_size: tuple[int, ...],
         stride: tuple[int, ...],
         padding: Union[str, tuple[int, ...]],
@@ -75,8 +77,10 @@ class _MCConvNd(nn.Module):
             raise ValueError("color_in_channels must be divisible by groups")
         if brightness_in_channels % groups != 0:
             raise ValueError("brightness_in_channels must be divisible by groups")
-        if out_channels % groups != 0:
-            raise ValueError("out_channels must be divisible by groups")
+        if color_out_channels % groups != 0:
+            raise ValueError("color_out_channels must be divisible by groups")
+        if brightness_out_channels % groups != 0:
+            raise ValueError("brightness_out_channels must be divisible by groups")
         
         valid_padding_strings = {"same", "valid"}
         if isinstance(padding, str):
@@ -98,7 +102,8 @@ class _MCConvNd(nn.Module):
         # Store parameters
         self.color_in_channels = color_in_channels
         self.brightness_in_channels = brightness_in_channels
-        self.out_channels = out_channels
+        self.color_out_channels = color_out_channels
+        self.brightness_out_channels = brightness_out_channels
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
@@ -109,21 +114,21 @@ class _MCConvNd(nn.Module):
         # Create weight parameters for both pathways
         self.color_weight = Parameter(
             torch.empty(
-                (out_channels, color_in_channels // groups, *kernel_size),
+                (color_out_channels, color_in_channels // groups, *kernel_size),
                 **factory_kwargs,
             )
         )
         self.brightness_weight = Parameter(
             torch.empty(
-                (out_channels, brightness_in_channels // groups, *kernel_size),
+                (brightness_out_channels, brightness_in_channels // groups, *kernel_size),
                 **factory_kwargs,
             )
         )
         
         # Create bias parameters for both pathways
         if bias:
-            self.color_bias = Parameter(torch.empty(out_channels, **factory_kwargs))
-            self.brightness_bias = Parameter(torch.empty(out_channels, **factory_kwargs))
+            self.color_bias = Parameter(torch.empty(color_out_channels, **factory_kwargs))
+            self.brightness_bias = Parameter(torch.empty(brightness_out_channels, **factory_kwargs))
         else:
             self.register_parameter("color_bias", None)
             self.register_parameter("brightness_bias", None)
@@ -180,7 +185,8 @@ class _MCConvNd(nn.Module):
         """String representation exactly like _ConvNd."""
         s = (
             "color_in_channels={color_in_channels}, brightness_in_channels={brightness_in_channels}, "
-            "out_channels={out_channels}, kernel_size={kernel_size}, stride={stride}"
+            "color_out_channels={color_out_channels}, brightness_out_channels={brightness_out_channels}, "
+            "kernel_size={kernel_size}, stride={stride}"
         )
         if self.padding != (0,) * len(self.padding):
             s += ", padding={padding}"
@@ -207,7 +213,8 @@ class MCConv2d(_MCConvNd):
         self,
         color_in_channels: int,
         brightness_in_channels: int,
-        out_channels: int,
+        color_out_channels: int,
+        brightness_out_channels: int,
         kernel_size: _size_2_t,
         stride: _size_2_t = 1,
         padding: Union[str, _size_2_t] = 0,
@@ -226,7 +233,8 @@ class MCConv2d(_MCConvNd):
         super().__init__(
             color_in_channels,
             brightness_in_channels,
-            out_channels,
+            color_out_channels,
+            brightness_out_channels,
             kernel_size_,
             stride_,
             padding_,
@@ -326,8 +334,9 @@ class _MCNormBase(nn.Module):
     """Common base for Multi-Channel normalization - follows PyTorch's _NormBase pattern exactly."""
     
     _version = 2
-    __constants__ = ["track_running_stats", "momentum", "eps", "num_features", "affine"]
-    num_features: int
+    __constants__ = ["track_running_stats", "momentum", "eps", "color_num_features", "brightness_num_features", "affine"]
+    color_num_features: int
+    brightness_num_features: int
     eps: float
     momentum: Optional[float]
     affine: bool
@@ -337,7 +346,8 @@ class _MCNormBase(nn.Module):
     
     def __init__(
         self,
-        num_features: int,
+        color_num_features: int,
+        brightness_num_features: int,
         eps: float = 1e-5,
         momentum: Optional[float] = 0.1,
         affine: bool = True,
@@ -347,7 +357,8 @@ class _MCNormBase(nn.Module):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.num_features = num_features
+        self.color_num_features = color_num_features
+        self.brightness_num_features = brightness_num_features
         self.eps = eps
         self.momentum = momentum
         self.affine = affine
@@ -355,10 +366,10 @@ class _MCNormBase(nn.Module):
         
         # Create parameters for both pathways - exactly like _NormBase but dual
         if self.affine:
-            self.color_weight = Parameter(torch.empty(num_features, **factory_kwargs))
-            self.color_bias = Parameter(torch.empty(num_features, **factory_kwargs))
-            self.brightness_weight = Parameter(torch.empty(num_features, **factory_kwargs))
-            self.brightness_bias = Parameter(torch.empty(num_features, **factory_kwargs))
+            self.color_weight = Parameter(torch.empty(color_num_features, **factory_kwargs))
+            self.color_bias = Parameter(torch.empty(color_num_features, **factory_kwargs))
+            self.brightness_weight = Parameter(torch.empty(brightness_num_features, **factory_kwargs))
+            self.brightness_bias = Parameter(torch.empty(brightness_num_features, **factory_kwargs))
         else:
             self.register_parameter("color_weight", None)
             self.register_parameter("color_bias", None)
@@ -368,16 +379,16 @@ class _MCNormBase(nn.Module):
         # Create buffers for both pathways - exactly like _NormBase but dual
         if self.track_running_stats:
             # Color pathway buffers
-            self.register_buffer("color_running_mean", torch.zeros(num_features, **factory_kwargs))
-            self.register_buffer("color_running_var", torch.ones(num_features, **factory_kwargs))
+            self.register_buffer("color_running_mean", torch.zeros(color_num_features, **factory_kwargs))
+            self.register_buffer("color_running_var", torch.ones(color_num_features, **factory_kwargs))
             self.color_running_mean: Optional[Tensor]
             self.color_running_var: Optional[Tensor]
             self.register_buffer("color_num_batches_tracked", torch.tensor(0, dtype=torch.long, **{k: v for k, v in factory_kwargs.items() if k != "dtype"}))
             self.color_num_batches_tracked: Optional[Tensor]
             
             # Brightness pathway buffers
-            self.register_buffer("brightness_running_mean", torch.zeros(num_features, **factory_kwargs))
-            self.register_buffer("brightness_running_var", torch.ones(num_features, **factory_kwargs))
+            self.register_buffer("brightness_running_mean", torch.zeros(brightness_num_features, **factory_kwargs))
+            self.register_buffer("brightness_running_var", torch.ones(brightness_num_features, **factory_kwargs))
             self.brightness_running_mean: Optional[Tensor]
             self.brightness_running_var: Optional[Tensor]
             self.register_buffer("brightness_num_batches_tracked", torch.tensor(0, dtype=torch.long, **{k: v for k, v in factory_kwargs.items() if k != "dtype"}))
@@ -397,6 +408,9 @@ class _MCNormBase(nn.Module):
         self.running_mean = self.color_running_mean if track_running_stats else None
         self.running_var = self.color_running_var if track_running_stats else None
         self.num_batches_tracked = self.color_num_batches_tracked if track_running_stats else None
+        
+        # For backward compatibility, expose num_features as color_num_features
+        self.num_features = self.color_num_features
         
         self.reset_parameters()
     
@@ -427,9 +441,10 @@ class _MCNormBase(nn.Module):
         raise NotImplementedError
     
     def extra_repr(self):
-        """String representation - exactly like _NormBase."""
+        """String representation - updated for dual channels."""
         return (
-            "{num_features}, eps={eps}, momentum={momentum}, affine={affine}, "
+            "color_num_features={color_num_features}, brightness_num_features={brightness_num_features}, "
+            "eps={eps}, momentum={momentum}, affine={affine}, "
             "track_running_stats={track_running_stats}".format(**self.__dict__)
         )
     
@@ -477,7 +492,8 @@ class _MCBatchNorm(_MCNormBase):
     
     def __init__(
         self,
-        num_features: int,
+        color_num_features: int,
+        brightness_num_features: int,
         eps: float = 1e-5,
         momentum: Optional[float] = 0.1,
         affine: bool = True,
@@ -487,7 +503,7 @@ class _MCBatchNorm(_MCNormBase):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
-            num_features, eps, momentum, affine, track_running_stats, **factory_kwargs
+            color_num_features, brightness_num_features, eps, momentum, affine, track_running_stats, **factory_kwargs
         )
     
     def forward(self, color_input: Tensor, brightness_input: Tensor) -> tuple[Tensor, Tensor]:
@@ -519,6 +535,30 @@ class _MCBatchNorm(_MCNormBase):
         )
         
         return color_out, brightness_out
+    
+    def forward_color(self, color_input: Tensor) -> Tensor:
+        """Forward pass through color pathway only."""
+        self._check_input_dim(color_input)
+        return self._forward_single_pathway(
+            color_input,
+            self.color_running_mean,
+            self.color_running_var,
+            self.color_weight,
+            self.color_bias,
+            self.color_num_batches_tracked,
+        )
+    
+    def forward_brightness(self, brightness_input: Tensor) -> Tensor:
+        """Forward pass through brightness pathway only."""
+        self._check_input_dim(brightness_input)
+        return self._forward_single_pathway(
+            brightness_input,
+            self.brightness_running_mean,
+            self.brightness_running_var,
+            self.brightness_weight,
+            self.brightness_bias,
+            self.brightness_num_batches_tracked,
+        )
     
     def _forward_single_pathway(
         self,

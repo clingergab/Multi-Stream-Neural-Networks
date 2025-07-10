@@ -522,13 +522,14 @@ class ResNet(nn.Module):
         
         return history
     
-    def predict(self, data_loader: Union[torch.utils.data.DataLoader, torch.Tensor], 
-                batch_size: int = 32) -> torch.Tensor:
+    def predict(self, data_loader: Optional[Union[torch.utils.data.DataLoader, torch.Tensor]] = None, 
+                targets: Optional[torch.Tensor] = None, batch_size: int = 32) -> torch.Tensor:
         """
         Generate predictions for the input data.
         
         Args:
             data_loader: DataLoader containing input data OR tensor of input data
+            targets: Target tensor (required when data_loader is a tensor)
             batch_size: Batch size (used when creating DataLoader from tensor)
             
         Returns:
@@ -540,8 +541,10 @@ class ResNet(nn.Module):
         
         # Handle tensor input by converting to DataLoader
         if isinstance(data_loader, torch.Tensor):
+            if targets is None:
+                raise ValueError("targets must be provided when data_loader is a tensor")
             data_loader = create_dataloader_from_tensors(
-                data_loader, batch_size=batch_size, shuffle=False, device=self.device
+                data_loader, targets, batch_size=batch_size, shuffle=False, device=self.device
             )
         
         self.eval()
