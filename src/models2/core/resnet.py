@@ -7,8 +7,8 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 from torch.optim import Adam, SGD, AdamW
 from torch.optim.lr_scheduler import OneCycleLR
-from src.training.losses import FocalLoss
-from src.models2.common import (
+from training.losses import FocalLoss
+from models2.common import (
     setup_scheduler,
     update_scheduler,
     save_checkpoint,

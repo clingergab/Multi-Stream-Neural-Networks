@@ -9,7 +9,7 @@ from unittest.mock import patch, mock_open, MagicMock
 import tempfile
 import os
 
-from src.data_utils.dataset_utils import (
+from data_utils.dataset_utils import (
     _load_cifar100_pickle,
     load_cifar100_data,
     CIFAR100_FINE_LABELS
@@ -94,7 +94,7 @@ class TestLoadCIFAR100Data:
         
         return train_data, test_data
     
-    @patch('src.data_utils.dataset_utils._load_cifar100_pickle')
+    @patch('data_utils.dataset_utils._load_cifar100_pickle')
     @patch('pathlib.Path.exists')
     def test_load_torch_format(self, mock_exists, mock_load_pickle, mock_cifar100_data):
         """Test loading data in torch format."""
@@ -135,7 +135,7 @@ class TestLoadCIFAR100Data:
         assert torch.all(test_X >= 0.0)
         assert torch.all(test_X <= 1.0)
     
-    @patch('src.data_utils.dataset_utils._load_cifar100_pickle')
+    @patch('data_utils.dataset_utils._load_cifar100_pickle')
     @patch('pathlib.Path.exists')
     def test_load_numpy_format(self, mock_exists, mock_load_pickle, mock_cifar100_data):
         """Test loading data in numpy format."""
@@ -170,7 +170,7 @@ class TestLoadCIFAR100Data:
         assert test_X.dtype == np.float32
         assert test_y.dtype == np.int64
     
-    @patch('src.data_utils.dataset_utils._load_cifar100_pickle')
+    @patch('data_utils.dataset_utils._load_cifar100_pickle')
     @patch('pathlib.Path.exists')
     def test_load_without_normalization(self, mock_exists, mock_load_pickle, mock_cifar100_data):
         """Test loading data without normalization."""
@@ -208,7 +208,7 @@ class TestLoadCIFAR100Data:
         
         assert "CIFAR-100 data directory not found" in str(exc_info.value)
     
-    @patch('src.data_utils.dataset_utils._load_cifar100_pickle')
+    @patch('data_utils.dataset_utils._load_cifar100_pickle')
     @patch('pathlib.Path.exists')
     def test_load_with_string_path(self, mock_exists, mock_load_pickle, mock_cifar100_data):
         """Test loading with string path instead of Path object."""
@@ -228,7 +228,7 @@ class TestLoadCIFAR100Data:
         assert isinstance(train_X, torch.Tensor)
         assert train_X.shape == (100, 3, 32, 32)
     
-    @patch('src.data_utils.dataset_utils._load_cifar100_pickle')
+    @patch('data_utils.dataset_utils._load_cifar100_pickle')
     @patch('pathlib.Path.exists')
     def test_verbose_output(self, mock_exists, mock_load_pickle, mock_cifar100_data, capsys):
         """Test verbose output."""
@@ -248,7 +248,7 @@ class TestLoadCIFAR100Data:
         assert "Training:" in captured.out
         assert "Test:" in captured.out
 
-    @patch('src.data_utils.dataset_utils._load_cifar100_pickle')
+    @patch('data_utils.dataset_utils._load_cifar100_pickle')
     @patch('pathlib.Path.exists')
     def test_data_shapes_and_values(self, mock_exists, mock_load_pickle):
         """Test that data is properly reshaped and processed."""
@@ -353,7 +353,7 @@ class TestCIFAR100FineLabels:
 class TestIntegration:
     """Integration tests for the entire module."""
     
-    @patch('src.data_utils.dataset_utils._load_cifar100_pickle')
+    @patch('data_utils.dataset_utils._load_cifar100_pickle')
     @patch('pathlib.Path.exists')
     def test_full_pipeline_torch(self, mock_exists, mock_load_pickle):
         """Test the full data loading pipeline with torch format."""
@@ -399,7 +399,7 @@ class TestIntegration:
         assert torch.all(train_y >= 0) and torch.all(train_y < 100)
         assert torch.all(test_y >= 0) and torch.all(test_y < 100)
     
-    @patch('src.data_utils.dataset_utils._load_cifar100_pickle')
+    @patch('data_utils.dataset_utils._load_cifar100_pickle')
     @patch('pathlib.Path.exists')
     def test_full_pipeline_numpy(self, mock_exists, mock_load_pickle):
         """Test the full data loading pipeline with numpy format."""

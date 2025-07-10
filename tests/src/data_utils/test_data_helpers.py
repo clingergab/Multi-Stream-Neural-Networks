@@ -6,7 +6,7 @@ import numpy as np
 from unittest.mock import MagicMock, patch
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.data_utils.data_helpers import (
+from data_utils.data_helpers import (
     calculate_dataset_stats,
     get_class_weights
 )

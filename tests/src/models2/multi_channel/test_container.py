@@ -12,9 +12,9 @@ from collections import OrderedDict
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent.parent.parent.parent / "src"))
 
-from src.models2.multi_channel.container import MCSequential
-from src.models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
-from src.models2.multi_channel.blocks import MCBasicBlock
+from models2.multi_channel.container import MCSequential
+from models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
+from models2.multi_channel.blocks import MCBasicBlock
 
 
 class MockMCModule(nn.Module):

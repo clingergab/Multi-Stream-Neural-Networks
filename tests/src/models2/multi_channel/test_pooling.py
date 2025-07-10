@@ -11,7 +11,7 @@ from pathlib import Path
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent.parent.parent.parent / "src"))
 
-from src.models2.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
+from models2.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
 
 
 class TestMCMaxPool2d(unittest.TestCase):
@@ -338,7 +338,7 @@ class TestPoolingLayersIntegration(unittest.TestCase):
     
     def test_maxpool_with_conv(self):
         """Test MCMaxPool2d integration with conv layers."""
-        from src.models2.multi_channel.conv import MCConv2d
+        from models2.multi_channel.conv import MCConv2d
         
         conv = MCConv2d(3, 1, 16, 16, kernel_size=3, padding=1)
         pool = MCMaxPool2d(kernel_size=2, stride=2)
@@ -356,7 +356,7 @@ class TestPoolingLayersIntegration(unittest.TestCase):
     
     def test_adaptive_pool_with_conv(self):
         """Test MCAdaptiveAvgPool2d integration with conv layers."""
-        from src.models2.multi_channel.conv import MCConv2d
+        from models2.multi_channel.conv import MCConv2d
         
         conv = MCConv2d(3, 1, 16, 16, kernel_size=3, padding=1)
         pool = MCAdaptiveAvgPool2d(1)  # Global average pooling

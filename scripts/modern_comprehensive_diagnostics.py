@@ -24,12 +24,12 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 try:
-    from src.models.basic_multi_channel.multi_channel_resnet_network import multi_channel_resnet50
-    from src.models.basic_multi_channel.base_multi_channel_network import base_multi_channel_large
-    from src.data_utils.dataset_utils import get_cifar100_datasets, create_validation_split
-    from src.data_utils.rgb_to_rgbl import process_dataset_to_streams
-    from src.data_utils.augmentation import create_augmented_dataloaders
-    from src.data_utils.rgb_to_rgbl import RGBtoRGBL
+    from models.basic_multi_channel.multi_channel_resnet_network import multi_channel_resnet50
+    from models.basic_multi_channel.base_multi_channel_network import base_multi_channel_large
+    from data_utils.dataset_utils import get_cifar100_datasets, create_validation_split
+    from data_utils.rgb_to_rgbl import process_dataset_to_streams
+    from data_utils.augmentation import create_augmented_dataloaders
+    from data_utils.rgb_to_rgbl import RGBtoRGBL
 except ImportError as e:
     print(f"Import error: {e}")
     print("Please make sure you're running this script from the project root directory.")

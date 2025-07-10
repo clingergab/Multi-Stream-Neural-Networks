@@ -26,23 +26,26 @@ from typing import Dict, List, Tuple, Any
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# Add project root to path to ensure imports work
+# Add project root and src to path to ensure imports work
 project_root = str(Path(__file__).resolve().parent.parent)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
+src_path = str(Path(project_root) / 'src')
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
 
 # Import after sys.path is updated
 try:
-    from src.models.basic_multi_channel.multi_channel_resnet_network import multi_channel_resnet50
-    from src.models.basic_multi_channel.base_multi_channel_network import base_multi_channel_large
-    from src.data_utils.dataset_utils import get_cifar100_datasets
-    from src.data_utils.rgb_to_rgbl import RGBtoRGBL
-    from src.utils.debug_utils import (
+    from models.basic_multi_channel.multi_channel_resnet_network import multi_channel_resnet50
+    from models.basic_multi_channel.base_multi_channel_network import base_multi_channel_large
+    from data_utils.dataset_utils import get_cifar100_datasets
+    from data_utils.rgb_to_rgbl import RGBtoRGBL
+    from utils.debug_utils import (
         analyze_gradient_flow, 
         analyze_parameter_magnitudes,
         add_diagnostic_hooks
     )
-    from src.utils.early_stopping import EarlyStopping
+    from utils.early_stopping import EarlyStopping
 except ImportError as e:
     print(f"Import error: {e}")
     print("Please make sure you're running this script from the project root directory.")

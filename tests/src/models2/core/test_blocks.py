@@ -10,8 +10,8 @@ from pathlib import Path
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent.parent.parent.parent / "src"))
 
-from src.models2.core.blocks import BasicBlock, Bottleneck
-from src.models2.core.conv import conv1x1, conv3x3
+from models2.core.blocks import BasicBlock, Bottleneck
+from models2.core.conv import conv1x1, conv3x3
 
 
 class TestBasicBlock(unittest.TestCase):

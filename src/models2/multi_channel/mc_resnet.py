@@ -9,14 +9,14 @@ import numpy as np
 if TYPE_CHECKING:
     from tqdm import tqdm as TqdmType
 
-from src.models2.abstracts.abstract_model import BaseModel
+from models2.abstracts.abstract_model import BaseModel
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
-from src.data_utils.dual_channel_dataset import DualChannelDataset, create_dual_channel_dataloaders, create_dual_channel_dataloader 
-from src.models2.common import (
+from data_utils.dual_channel_dataset import DualChannelDataset, create_dual_channel_dataloaders, create_dual_channel_dataloader 
+from models2.common import (
     setup_scheduler,
     update_scheduler,
     save_checkpoint,
@@ -44,10 +44,10 @@ except:
     from tqdm import tqdm
 
 # Import the multi-channel components
-from src.models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
-from src.models2.multi_channel.blocks import MCBasicBlock, MCBottleneck
-from src.models2.multi_channel.container import MCSequential
-from src.models2.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
+from models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
+from models2.multi_channel.blocks import MCBasicBlock, MCBottleneck
+from models2.multi_channel.container import MCSequential
+from models2.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
 
 
 class MCResNet(BaseModel):

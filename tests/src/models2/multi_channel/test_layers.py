@@ -25,11 +25,11 @@ class TestMultiChannelLayersPlaceholder(unittest.TestCase):
     def test_imports_work(self):
         """Test that all multi-channel modules can be imported."""
         try:
-            from src.models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
-            from src.models2.multi_channel.blocks import MCBasicBlock, MCBottleneck, mc_conv3x3, mc_conv1x1
-            from src.models2.multi_channel.container import MCSequential
-            from src.models2.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
-            from src.models2.multi_channel.mc_resnet import MCResNet, mc_resnet18
+            from models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
+            from models2.multi_channel.blocks import MCBasicBlock, MCBottleneck, mc_conv3x3, mc_conv1x1
+            from models2.multi_channel.container import MCSequential
+            from models2.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
+            from models2.multi_channel.mc_resnet import MCResNet, mc_resnet18
             
             # If we get here, all imports worked
             self.assertTrue(True)

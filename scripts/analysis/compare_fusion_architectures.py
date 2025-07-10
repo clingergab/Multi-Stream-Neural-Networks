@@ -10,7 +10,7 @@ import os
 # Add project root to path
 sys.path.append('/Users/gclinger/Documents/projects/Multi-Stream-Neural-Networks')
 
-from src.models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork
+from models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork
 
 def count_parameters(model):
     """Count total parameters in a model."""

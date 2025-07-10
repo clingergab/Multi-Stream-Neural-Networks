@@ -12,9 +12,9 @@ from pathlib import Path
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent.parent.parent.parent / "src"))
 
-from src.models2.multi_channel.blocks import MCBasicBlock, MCBottleneck, mc_conv3x3, mc_conv1x1
-from src.models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
-from src.models2.multi_channel.container import MCSequential
+from models2.multi_channel.blocks import MCBasicBlock, MCBottleneck, mc_conv3x3, mc_conv1x1
+from models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
+from models2.multi_channel.container import MCSequential
 
 
 class TestMCBasicBlock(unittest.TestCase):

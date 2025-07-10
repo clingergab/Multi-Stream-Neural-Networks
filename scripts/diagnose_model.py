@@ -24,11 +24,11 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # Import after sys.path is updated
-from src.models.basic_multi_channel.multi_channel_resnet_network import MultiChannelResNetNetwork
-from src.models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork
-from src.data_utils.dataset_utils import get_cifar100_datasets
-from src.data_utils.rgb_to_rgbl import RGBtoRGBL
-from src.utils.debug_utils import (
+from models.basic_multi_channel.multi_channel_resnet_network import MultiChannelResNetNetwork
+from models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork
+from data_utils.dataset_utils import get_cifar100_datasets
+from data_utils.rgb_to_rgbl import RGBtoRGBL
+from utils.debug_utils import (
     analyze_gradient_flow, 
     analyze_parameter_magnitudes,
     debug_forward_pass,

@@ -13,9 +13,9 @@ from unittest.mock import patch, MagicMock
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent.parent.parent.parent / "src"))
 
-from src.models2.multi_channel.mc_resnet import MCResNet
-from src.models2.multi_channel.blocks import MCBasicBlock, MCBottleneck
-from src.data_utils.dual_channel_dataset import create_dual_channel_dataloader
+from models2.multi_channel.mc_resnet import MCResNet
+from models2.multi_channel.blocks import MCBasicBlock, MCBottleneck
+from data_utils.dual_channel_dataset import create_dual_channel_dataloader
 
 
 class TestMCResNet(unittest.TestCase):
@@ -66,9 +66,9 @@ class TestMCResNet(unittest.TestCase):
         self.assertTrue(hasattr(self.model, 'fc'))
         
         # Test layer types
-        from src.models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
-        from src.models2.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
-        from src.models2.multi_channel.container import MCSequential
+        from models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
+        from models2.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
+        from models2.multi_channel.container import MCSequential
         
         self.assertIsInstance(self.model.conv1, MCConv2d)
         self.assertIsInstance(self.model.bn1, MCBatchNorm2d)
@@ -181,7 +181,7 @@ class TestMCResNet(unittest.TestCase):
         # Test focal loss  
         try:
             self.model.compile(optimizer='adam', loss='focal', device='cpu', alpha=1.0, gamma=2.0)
-            from src.training.losses import FocalLoss
+            from training.losses import FocalLoss
             self.assertIsInstance(self.model.criterion, FocalLoss)
         except Exception as e:
             self.fail(f"MCResNet should support focal loss but got error: {e}")
@@ -1003,7 +1003,7 @@ class TestMCResNetHelperFunctions(unittest.TestCase):
     
     def test_mc_resnet18(self):
         """Test mc_resnet18 helper function."""
-        from src.models2.multi_channel.mc_resnet import mc_resnet18
+        from models2.multi_channel.mc_resnet import mc_resnet18
         
         # Test basic creation with explicit device
         model = mc_resnet18(num_classes=10, device='cpu')
@@ -1028,7 +1028,7 @@ class TestMCResNetHelperFunctions(unittest.TestCase):
     
     def test_mc_resnet18_with_kwargs(self):
         """Test mc_resnet18 with additional keyword arguments."""
-        from src.models2.multi_channel.mc_resnet import mc_resnet18
+        from models2.multi_channel.mc_resnet import mc_resnet18
         
         # Test with device argument
         model = mc_resnet18(num_classes=5, device='cpu')
@@ -1039,7 +1039,7 @@ class TestMCResNetHelperFunctions(unittest.TestCase):
     
     def test_mc_resnet18_default_classes(self):
         """Test mc_resnet18 with default number of classes."""
-        from src.models2.multi_channel.mc_resnet import mc_resnet18
+        from models2.multi_channel.mc_resnet import mc_resnet18
         
         model = mc_resnet18()
         
@@ -1053,17 +1053,17 @@ class TestMCResNetImports(unittest.TestCase):
     
     def test_import_mcresnet(self):
         """Test that MCResNet can be imported."""
-        from src.models2.multi_channel.mc_resnet import MCResNet
+        from models2.multi_channel.mc_resnet import MCResNet
         self.assertTrue(callable(MCResNet))
     
     def test_import_helper_functions(self):
         """Test that helper functions can be imported."""
-        from src.models2.multi_channel.mc_resnet import mc_resnet18
+        from models2.multi_channel.mc_resnet import mc_resnet18
         self.assertTrue(callable(mc_resnet18))
     
     def test_import_blocks(self):
         """Test that block classes can be imported."""
-        from src.models2.multi_channel.mc_resnet import MCBasicBlock, MCBottleneck
+        from models2.multi_channel.mc_resnet import MCBasicBlock, MCBottleneck
         self.assertTrue(callable(MCBasicBlock))
         self.assertTrue(callable(MCBottleneck))
     
@@ -1180,7 +1180,7 @@ class TestMCResNetSpecialCases(unittest.TestCase):
     
     def test_custom_norm_layer(self):
         """Test MCResNet with custom normalization layer."""
-        from src.models2.multi_channel.conv import MCBatchNorm2d
+        from models2.multi_channel.conv import MCBatchNorm2d
         
         model = MCResNet(
             block=MCBasicBlock,
@@ -1199,7 +1199,7 @@ class TestMCResNetSpecialCases(unittest.TestCase):
         output = model(color_input, brightness_input)
         self.assertEqual(output.shape, (2, 10))
     
-    @patch('src.models2.multi_channel.mc_resnet.get_ipython')
+    @patch('models2.multi_channel.mc_resnet.get_ipython')
     def test_tqdm_import_jupyter_environment(self, mock_get_ipython):
         """Test tqdm import in Jupyter environment."""
         # Mock Jupyter environment
@@ -1217,7 +1217,7 @@ class TestMCResNetSpecialCases(unittest.TestCase):
         )
         self.assertIsInstance(model, MCResNet)
     
-    @patch('src.models2.multi_channel.mc_resnet.get_ipython')
+    @patch('models2.multi_channel.mc_resnet.get_ipython')
     def test_tqdm_import_exception_handling(self, mock_get_ipython):
         """Test tqdm import exception handling."""
         # Mock an exception during IPython detection

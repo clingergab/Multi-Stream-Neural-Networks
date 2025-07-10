@@ -8,8 +8,8 @@ import sys
 
 sys.path.append(str(Path(__file__).parent.parent / "src"))
 
-from src.data_utils import DualChannelDataset
-from src.data_utils.data_helpers import DataHelper, split_dataset
+from data_utils import DualChannelDataset
+from data_utils.data_helpers import DataHelper, split_dataset
 
 
 def main():

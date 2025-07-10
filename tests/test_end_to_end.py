@@ -14,11 +14,11 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import our utilities and models
-from src.data_utils.dataset_utils import load_cifar100_numpy
-from src.models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork
-from src.models.basic_multi_channel.multi_channel_resnet_network import MultiChannelResNetNetwork
-from src.data_utils.rgb_to_rgbl import RGBtoRGBL
-from src.data_utils.rgb_to_rgbl import process_dataset_to_streams
+from data_utils.dataset_utils import load_cifar100_numpy
+from models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork
+from models.basic_multi_channel.multi_channel_resnet_network import MultiChannelResNetNetwork
+from data_utils.rgb_to_rgbl import RGBtoRGBL
+from data_utils.rgb_to_rgbl import process_dataset_to_streams
 from torch.utils.data import TensorDataset
 
 # This function is no longer needed as we use process_dataset_to_streams instead

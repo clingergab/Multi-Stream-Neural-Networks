@@ -12,7 +12,7 @@ import numpy as np
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.models.builders.model_factory import create_model
+from models.builders.model_factory import create_model
 
 def analyze_model_bottlenecks():
     """Comprehensive analysis of ResNet model for bottlenecks."""

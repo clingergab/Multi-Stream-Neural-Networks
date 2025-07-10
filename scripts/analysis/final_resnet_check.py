@@ -10,7 +10,7 @@ import torch.nn as nn
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.models.builders.model_factory import create_model
+from models.builders.model_factory import create_model
 
 def quick_resnet_analysis():
     """Quick analysis focusing on key implementation aspects."""

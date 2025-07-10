@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 from torch.utils.data import TensorDataset
 from PIL import Image
 
-from src.data_utils.rgb_to_rgbl import (
+from data_utils.rgb_to_rgbl import (
     RGBtoRGBL,
     create_rgbl_transform,
     collate_with_streams,
@@ -383,13 +383,13 @@ class TestProcessDatasetToStreams:
         
         assert "Batch size must be positive" in str(exc_info.value)
     
-    @patch('src.data_utils.rgb_to_rgbl.tqdm')
+    @patch('data_utils.rgb_to_rgbl.tqdm')
     def test_process_with_progress_bar(self, mock_tqdm, sample_dataset):
         """Test that progress bar is used correctly."""
         mock_tqdm.return_value = range(0, 10, 3)  # Mock the range iteration
         
         # Mock the actual tqdm to avoid issues
-        with patch('src.data_utils.rgb_to_rgbl.tqdm', return_value=range(0, 10, 3)):
+        with patch('data_utils.rgb_to_rgbl.tqdm', return_value=range(0, 10, 3)):
             try:
                 process_dataset_to_streams(sample_dataset, batch_size=3, desc="Test progress")
             except Exception:

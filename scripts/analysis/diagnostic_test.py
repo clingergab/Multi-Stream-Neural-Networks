@@ -11,8 +11,8 @@ import numpy as np
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.models.builders.model_factory import create_model
-from src.data_utils.rgb_to_rgbl import RGBtoRGBL
+from models.builders.model_factory import create_model
+from data_utils.rgb_to_rgbl import RGBtoRGBL
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Subset

@@ -14,10 +14,10 @@ from unittest.mock import patch, MagicMock
 # Add src to path
 sys.path.append(str(Path(__file__).parent.parent.parent.parent.parent / "src"))
 
-from src.models2.core.resnet import (
+from models2.core.resnet import (
     ResNet, resnet18, resnet34, resnet50, resnet101, resnet152
 )
-from src.models2.core.blocks import BasicBlock, Bottleneck
+from models2.core.blocks import BasicBlock, Bottleneck
 from torch.utils.data import DataLoader, TensorDataset
 
 
@@ -1314,7 +1314,7 @@ class TestResNetProgressBarHandling(unittest.TestCase):
         self.assertIn('train_loss', history)
         self.assertEqual(len(history['train_loss']), 1)
     
-    @patch('src.models2.core.resnet.tqdm')
+    @patch('models2.core.resnet.tqdm')
     def test_progress_bar_refresh_error_handling(self, mock_tqdm):
         """Test progress bar refresh error handling."""
         # Mock tqdm to raise an exception on refresh
