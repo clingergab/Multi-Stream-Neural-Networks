@@ -6,12 +6,7 @@ import unittest
 import torch
 import torch.nn as nn
 import numpy as np
-import sys
-from pathlib import Path
 from unittest.mock import patch, MagicMock
-
-# Add src to path
-sys.path.append(str(Path(__file__).parent.parent.parent.parent.parent / "src"))
 
 from models2.multi_channel.mc_resnet import MCResNet
 from models2.multi_channel.blocks import MCBasicBlock, MCBottleneck

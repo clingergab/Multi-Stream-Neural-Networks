@@ -2,13 +2,6 @@
 Comprehensive unit tests for model_helpers.py module.
 """
 
-import sys
-import os
-# Add the project root and src to sys.path so we can import from src
-project_root = os.path.join(os.path.dirname(__file__), '../../../../')
-sys.path.insert(0, project_root)
-sys.path.insert(0, os.path.join(project_root, 'src'))
-
 import pytest
 import torch
 import torch.nn as nn

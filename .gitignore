@@ -17,6 +17,11 @@ __pycache__/
 *$py.class
 .pytest_cache/
 
+# Package build artifacts
+*.egg-info/
+build/
+dist/
+
 # Jupyter notebook checkpoints
 .ipynb_checkpoints/
 
@@ -24,6 +29,8 @@ __pycache__/
 outputs/
 checkpoints/
 results/*.png
+results/mcresnet_baseline_grid_search/
+mcresnet_baseline_grid_search/
 diagnostics/
 
 # Environment and IDE files

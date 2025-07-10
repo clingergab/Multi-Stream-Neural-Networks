@@ -6,13 +6,9 @@ Consolidates all ResNet-related tests into a single file to mirror the source st
 import unittest
 import torch
 import torch.nn as nn
-import sys
-from pathlib import Path
 import tempfile
 import os
 from unittest.mock import patch, MagicMock
-# Add src to path
-sys.path.append(str(Path(__file__).parent.parent.parent.parent.parent / "src"))
 
 from models2.core.resnet import (
     ResNet, resnet18, resnet34, resnet50, resnet101, resnet152

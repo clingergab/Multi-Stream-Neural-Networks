@@ -4,9 +4,6 @@
 import argparse
 import os
 from pathlib import Path
-import sys
-
-sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 from data_utils import DualChannelDataset
 from data_utils.data_helpers import DataHelper, split_dataset

@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 import sys
+import argparse
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from pathlib import Path
@@ -21,9 +22,6 @@ from pathlib import Path
 from sklearn.model_selection import train_test_split
 import torch
 from torchvision import transforms
-
-# Add src to path
-sys.path.append(str(Path(__file__).parent.parent / "src"))
 
 try:
     from data_utils.dataset_utils import load_cifar100_data
@@ -42,7 +40,7 @@ class MCResNetBaselineGridSearch:
     """Baseline grid search for MCResNet hyperparameters."""
     
     def __init__(self, 
-                 results_dir: str = "mcresnet_baseline_grid_search",
+                 results_dir: str = "results/mcresnet_baseline_grid_search",
                  device: Optional[str] = None):
         """
         Initialize grid search.
@@ -53,6 +51,10 @@ class MCResNetBaselineGridSearch:
         """
         self.results_dir = results_dir
         os.makedirs(results_dir, exist_ok=True)
+        
+        # Generate single filename for this grid search run
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.results_filename = os.path.join(self.results_dir, f"baseline_grid_search_results_{timestamp}.json")
         
         # Auto-detect device if not provided
         if device is None:
@@ -69,26 +71,32 @@ class MCResNetBaselineGridSearch:
             self.device = device
             
         print(f"Using device: {self.device}")
+        print(f"Results will be saved to: {self.results_filename}")
     
-    def define_parameter_grid(self) -> Dict[str, List[Any]]:
-        """Define the baseline hyperparameter grid."""
+    def define_parameter_grid(self, 
+                             learning_rates: List[float] = None,
+                             batch_sizes: List[int] = None,
+                             optimizers: List[str] = None,
+                             weight_decays: List[float] = None,
+                             schedulers: List[str] = None) -> Dict[str, List[Any]]:
+        """Define the hyperparameter grid with optional custom values."""
         return {
-            'learning_rate': [0.001, 0.01],        # 2 options
-            'batch_size': [64, 128],               # 2 options  
-            'optimizer': ['sgd', 'adamw'],         # 2 options
-            'weight_decay': [1e-5, 1e-4],         # 2 options
-            'scheduler': ['cosine', 'step'],       # 2 options
+            'learning_rate': learning_rates or [0.001, 0.01],
+            'batch_size': batch_sizes or [64, 128],
+            'optimizer': optimizers or ['sgd', 'adamw'],
+            'weight_decay': weight_decays or [1e-5, 1e-4],
+            'scheduler': schedulers or ['cosine', 'oneCycle'],
         }
     
     
     def train_single_configuration(self, 
-                                   params: Dict[str, Any],
                                    train_rgb: torch.Tensor,
                                    train_brightness: torch.Tensor,
                                    train_labels: torch.Tensor,
                                    val_rgb: torch.Tensor,
                                    val_brightness: torch.Tensor,
-                                   val_labels: torch.Tensor) -> Dict[str, float]:
+                                   val_labels: torch.Tensor,
+                                   **params) -> Dict[str, Any]:
         """Train model with a single parameter configuration."""
         print(f"Training with parameters: {params}")
         
@@ -121,7 +129,7 @@ class MCResNetBaselineGridSearch:
                           scheduler=params['scheduler']
                           )
             
-            # Train model for 15 epochs with early stopping
+            # Train model for 20 epochs with early stopping
             print("Starting training...")
             history = model.fit(
                 train_loader=train_loader,
@@ -145,7 +153,7 @@ class MCResNetBaselineGridSearch:
             final_val_accuracy = history['val_accuracy'][-1]
             
             # Check if early stopping occurred
-            early_stopped = len(history['val_loss']) < 15
+            early_stopped = len(history['val_loss']) < 20
             early_stopping_info = history.get('early_stopping', {})
             
             return {
@@ -154,7 +162,7 @@ class MCResNetBaselineGridSearch:
                 'final_val_loss': final_val_loss,
                 'final_val_accuracy': final_val_accuracy,
                 'epochs_completed': len(history['val_loss']),
-                'converged': len(history['val_loss']) >= 15,
+                'converged': len(history['val_loss']) >= 20,
                 'early_stopped': early_stopped,
                 'early_stopping_info': early_stopping_info,
                 'training_history': {
@@ -187,9 +195,10 @@ class MCResNetBaselineGridSearch:
                         train_labels: torch.Tensor,
                         val_rgb: torch.Tensor,
                         val_brightness: torch.Tensor,
-                        val_labels: torch.Tensor) -> List[Dict[str, Any]]:
+                        val_labels: torch.Tensor,
+                        **grid_params) -> List[Dict[str, Any]]:
         """Run baseline grid search over all parameter combinations."""
-        param_grid = self.define_parameter_grid()
+        param_grid = self.define_parameter_grid(**grid_params)
         
         # Generate all combinations
         param_names = list(param_grid.keys())
@@ -197,8 +206,17 @@ class MCResNetBaselineGridSearch:
         combinations = list(itertools.product(*param_values))
         
         print(f"Running baseline grid search over {len(combinations)} combinations...")
-        print(f"Estimated time: ~{len(combinations) * 15 * 8 / 60:.1f} hours")
-        print(f"Results will be saved to: {self.results_dir}")
+        print(f"Estimated time: ~{len(combinations) * 20 * 8 / 60:.1f} hours")
+        
+        # Create run metadata
+        run_start_time = datetime.now()
+        run_metadata = {
+            'run_start_time': run_start_time.isoformat(),
+            'total_combinations': len(combinations),
+            'parameter_grid': param_grid,
+            'device': self.device,
+            'script_version': 'baseline_v1.0'
+        }
         
         results = []
         
@@ -213,8 +231,8 @@ class MCResNetBaselineGridSearch:
             # Train with this configuration
             start_time = datetime.now()
             metrics = self.train_single_configuration(
-                params, train_rgb, train_brightness, train_labels,
-                val_rgb, val_brightness, val_labels
+                train_rgb, train_brightness, train_labels,
+                val_rgb, val_brightness, val_labels, **params
             )
             end_time = datetime.now()
             
@@ -230,12 +248,12 @@ class MCResNetBaselineGridSearch:
             results.append(result)
             
             # Save intermediate results after each combination
-            self.save_results(results)
+            self.save_results(results, run_metadata)
             
             print(f"Completed in {result['duration_minutes']:.1f} minutes")
             print(f"Results: val_loss={metrics['final_val_loss']:.4f}, "
                   f"val_acc={metrics['final_val_accuracy']:.4f}")
-            print(f"Epochs: {metrics['epochs_completed']}/15, "
+            print(f"Epochs: {metrics['epochs_completed']}/20, "
                   f"Early stopped: {metrics.get('early_stopped', False)}")
             
             # Estimate remaining time
@@ -250,20 +268,28 @@ class MCResNetBaselineGridSearch:
         
         return results
     
-    def save_results(self, results: List[Dict[str, Any]]):
-        """Save results to JSON file."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(self.results_dir, f"baseline_grid_search_results_{timestamp}.json")
+    def save_results(self, results: List[Dict[str, Any]], run_metadata: Optional[Dict[str, Any]] = None):
+        """Save results to JSON file. Updates the same file throughout the run."""
+        data_to_save = {
+            'metadata': run_metadata or {},
+            'results': results
+        }
         
-        with open(filename, 'w') as f:
-            json.dump(results, f, indent=2)
+        with open(self.results_filename, 'w') as f:
+            json.dump(data_to_save, f, indent=2)
         
-        print(f"Results saved to {filename}")
+        print(f"Results updated: {len(results)} combinations completed")
     
     def analyze_results(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Analyze grid search results."""
+        # Handle both old format (direct list) and new format (with metadata)
+        if isinstance(results, dict) and 'results' in results:
+            actual_results = results['results']
+        else:
+            actual_results = results
+            
         # Filter out failed runs
-        valid_results = [r for r in results if 'error' not in r['metrics']]
+        valid_results = [r for r in actual_results if 'error' not in r['metrics']]
         
         if not valid_results:
             return {"error": "No valid results found"}
@@ -289,9 +315,9 @@ class MCResNetBaselineGridSearch:
         avg_epochs = sum(r['metrics']['epochs_completed'] for r in valid_results) / len(valid_results)
         
         return {
-            'total_combinations': len(results),
+            'total_combinations': len(actual_results),
             'successful_combinations': len(valid_results),
-            'failed_combinations': len(results) - len(valid_results),
+            'failed_combinations': len(actual_results) - len(valid_results),
             'early_stopped_count': early_stopped_count,
             'average_epochs': avg_epochs,
             'best_by_accuracy': {
@@ -321,14 +347,98 @@ class MCResNetBaselineGridSearch:
             ]
         }
 
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="MCResNet Baseline Grid Search",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Default grid search
+  python scripts/grid_search_mcresnet_baseline.py
+  
+  # Custom learning rates and batch sizes
+  python scripts/grid_search_mcresnet_baseline.py --learning_rate 0.001 0.01 0.1 --batch_size 32 64
+  
+  # Single optimizer and scheduler
+  python scripts/grid_search_mcresnet_baseline.py --optimizer adamw --scheduler cosine
+  
+  # Full custom grid
+  python scripts/grid_search_mcresnet_baseline.py \
+    --learning_rate 0.001 0.01 \
+    --batch_size 64 128 256 \
+    --optimizer sgd adamw \
+    --weight_decay 1e-5 1e-4 1e-3 \
+    --scheduler cosine oneCycle
+        """
+    )
+    
+    parser.add_argument(
+        '--learning_rate', '--lr',
+        type=float,
+        nargs='+',
+        default=[0.001],
+        help='Learning rates to test (default: [0.001])'
+    )
+    
+    parser.add_argument(
+        '--batch_size', '--bs',
+        type=int,
+        nargs='+',
+        default=[64],
+        help='Batch sizes to test (default: [64])'
+    )
+    
+    parser.add_argument(
+        '--optimizer', '--opt',
+        type=str,
+        nargs='+',
+        choices=['sgd', 'adam', 'adamw'],
+        default=['adamw'],
+        help='Optimizers to test (default: [adamw])'
+    )
+    
+    parser.add_argument(
+        '--weight_decay', '--wd',
+        type=float,
+        nargs='+',
+        default=[1e-5],
+        help='Weight decay values to test (default: [1e-5, 1e-4])'
+    )
+    
+    parser.add_argument(
+        '--scheduler', '--sched',
+        type=str,
+        nargs='+',
+        choices=['cosine', 'oneCycle', 'step', 'plateau'],
+        default=['cosine'],
+        help='Schedulers to test (default: [cosine, oneCycle])'
+    )
+    
+    return parser.parse_args()
 
 def main():
     """Main function to run baseline grid search."""
+    # Parse command line arguments
+    args = parse_arguments()
     print("MCResNet Baseline Grid Search")
     print("="*50)
     
-    # TODO: Load your actual data here
-    # For now, creating dummy data as an example
+    # Print configuration
+    print("Configuration:")
+    print(f"  Learning rates: {args.learning_rate}")
+    print(f"  Batch sizes: {args.batch_size}")
+    print(f"  Optimizers: {args.optimizer}")
+    print(f"  Weight decays: {args.weight_decay}")
+    print(f"  Schedulers: {args.scheduler}")
+    
+    # Calculate total combinations
+    total_combinations = (len(args.learning_rate) * len(args.batch_size) * 
+                         len(args.optimizer) * len(args.weight_decay) * 
+                         len(args.scheduler))
+    print(f"  Total combinations: {total_combinations}")
+    print()
+    
     print("Loading data...")
     converter = RGBtoRGBL()
     # Example: Load your actual tensors here
@@ -355,7 +465,7 @@ def main():
 
     # Initialize grid search
     grid_search = MCResNetBaselineGridSearch(
-        results_dir="mcresnet_baseline_grid_search",
+        results_dir="results/mcresnet_baseline_grid_search",
         device=None  # Auto-detect
     )
     
@@ -366,7 +476,12 @@ def main():
         train_labels=train_labels,
         val_rgb=val_color,
         val_brightness=val_brightness,
-        val_labels=val_labels
+        val_labels=val_labels,
+        learning_rates=args.learning_rate,
+        batch_sizes=args.batch_size,
+        optimizers=args.optimizer,
+        weight_decays=args.weight_decay,
+        schedulers=args.scheduler
     )
     
     # Analyze results
@@ -397,7 +512,7 @@ def main():
                   f"epochs={config['epochs']}, early_stop={config['early_stopped']}")
             print(f"   {config['parameters']}")
     
-    print(f"\nAll results saved in: {grid_search.results_dir}")
+    print(f"\nAll results saved in: {grid_search.results_filename}")
 
 
 if __name__ == "__main__":

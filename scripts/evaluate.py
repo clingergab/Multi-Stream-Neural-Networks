@@ -6,10 +6,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import yaml
 import os
-import sys
-
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from models.builders.model_factory import create_model
 from data_utils import DualChannelDataset, create_dual_channel_dataloaders
