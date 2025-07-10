@@ -369,7 +369,7 @@ Examples:
     --batch_size 64 128 256 \
     --optimizer sgd adamw \
     --weight_decay 1e-5 1e-4 1e-3 \
-    --scheduler cosine oneCycle
+    --scheduler cosine onecycle
         """
     )
     
@@ -410,9 +410,9 @@ Examples:
         '--scheduler', '--sched',
         type=str,
         nargs='+',
-        choices=['cosine', 'oneCycle', 'step', 'plateau'],
+        choices=['cosine', 'onecycle', 'step', 'plateau'],
         default=['cosine'],
-        help='Schedulers to test (default: [cosine, oneCycle])'
+        help='Schedulers to test (default: [cosine, onecycle])'
     )
     
     return parser.parse_args()
