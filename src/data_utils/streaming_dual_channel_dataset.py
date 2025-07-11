@@ -474,6 +474,7 @@ def create_imagenet_dual_channel_train_val_dataloaders(
     
     # Default validation batch size to training batch size if not specified
     if val_batch_size is None:
+        print("no val_batch_size specified, using training batch size for validation")
         val_batch_size = batch_size
     
     # Create datasets
