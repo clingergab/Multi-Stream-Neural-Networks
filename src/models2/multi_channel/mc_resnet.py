@@ -326,6 +326,7 @@ class MCResNet(BaseModel):
                 raise ValueError("Either provide train_loader or all of train_color_data, train_brightness_data, and train_targets")
             
             # Create both train and validation DataLoaders
+            print("🔄 Creating DataLoaders from tensors in MCResNet fit() for training using create_dual_channel_dataloaders")
             train_loader, val_loader = create_dual_channel_dataloaders(
                 train_color_data, train_brightness_data, train_targets,
                 val_color_data, val_brightness_data, val_targets,

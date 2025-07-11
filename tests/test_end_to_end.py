@@ -10,9 +10,6 @@ import torch
 import numpy as np
 import pytest
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 # Import our utilities and models
 from data_utils.dataset_utils import load_cifar100_numpy
 from models.basic_multi_channel.base_multi_channel_network import BaseMultiChannelNetwork

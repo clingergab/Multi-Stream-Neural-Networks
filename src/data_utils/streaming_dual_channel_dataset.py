@@ -442,6 +442,7 @@ def create_imagenet_dual_channel_train_val_dataloaders(
     train_transform: Optional[Callable] = None,
     val_transform: Optional[Callable] = None,
     batch_size: int = 32,
+    val_batch_size: Optional[int] = None,
     image_size: Tuple[int, int] = (224, 224),
     num_workers: int = 4,
     pin_memory: bool = True,
@@ -459,7 +460,8 @@ def create_imagenet_dual_channel_train_val_dataloaders(
         truth_file: Path to validation truth file (ILSVRC2012_validation_ground_truth.txt)
         train_transform: Transform to apply to training data (both RGB and brightness)
         val_transform: Transform to apply to validation data (both RGB and brightness)
-        batch_size: Batch size for training (validation will use batch_size*2)
+        batch_size: Batch size for training
+        val_batch_size: Batch size for validation (defaults to batch_size if not specified)
         image_size: Target image size (H, W) for resizing
         num_workers: Number of parallel data loading workers
         pin_memory: Whether to pin memory for faster CPU→GPU transfer
@@ -469,6 +471,10 @@ def create_imagenet_dual_channel_train_val_dataloaders(
     Returns:
         Tuple of (train_dataloader, val_dataloader)
     """
+    
+    # Default validation batch size to training batch size if not specified
+    if val_batch_size is None:
+        val_batch_size = batch_size
     
     # Create datasets
     train_dataset = StreamingDualChannelDataset(
@@ -501,7 +507,7 @@ def create_imagenet_dual_channel_train_val_dataloaders(
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size * 2,  # Larger batch for validation
+        batch_size=val_batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
