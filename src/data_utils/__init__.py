@@ -9,6 +9,14 @@ from .dual_channel_dataset import (
     create_dual_channel_dataloader
 )
 
+# Streaming dual-channel dataset for ImageNet (large datasets)
+from .streaming_dual_channel_dataset import (
+    StreamingDualChannelDataset,
+    create_imagenet_dual_channel_train_val_dataloaders,
+    create_imagenet_dual_channel_test_dataloader,
+    create_default_imagenet_transforms
+)
+
 # Collate function for multi-stream data (legacy support)
 from .rgb_to_rgbl import (
     collate_with_streams
@@ -39,6 +47,12 @@ __all__ = [
     'DualChannelDataset',
     'create_dual_channel_dataloaders',
     'create_dual_channel_dataloader',
+
+    # Streaming dual-channel dataset for ImageNet
+    'StreamingDualChannelDataset',
+    'create_imagenet_dual_channel_train_val_dataloaders',
+    'create_imagenet_dual_channel_test_dataloader', 
+    'create_default_imagenet_transforms',
 
     # Legacy support
     'collate_with_streams',
