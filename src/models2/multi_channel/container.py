@@ -10,13 +10,63 @@ from typing import Any, Optional, Union, overload
 from typing_extensions import Self
 
 import torch.nn as nn
+from torch import Tensor
+from torch.nn import functional as F
 from torch.nn import Module
 from torch._jit_internal import _copy_to_script_wrapper
 
 
 __all__ = [
     "MCSequential",
+    "MCReLU",
 ]
+
+
+class MCReLU(nn.Module):
+    """
+    Multi-Channel ReLU activation function.
+    
+    Applies ReLU activation separately to color and brightness pathways,
+    following the dual-stream pattern for compatibility with MCSequential.
+    
+    Args:
+        inplace: If set to True, will do this operation in-place. Default: False
+        
+    Shape:
+        - Color Input: Any tensor shape
+        - Brightness Input: Any tensor shape  
+        - Color Output: Same shape as color input
+        - Brightness Output: Same shape as brightness input
+        
+    Examples::
+        >>> m = MCReLU()
+        >>> color_input = torch.randn(2, 3, 4, 4)
+        >>> brightness_input = torch.randn(2, 1, 4, 4)
+        >>> color_output, brightness_output = m(color_input, brightness_input)
+    """
+    
+    __constants__ = ['inplace']
+    inplace: bool
+    
+    def __init__(self, inplace: bool = False) -> None:
+        super().__init__()
+        self.inplace = inplace
+    
+    def forward(self, color_input: Tensor, brightness_input: Tensor) -> tuple[Tensor, Tensor]:
+        """Apply ReLU to both pathways."""
+        return F.relu(color_input, inplace=self.inplace), F.relu(brightness_input, inplace=self.inplace)
+    
+    def forward_color(self, color_input: Tensor) -> Tensor:
+        """Apply ReLU to color pathway only."""
+        return F.relu(color_input, inplace=self.inplace)
+    
+    def forward_brightness(self, brightness_input: Tensor) -> Tensor:
+        """Apply ReLU to brightness pathway only."""
+        return F.relu(brightness_input, inplace=self.inplace)
+    
+    def extra_repr(self) -> str:
+        inplace_str = 'inplace=True' if self.inplace else ''
+        return inplace_str
 
 
 class MCSequential(Module):
@@ -25,26 +75,17 @@ class MCSequential(Module):
     Modules will be added to it in the order they are passed in the
     constructor. Alternatively, an ``OrderedDict`` of modules can be
     passed in. The ``forward()`` method of ``MCSequential`` accepts two
-    inputs (color and brightness) and forwards them to the first module it contains.
-    It then "chains" outputs to inputs sequentially for each subsequent module,
-    finally returning the output of the last module.
+    inputs (color and brightness) and forwards them through the contained modules.
 
-    This is exactly like PyTorch's ``Sequential`` but adapted for dual-stream
-    multi-channel processing where each module takes two inputs and produces two outputs.
-
-    Example::
-
-        # Using MCSequential to create a multi-channel downsample layer
-        downsample = MCSequential(
-            MCConv2d(64, 64, 256, kernel_size=1, stride=2, bias=False),
-            MCBatchNorm2d(256)
-        )
-        
-        # Using MCSequential with OrderedDict
-        downsample = MCSequential(OrderedDict([
-            ('conv', MCConv2d(64, 64, 256, kernel_size=1, stride=2, bias=False)),
-            ('bn', MCBatchNorm2d(256))
-        ]))
+    MCSequential is an extension of PyTorch's Sequential for dual-stream multi-channel processing.
+    
+    All modules within MCSequential must support dual-stream input/output:
+    - Each module takes two inputs (color_input, brightness_input)
+    - Each module returns two outputs (color_output, brightness_output)
+    - Each module must have forward_color() and forward_brightness() methods
+      
+    This design maintains the clean dual-stream architecture where MCSequential
+    extends nn.Sequential behavior to multi-channel processing.
     """
 
     _modules: dict[str, Module]  # type: ignore[assignment]
@@ -185,8 +226,11 @@ class MCSequential(Module):
         """
         Forward pass through the sequential container.
         
-        Each module is expected to take two inputs (color, brightness) and return two outputs.
-        The outputs of one module become the inputs to the next module.
+        Each module must accept dual inputs (color_input, brightness_input) 
+        and return dual outputs (color_output, brightness_output).
+        
+        This ensures compatibility with multi-channel modules like MCConv2d, 
+        MCBatchNorm2d, MCReLU, etc.
         """
         for module in self:
             color_input, brightness_input = module(color_input, brightness_input)

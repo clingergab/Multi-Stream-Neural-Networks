@@ -35,15 +35,15 @@ def _get_tqdm():
 tqdm = _get_tqdm()
 
 from typing import Dict, List, Any, Union
-from models.base import BaseMultiStreamModel
+from models_old.base import BaseMultiStreamModel
 from utils.grad_utils import safe_clip_grad_norm
-from models.layers.conv_layers import (
+from models_old.layers.conv_layers import (
     MultiChannelConv2d,
     MultiChannelBatchNorm2d,
     MultiChannelActivation,
     MultiChannelAdaptiveAvgPool2d
 )
-from models.layers.resnet_blocks import (
+from models_old.layers.resnet_blocks import (
     MultiChannelResNetBasicBlock,
     MultiChannelResNetBottleneck,
     MultiChannelDownsample,

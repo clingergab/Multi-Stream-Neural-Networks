@@ -47,10 +47,15 @@ def run_coverage(test_path, source_path=None):
     # Get target file for display purposes
     target_file = get_target_file_for_display(test_path)
     
+    # Create coverage reports directory if it doesn't exist
+    coverage_dir = "coverage_reports"
+    os.makedirs(coverage_dir, exist_ok=True)
+    
     print(f"🔍 Running coverage analysis on: {test_path}")
     print(f"📁 Source path: {source_path}")
     if target_file:
         print(f"🎯 Target file: {target_file}")
+    print(f"📊 Coverage reports will be saved to: {coverage_dir}/")
     print("="*60)
     
     # Run coverage using pytest-cov (more reliable than coverage run)
@@ -60,7 +65,7 @@ def run_coverage(test_path, source_path=None):
         test_path,
         f'--cov={source_path}',
         '--cov-report=term-missing',
-        '--cov-report=html',
+        f'--cov-report=html:{coverage_dir}/html',
         '-v'
     ])
     
@@ -70,8 +75,8 @@ def run_coverage(test_path, source_path=None):
     
     print("\n" + "="*60)
     print("✅ Coverage analysis completed successfully!")
-    print("📄 HTML coverage report generated: htmlcov/index.html")
-    print("💡 Open htmlcov/index.html in your browser to view detailed coverage")
+    print(f"📄 HTML coverage report generated: {coverage_dir}/html/index.html")
+    print(f"💡 Open {coverage_dir}/html/index.html in your browser to view detailed coverage")
     
     return True
 

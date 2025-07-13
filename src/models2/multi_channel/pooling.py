@@ -131,30 +131,6 @@ class MCMaxPool2d(_MCMaxPoolNd):
     padding: _size_2_t
     dilation: _size_2_t
 
-    def __init__(
-        self,
-        kernel_size: _size_2_t,
-        stride: Optional[_size_2_t] = None,
-        padding: _size_2_t = 0,
-        dilation: _size_2_t = 1,
-        return_indices: bool = False,
-        ceil_mode: bool = False,
-    ) -> None:
-        # Convert parameters to tuples exactly like PyTorch's MaxPool2d
-        kernel_size_ = _pair(kernel_size)
-        stride_ = _pair(stride if stride is not None else kernel_size)
-        padding_ = _pair(padding)
-        dilation_ = _pair(dilation)
-        
-        super().__init__(
-            kernel_size_,
-            stride_,
-            padding_,
-            dilation_,
-            return_indices,
-            ceil_mode,
-        )
-
     def forward(self, color_input: Tensor, brightness_input: Tensor) -> tuple[Tensor, Tensor]:
         """
         Forward pass through dual max pooling layers.

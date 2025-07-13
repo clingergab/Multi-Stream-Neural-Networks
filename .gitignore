@@ -53,3 +53,9 @@ Thumbs.db
 
 # The patch file we created
 tensor_handling_fix.patch
+
+# Coverage reports
+htmlcov/
+coverage_reports/
+.coverage
+.coverage.*

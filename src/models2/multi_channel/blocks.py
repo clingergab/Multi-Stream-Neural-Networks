@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from .conv import MCConv2d, MCBatchNorm2d
+from .container import MCReLU
 
 
 def mc_conv3x3(color_in_planes: int, brightness_in_planes: int, color_out_planes: int, brightness_out_planes: int,
@@ -74,7 +75,7 @@ class MCBasicBlock(nn.Module):
         # Both self.conv1 and self.downsample layers downsample the input when stride != 1
         self.conv1 = mc_conv3x3(color_inplanes, brightness_inplanes, color_planes, brightness_planes, stride)
         self.bn1 = norm_layer(color_planes, brightness_planes)
-        self.relu = nn.ReLU(inplace=True)
+        self.relu = MCReLU(inplace=True)
         self.conv2 = mc_conv3x3(color_planes, brightness_planes, color_planes, brightness_planes)
         self.bn2 = norm_layer(color_planes, brightness_planes)
         self.downsample = downsample
@@ -86,8 +87,7 @@ class MCBasicBlock(nn.Module):
         
         color_out, brightness_out = self.conv1(color_input, brightness_input)
         color_out, brightness_out = self.bn1(color_out, brightness_out)
-        color_out = self.relu(color_out)
-        brightness_out = self.relu(brightness_out)
+        color_out, brightness_out = self.relu(color_out, brightness_out)
         
         color_out, brightness_out = self.conv2(color_out, brightness_out)
         color_out, brightness_out = self.bn2(color_out, brightness_out)
@@ -97,8 +97,7 @@ class MCBasicBlock(nn.Module):
         
         color_out += color_identity
         brightness_out += brightness_identity
-        color_out = self.relu(color_out)
-        brightness_out = self.relu(brightness_out)
+        color_out, brightness_out = self.relu(color_out, brightness_out)
         
         return color_out, brightness_out
 
@@ -108,7 +107,7 @@ class MCBasicBlock(nn.Module):
         
         color_out = self.conv1.forward_color(color_input)
         color_out = self.bn1.forward_color(color_out)
-        color_out = self.relu(color_out)
+        color_out = self.relu.forward_color(color_out)
         
         color_out = self.conv2.forward_color(color_out)
         color_out = self.bn2.forward_color(color_out)
@@ -117,7 +116,7 @@ class MCBasicBlock(nn.Module):
             color_identity = self.downsample.forward_color(color_identity)
         
         color_out += color_identity
-        color_out = self.relu(color_out)
+        color_out = self.relu.forward_color(color_out)
         
         return color_out
     
@@ -127,7 +126,7 @@ class MCBasicBlock(nn.Module):
         
         brightness_out = self.conv1.forward_brightness(brightness_input)
         brightness_out = self.bn1.forward_brightness(brightness_out)
-        brightness_out = self.relu(brightness_out)
+        brightness_out = self.relu.forward_brightness(brightness_out)
         
         brightness_out = self.conv2.forward_brightness(brightness_out)
         brightness_out = self.bn2.forward_brightness(brightness_out)
@@ -136,7 +135,7 @@ class MCBasicBlock(nn.Module):
             brightness_identity = self.downsample.forward_brightness(brightness_identity)
         
         brightness_out += brightness_identity
-        brightness_out = self.relu(brightness_out)
+        brightness_out = self.relu.forward_brightness(brightness_out)
         
         return brightness_out
 
@@ -183,7 +182,7 @@ class MCBottleneck(nn.Module):
         self.bn2 = norm_layer(color_width, brightness_width)
         self.conv3 = mc_conv1x1(color_width, brightness_width, self.color_outplanes, self.brightness_outplanes)
         self.bn3 = norm_layer(self.color_outplanes, self.brightness_outplanes)
-        self.relu = nn.ReLU(inplace=True)
+        self.relu = MCReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
     
@@ -193,13 +192,11 @@ class MCBottleneck(nn.Module):
         
         color_out, brightness_out = self.conv1(color_input, brightness_input)
         color_out, brightness_out = self.bn1(color_out, brightness_out)
-        color_out = self.relu(color_out)
-        brightness_out = self.relu(brightness_out)
+        color_out, brightness_out = self.relu(color_out, brightness_out)
         
         color_out, brightness_out = self.conv2(color_out, brightness_out)
         color_out, brightness_out = self.bn2(color_out, brightness_out)
-        color_out = self.relu(color_out)
-        brightness_out = self.relu(brightness_out)
+        color_out, brightness_out = self.relu(color_out, brightness_out)
         
         color_out, brightness_out = self.conv3(color_out, brightness_out)
         color_out, brightness_out = self.bn3(color_out, brightness_out)
@@ -209,8 +206,7 @@ class MCBottleneck(nn.Module):
         
         color_out += color_identity
         brightness_out += brightness_identity
-        color_out = self.relu(color_out)
-        brightness_out = self.relu(brightness_out)
+        color_out, brightness_out = self.relu(color_out, brightness_out)
         
         return color_out, brightness_out
 
@@ -220,11 +216,11 @@ class MCBottleneck(nn.Module):
         
         color_out = self.conv1.forward_color(color_input)
         color_out = self.bn1.forward_color(color_out)
-        color_out = self.relu(color_out)
+        color_out = self.relu.forward_color(color_out)
         
         color_out = self.conv2.forward_color(color_out)
         color_out = self.bn2.forward_color(color_out)
-        color_out = self.relu(color_out)
+        color_out = self.relu.forward_color(color_out)
         
         color_out = self.conv3.forward_color(color_out)
         color_out = self.bn3.forward_color(color_out)
@@ -233,7 +229,7 @@ class MCBottleneck(nn.Module):
             color_identity = self.downsample.forward_color(color_identity)
         
         color_out += color_identity
-        color_out = self.relu(color_out)
+        color_out = self.relu.forward_color(color_out)
         
         return color_out
     
@@ -243,11 +239,11 @@ class MCBottleneck(nn.Module):
         
         brightness_out = self.conv1.forward_brightness(brightness_input)
         brightness_out = self.bn1.forward_brightness(brightness_out)
-        brightness_out = self.relu(brightness_out)
+        brightness_out = self.relu.forward_brightness(brightness_out)
         
         brightness_out = self.conv2.forward_brightness(brightness_out)
         brightness_out = self.bn2.forward_brightness(brightness_out)
-        brightness_out = self.relu(brightness_out)
+        brightness_out = self.relu.forward_brightness(brightness_out)
         
         brightness_out = self.conv3.forward_brightness(brightness_out)
         brightness_out = self.bn3.forward_brightness(brightness_out)
@@ -256,6 +252,6 @@ class MCBottleneck(nn.Module):
             brightness_identity = self.downsample.forward_brightness(brightness_identity)
         
         brightness_out += brightness_identity
-        brightness_out = self.relu(brightness_out)
+        brightness_out = self.relu.forward_brightness(brightness_out)
         
         return brightness_out

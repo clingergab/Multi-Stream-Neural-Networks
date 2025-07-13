@@ -46,7 +46,7 @@ except:
 # Import the multi-channel components
 from models2.multi_channel.conv import MCConv2d, MCBatchNorm2d
 from models2.multi_channel.blocks import MCBasicBlock, MCBottleneck
-from models2.multi_channel.container import MCSequential
+from models2.multi_channel.container import MCSequential, MCReLU
 from models2.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
 
 
@@ -116,7 +116,7 @@ class MCResNet(BaseModel):
             kernel_size=7, stride=2, padding=3, bias=False
         )
         self.bn1 = self._norm_layer(self.color_inplanes, self.brightness_inplanes)
-        self.relu = nn.ReLU(inplace=True)
+        self.relu = MCReLU(inplace=True)
         self.maxpool = MCMaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, 64, 64, layers[0])       # Equal scaling: 64, 64
         self.layer2 = self._make_layer(block, 128, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])  # Equal scaling: 128, 128
@@ -241,8 +241,7 @@ class MCResNet(BaseModel):
         # Initial convolution
         color_x, brightness_x = self.conv1(color_input, brightness_input)
         color_x, brightness_x = self.bn1(color_x, brightness_x)
-        color_x = self.relu(color_x)
-        brightness_x = self.relu(brightness_x)
+        color_x, brightness_x = self.relu(color_x, brightness_x)
         
         # Max pooling
         color_x, brightness_x = self.maxpool(color_x, brightness_x)
@@ -771,7 +770,7 @@ class MCResNet(BaseModel):
         # Initial convolution (color pathway only)
         color_x = self.conv1.forward_color(color_x)
         color_x = self.bn1.forward_color(color_x)
-        color_x = self.relu(color_x)
+        color_x = self.relu.forward_color(color_x)
         
         # Max pooling (color pathway only)
         color_x = self.maxpool.forward_color(color_x)
@@ -806,7 +805,7 @@ class MCResNet(BaseModel):
         # Initial convolution (brightness pathway only)
         brightness_x = self.conv1.forward_brightness(brightness_x)
         brightness_x = self.bn1.forward_brightness(brightness_x)
-        brightness_x = self.relu(brightness_x)
+        brightness_x = self.relu.forward_brightness(brightness_x)
         
         # Max pooling (brightness pathway only)
         brightness_x = self.maxpool.forward_brightness(brightness_x)

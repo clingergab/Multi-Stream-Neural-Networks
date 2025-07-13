@@ -71,16 +71,16 @@ def _register_builtin_models():
     """Register built-in model types."""
     try:
         # Import model classes
-        from ..models.continuous_integration.direct_mixing import (
+        from ..models_old.continuous_integration.direct_mixing import (
             ScalarMixingModel,
             ChannelAdaptiveMixingModel, 
             DynamicMixingModel,
             SpatialAdaptiveMixingModel
         )
-        from ..models.continuous_integration.concat_linear import ConcatLinearModel
-        from ..models.continuous_integration.attention_based import AttentionBasedModel
-        from ..models.continuous_integration.neural_processing import NeuralProcessingModel
-        from ..models.basic_multi_channel import (
+        from ..models_old.continuous_integration.concat_linear import ConcatLinearModel
+        from ..models_old.continuous_integration.attention_based import AttentionBasedModel
+        from ..models_old.continuous_integration.neural_processing import NeuralProcessingModel
+        from ..models_old.basic_multi_channel import (
             BaseMultiChannelNetwork,
             MultiChannelResNetNetwork
         )

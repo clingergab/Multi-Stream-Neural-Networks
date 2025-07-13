@@ -10,7 +10,7 @@ from .mc_resnet import (
     mc_resnet101, 
     mc_resnet152
 )
-from .container import MCSequential
+from .container import MCSequential, MCReLU
 from .conv import MCConv2d, MCBatchNorm2d
 from .blocks import MCBasicBlock, MCBottleneck, mc_conv3x3, mc_conv1x1
 from .pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
@@ -25,6 +25,7 @@ __all__ = [
     "MCSequential",
     "MCConv2d", 
     "MCBatchNorm2d",
+    "MCReLU",
     "MCBasicBlock",
     "MCBottleneck",
     "mc_conv3x3",

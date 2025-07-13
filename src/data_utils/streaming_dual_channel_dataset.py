@@ -290,10 +290,10 @@ class StreamingDualChannelDataset(Dataset):
         img_path = self.image_paths[idx]
         label = torch.tensor(self.labels[idx], dtype=torch.long)
         
-        # Load and preprocess RGB image
+        # Load and preprocess RGB image (no normalization yet)
         rgb = self._load_and_preprocess_image(img_path)
         
-        # Compute brightness from RGB on-the-fly
+        # Compute brightness from original RGB values (before normalization)
         brightness = self._rgb_converter.get_brightness(rgb)
         
         # Apply synchronized transforms to both channels
