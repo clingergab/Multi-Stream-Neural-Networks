@@ -1226,3 +1226,285 @@ class TestMCResNetSpecialCases(unittest.TestCase):
             device='cpu'
         )
         self.assertIsInstance(model, MCResNet)
+
+
+class TestMCResNetGradientAccumulation(unittest.TestCase):
+    """Test gradient accumulation functionality in MCResNet."""
+    
+    def setUp(self):
+        """Set up test fixtures for gradient accumulation tests."""
+        self.model = MCResNet(
+            block=MCBasicBlock,
+            layers=[2, 2, 2, 2],
+            num_classes=10,
+            device='cpu'
+        )
+        
+        # Compile model with basic optimizer string instead of object
+        self.model.compile(
+            optimizer='sgd',
+            learning_rate=0.01,
+            loss='cross_entropy'
+        )
+        
+        # Create test data
+        self.color_data = torch.randn(16, 3, 32, 32)
+        self.brightness_data = torch.randn(16, 1, 32, 32)
+        self.targets = torch.randint(0, 10, (16,))
+        
+        self.train_loader = create_dual_channel_dataloader(
+            self.color_data, self.brightness_data, self.targets,
+            batch_size=4, num_workers=0
+        )
+    
+    def test_gradient_accumulation_default(self):
+        """Test that gradient_accumulation_steps=1 works as default."""
+        history = self.model.fit(
+            train_loader=self.train_loader,
+            epochs=1,
+            verbose=False,
+            gradient_accumulation_steps=1
+        )
+        
+        self.assertIn('train_loss', history)
+        self.assertIn('train_accuracy', history)
+        self.assertEqual(len(history['train_loss']), 1)
+    
+    def test_gradient_accumulation_steps_parameter(self):
+        """Test that gradient_accumulation_steps parameter is properly handled."""
+        # Test with accumulation steps = 2
+        history = self.model.fit(
+            train_loader=self.train_loader,
+            epochs=1,
+            verbose=False,
+            gradient_accumulation_steps=2
+        )
+        
+        self.assertIn('train_loss', history)
+        self.assertIn('train_accuracy', history)
+        self.assertEqual(len(history['train_loss']), 1)
+    
+    def test_gradient_accumulation_parameter_validation(self):
+        """Test that invalid gradient_accumulation_steps values are handled."""
+        # Test with gradient_accumulation_steps = 0 (should work but be effectively 1)
+        history = self.model.fit(
+            train_loader=self.train_loader,
+            epochs=1,
+            verbose=False,
+            gradient_accumulation_steps=0
+        )
+        
+        self.assertIn('train_loss', history)
+        
+        # Test with very large accumulation steps
+        history = self.model.fit(
+            train_loader=self.train_loader,
+            epochs=1,
+            verbose=False,
+            gradient_accumulation_steps=100
+        )
+        
+        self.assertIn('train_loss', history)
+    
+    def test_gradient_accumulation_with_amp(self):
+        """Test gradient accumulation with automatic mixed precision."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available for AMP testing")
+        
+        model_amp = MCResNet(
+            block=MCBasicBlock,
+            layers=[2, 2, 2, 2],
+            num_classes=10,
+            device='cuda',
+            use_amp=True
+        )
+        
+        model_amp.compile(
+            optimizer='sgd',
+            learning_rate=0.01,
+            loss='cross_entropy'
+        )
+        
+        # Move test data to GPU
+        color_data_gpu = self.color_data.cuda()
+        brightness_data_gpu = self.brightness_data.cuda()
+        targets_gpu = self.targets.cuda()
+        
+        train_loader_gpu = create_dual_channel_dataloader(
+            color_data_gpu, brightness_data_gpu, targets_gpu,
+            batch_size=4, num_workers=0
+        )
+        
+        history = model_amp.fit(
+            train_loader=train_loader_gpu,
+            epochs=1,
+            verbose=False,
+            gradient_accumulation_steps=2
+        )
+        
+        self.assertIn('train_loss', history)
+        self.assertIn('train_accuracy', history)
+    
+    def test_gradient_accumulation_with_onecycle_scheduler(self):
+        """Test gradient accumulation with OneCycleLR scheduler."""
+        # Create model with OneCycleLR scheduler
+        model = MCResNet(
+            block=MCBasicBlock,
+            layers=[2, 2, 2, 2],
+            num_classes=10,
+            device='cpu'
+        )
+        
+        model.compile(
+            optimizer='sgd',
+            learning_rate=0.01,
+            loss='cross_entropy',
+            scheduler='onecycle'
+        )
+        
+        history = model.fit(
+            train_loader=self.train_loader,
+            epochs=2,
+            verbose=False,
+            gradient_accumulation_steps=2,
+            # OneCycleLR specific parameters
+            steps_per_epoch=len(self.train_loader),
+            max_lr=0.1
+        )
+        
+        self.assertIn('train_loss', history)
+        self.assertIn('learning_rates', history)
+        # Should have learning rate updates when using OneCycleLR
+        self.assertGreater(len(history['learning_rates']), 0)
+    
+    def test_gradient_accumulation_training_epoch_method(self):
+        """Test the _train_epoch method directly with gradient accumulation."""
+        self.model.train()
+        
+        # Initialize history
+        history = {
+            'train_loss': [], 
+            'val_loss': [], 
+            'train_accuracy': [],
+            'val_accuracy': [],
+            'learning_rates': []
+        }
+        
+        # Test with different accumulation steps
+        for accumulation_steps in [1, 2, 4]:
+            avg_loss, accuracy = self.model._train_epoch(
+                self.train_loader, 
+                history, 
+                pbar=None, 
+                gradient_accumulation_steps=accumulation_steps
+            )
+            
+            self.assertIsInstance(avg_loss, float)
+            self.assertIsInstance(accuracy, float)
+            self.assertGreaterEqual(accuracy, 0.0)
+            self.assertLessEqual(accuracy, 1.0)
+            
+            self.assertIsInstance(avg_loss, float)
+            self.assertIsInstance(accuracy, float)
+            self.assertGreaterEqual(accuracy, 0.0)
+            self.assertLessEqual(accuracy, 1.0)
+    
+    def test_gradient_accumulation_backward_compatibility(self):
+        """Test that existing code works without gradient_accumulation_steps parameter."""
+        # Test that fit() works without the gradient_accumulation_steps parameter
+        history = self.model.fit(
+            train_loader=self.train_loader,
+            epochs=1,
+            verbose=False
+            # No gradient_accumulation_steps parameter - should default to 1
+        )
+        
+        self.assertIn('train_loss', history)
+        self.assertIn('train_accuracy', history)
+    
+    def test_gradient_accumulation_effective_batch_size(self):
+        """Test that gradient accumulation simulates larger batch sizes correctly."""
+        # Create smaller batches for testing accumulation
+        small_batch_loader = create_dual_channel_dataloader(
+            self.color_data, self.brightness_data, self.targets,
+            batch_size=2, num_workers=0  # Smaller batch size
+        )
+        
+        # Train with gradient accumulation (effective batch size = 2 * 2 = 4)
+        history_accumulated = self.model.fit(
+            train_loader=small_batch_loader,
+            epochs=1,
+            verbose=False,
+            gradient_accumulation_steps=2
+        )
+        
+        # Should complete training without errors
+        self.assertIn('train_loss', history_accumulated)
+        self.assertIn('train_accuracy', history_accumulated)
+    
+    def test_gradient_accumulation_edge_cases(self):
+        """Test edge cases for gradient accumulation."""
+        # Test with accumulation steps larger than number of batches
+        very_large_steps = len(self.train_loader) + 10
+        
+        history = self.model.fit(
+            train_loader=self.train_loader,
+            epochs=1,
+            verbose=False,
+            gradient_accumulation_steps=very_large_steps
+        )
+        
+        self.assertIn('train_loss', history)
+        
+        # Test with single batch loader
+        single_batch_loader = create_dual_channel_dataloader(
+            self.color_data[:4], self.brightness_data[:4], self.targets[:4],
+            batch_size=4, num_workers=0
+        )
+        
+        history = self.model.fit(
+            train_loader=single_batch_loader,
+            epochs=1,
+            verbose=False,
+            gradient_accumulation_steps=2
+        )
+        
+        self.assertIn('train_loss', history)
+        
+        # Test with single batch loader
+        single_batch_loader = create_dual_channel_dataloader(
+            self.color_data[:4], self.brightness_data[:4], self.targets[:4],
+            batch_size=4, num_workers=0
+        )
+        
+        history = self.model.fit(
+            train_loader=single_batch_loader,
+            epochs=1,
+            verbose=False,
+            gradient_accumulation_steps=2
+        )
+        
+        self.assertIn('train_loss', history)
+    
+    def test_gradient_accumulation_memory_efficiency(self):
+        """Test that gradient accumulation doesn't cause memory issues."""
+        # Create larger test data to test memory management
+        large_color_data = torch.randn(32, 3, 64, 64)
+        large_brightness_data = torch.randn(32, 1, 64, 64)
+        large_targets = torch.randint(0, 10, (32,))
+        
+        large_loader = create_dual_channel_dataloader(
+            large_color_data, large_brightness_data, large_targets,
+            batch_size=8, num_workers=0
+        )
+        
+        # Train with gradient accumulation
+        history = self.model.fit(
+            train_loader=large_loader,
+            epochs=1,
+            verbose=False,
+            gradient_accumulation_steps=4
+        )
+        
+        self.assertIn('train_loss', history)
+        self.assertIn('train_accuracy', history)

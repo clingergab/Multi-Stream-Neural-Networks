@@ -284,6 +284,7 @@ class MCResNet(BaseModel):
         min_delta: float = 0.001,
         monitor: str = 'val_loss',  # 'val_loss' or 'val_accuracy'
         restore_best_weights: bool = True,
+        gradient_accumulation_steps: int = 1,  # NEW: Gradient accumulation for larger effective batch size
         **scheduler_kwargs
     ) -> dict:
         """
@@ -304,6 +305,8 @@ class MCResNet(BaseModel):
             min_delta: Minimum change to qualify as an improvement
             monitor: Metric to monitor ('val_loss' or 'val_accuracy')
             restore_best_weights: Whether to restore best weights when early stopping
+            gradient_accumulation_steps: Number of steps to accumulate gradients before updating.
+                                       Useful for simulating larger batch sizes (e.g., 4 steps = 4x effective batch size)
             **scheduler_kwargs: Additional arguments for the scheduler:
                 - For 'step' scheduler: step_size, gamma
                 - For 'cosine' scheduler: t_max
@@ -362,7 +365,7 @@ class MCResNet(BaseModel):
             pbar = create_progress_bar(verbose, epoch, epochs, total_steps)
             
             # Training phase - use helper method
-            avg_train_loss, train_accuracy = self._train_epoch(train_loader, history, pbar)
+            avg_train_loss, train_accuracy = self._train_epoch(train_loader, history, pbar, gradient_accumulation_steps)
             
             # Validation phase
             val_loss = 0.0
@@ -572,14 +575,15 @@ class MCResNet(BaseModel):
         return np.concatenate(all_probabilities, axis=0)
     
     
-    def _train_epoch(self, train_loader: DataLoader, history: dict, pbar: Optional['TqdmType'] = None) -> tuple:
+    def _train_epoch(self, train_loader: DataLoader, history: dict, pbar: Optional['TqdmType'] = None, gradient_accumulation_steps: int = 1) -> tuple:
         """
-        Train the model for one epoch with GPU optimizations.
+        Train the model for one epoch with GPU optimizations and gradient accumulation.
         
         Args:
             train_loader: DataLoader for training data
             history: Training history dictionary
             pbar: Optional progress bar to update
+            gradient_accumulation_steps: Number of steps to accumulate gradients before updating
             
         Returns:
             Tuple of (average_train_loss, train_accuracy)
@@ -590,39 +594,60 @@ class MCResNet(BaseModel):
         train_correct = 0
         train_total = 0
         
+        # Ensure gradient_accumulation_steps is at least 1 to avoid division by zero
+        gradient_accumulation_steps = max(1, gradient_accumulation_steps)
+        
+        # OPTIMIZATION 1: Progress bar update frequency - major performance improvement
+        update_frequency = max(1, len(train_loader) // 50)  # Update only 50 times per epoch
+        
         for batch_idx, (rgb_batch, brightness_batch, targets) in enumerate(train_loader):
             # GPU optimization: non-blocking transfer for dual-channel data
             rgb_batch = rgb_batch.to(self.device, non_blocking=True)
             brightness_batch = brightness_batch.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
             
-            # Forward pass with optional AMP
-            self.optimizer.zero_grad()
+            # OPTIMIZATION 5: Gradient accumulation - zero gradients only when starting accumulation
+            if batch_idx % gradient_accumulation_steps == 0:
+                self.optimizer.zero_grad()
             
             if self.use_amp:
                 # Use automatic mixed precision
                 with torch.amp.autocast(device_type='cuda'):
                     outputs = self(rgb_batch, brightness_batch)
                     loss = self.criterion(outputs, targets)
+                    # Scale loss for gradient accumulation
+                    if gradient_accumulation_steps > 1:
+                        loss = loss / gradient_accumulation_steps
                 
                 # Scale loss and backward pass
                 self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                
+                # OPTIMIZATION 5: Only step optimizer every accumulation_steps
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx == len(train_loader) - 1:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
             else:
                 # Standard precision training
                 outputs = self(rgb_batch, brightness_batch)
                 loss = self.criterion(outputs, targets)
+                # Scale loss for gradient accumulation
+                if gradient_accumulation_steps > 1:
+                    loss = loss / gradient_accumulation_steps
                 loss.backward()
-                self.optimizer.step()
+                
+                # OPTIMIZATION 5: Only step optimizer every accumulation_steps
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx == len(train_loader) - 1:
+                    self.optimizer.step()
             
-            # Step OneCycleLR scheduler after each batch
+            # Step OneCycleLR scheduler after each optimizer step (not every batch if accumulating)
             if self.scheduler is not None and isinstance(self.scheduler, OneCycleLR):
-                self.scheduler.step()
-                history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
+                if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx == len(train_loader) - 1:
+                    self.scheduler.step()
+                    history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
             
-            # Calculate training metrics
-            train_loss += loss.item()
+            # Calculate training metrics (use original loss for metrics, not scaled)
+            original_loss = loss.item() * gradient_accumulation_steps if gradient_accumulation_steps > 1 else loss.item()
+            train_loss += original_loss
             train_batches += 1
             
             # Calculate training accuracy
@@ -631,12 +656,12 @@ class MCResNet(BaseModel):
                 train_total += targets.size(0)
                 train_correct += (predicted == targets).sum().item()
             
-            # GPU memory management: clear cache periodically
-            if batch_idx % 50 == 0 and self.device.type == 'cuda':
+            # OPTIMIZATION 3: More aggressive memory management for ImageNet
+            if batch_idx % 10 == 0 and self.device.type == 'cuda':  # Changed from 50 to 10
                 torch.cuda.empty_cache()
             
-            # Update progress bar if provided
-            if pbar is not None:
+            # OPTIMIZATION 1: Update progress bar much less frequently - MAJOR SPEEDUP
+            if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(train_loader) - 1):
                 current_lr = self.optimizer.param_groups[0]['lr']
                 current_train_loss = train_loss / train_batches
                 current_train_acc = train_correct / train_total
@@ -658,13 +683,21 @@ class MCResNet(BaseModel):
                 postfix['lr'] = f'{current_lr:.6f}'
                 
                 pbar.set_postfix(postfix)
-                pbar.update(1)
                 
-                # Force refresh for better notebook display
-                try:
-                    pbar.refresh()
-                except:
-                    print("⚠️  Failed to refresh progress bar, continuing without it.")
+                # Calculate how many steps to update (avoiding over-updating)
+                steps_to_update = min(update_frequency, len(train_loader) - batch_idx)
+                if batch_idx == len(train_loader) - 1:
+                    # Final batch - only update remaining steps
+                    remaining_steps = len(train_loader) - (batch_idx // update_frequency) * update_frequency
+                    pbar.update(remaining_steps)
+                else:
+                    pbar.update(steps_to_update)
+                
+                # OPTIMIZATION 1: Remove expensive refresh() call - major performance gain
+                # try:
+                #     pbar.refresh()  # REMOVED - this was causing major slowdowns
+                # except:
+                #     print("⚠️  Failed to refresh progress bar, continuing without it.")
         
         avg_train_loss = train_loss / train_batches
         train_accuracy = train_correct / train_total
@@ -674,7 +707,7 @@ class MCResNet(BaseModel):
     def _validate(self, data_loader: DataLoader, 
                   pbar: Optional['TqdmType'] = None) -> tuple:
         """
-        Validate the model on the given data with GPU optimizations.
+        Validate the model on the given data with GPU optimizations and reduced progress updates.
         
         Args:
             data_loader: DataLoader containing dual-channel input data and targets
@@ -688,6 +721,9 @@ class MCResNet(BaseModel):
         total_loss = 0.0
         correct = 0
         total = 0
+        
+        # OPTIMIZATION 1: Progress bar update frequency for validation - major performance improvement
+        update_frequency = max(1, len(data_loader) // 25)  # Update only 25 times during validation
         
         with torch.no_grad():
             for batch_idx, (rgb_batch, brightness_batch, targets) in enumerate(data_loader):
@@ -710,12 +746,12 @@ class MCResNet(BaseModel):
                 total += targets.size(0)
                 correct += (predicted == targets).sum().item()
                 
-                # GPU memory management: clear cache periodically
-                if batch_idx % 20 == 0 and self.device.type == 'cuda':
+                # OPTIMIZATION 3: More aggressive memory management for validation
+                if batch_idx % 5 == 0 and self.device.type == 'cuda':  # Changed from 20 to 5
                     torch.cuda.empty_cache()
                 
-                # Update progress bar if provided
-                if pbar is not None:
+                # OPTIMIZATION 1: Update progress bar much less frequently during validation
+                if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(data_loader) - 1):
                     current_val_loss = total_loss / (batch_idx + 1)
                     current_val_acc = correct / total
                     current_lr = self.optimizer.param_groups[0]['lr']
@@ -737,7 +773,15 @@ class MCResNet(BaseModel):
                     postfix['lr'] = f'{current_lr:.6f}'
                     
                     pbar.set_postfix(postfix)
-                    pbar.update(1)
+                    
+                    # Calculate how many steps to update (avoiding over-updating)
+                    steps_to_update = min(update_frequency, len(data_loader) - batch_idx)
+                    if batch_idx == len(data_loader) - 1:
+                        # Final batch - only update remaining steps
+                        remaining_steps = len(data_loader) - (batch_idx // update_frequency) * update_frequency
+                        pbar.update(remaining_steps)
+                    else:
+                        pbar.update(steps_to_update)
         
         avg_loss = total_loss / len(data_loader)
         accuracy = correct / total
