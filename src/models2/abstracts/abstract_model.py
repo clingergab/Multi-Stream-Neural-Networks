@@ -4,7 +4,7 @@ import numpy as np
 from abc import ABC, abstractmethod
 from typing import Dict, List, Union, Optional, Any, Tuple, Callable
 from torch.utils.data import DataLoader
-from torch.amp import GradScaler
+from torch.amp import GradScaler, autocast
 import time
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -110,7 +110,7 @@ class BaseModel(nn.Module, ABC):
         # Set up automatic mixed precision (AMP) for CUDA
         if self.device.type == 'cuda' and use_amp:
             self.use_amp = True
-            self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = GradScaler()  # Use the imported GradScaler
             print(f"✅ Enabled Automatic Mixed Precision (AMP) training on {self.device}")
         else:
             self.use_amp = False

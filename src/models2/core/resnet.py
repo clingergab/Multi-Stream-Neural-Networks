@@ -4,6 +4,7 @@ import time
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.amp import GradScaler  # Add GradScaler import
 from torch.utils.data import DataLoader
 from torch.optim import Adam, SGD, AdamW
 from torch.optim.lr_scheduler import OneCycleLR
@@ -130,7 +131,7 @@ class ResNet(nn.Module):
         # Set up automatic mixed precision (AMP) for CUDA
         if self.device.type == 'cuda' and use_amp:
             self.use_amp = True
-            self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = GradScaler()  # Use the imported GradScaler
             print(f"✅ Enabled Automatic Mixed Precision (AMP) training on {self.device}")
         else:
             self.use_amp = False

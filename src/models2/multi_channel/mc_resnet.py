@@ -13,6 +13,7 @@ from models2.abstracts.abstract_model import BaseModel
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.amp import autocast  # Add autocast import
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
 from data_utils.dual_channel_dataset import DualChannelDataset, create_dual_channel_dataloaders, create_dual_channel_dataloader 
@@ -612,7 +613,7 @@ class MCResNet(BaseModel):
             
             if self.use_amp:
                 # Use automatic mixed precision
-                with torch.amp.autocast(device_type='cuda'):
+                with autocast(device_type=self.device.type):
                     outputs = self(rgb_batch, brightness_batch)
                     loss = self.criterion(outputs, targets)
                     # Scale loss for gradient accumulation
@@ -734,7 +735,7 @@ class MCResNet(BaseModel):
                 
                 # Use AMP for validation if enabled
                 if self.use_amp:
-                    with torch.amp.autocast(device_type='cuda'):
+                    with autocast(device_type=self.device.type):
                         outputs = self(rgb_batch, brightness_batch)
                         loss = self.criterion(outputs, targets)
                 else:
