@@ -63,7 +63,7 @@ class StreamingDualChannelDataset(Dataset):
         self._rgb_converter = RGBtoRGBL()
         
         # Handle single folder or multiple folders
-        if isinstance(data_folders, str):
+        if isinstance(data_folders, (str, Path)):
             data_folders = [data_folders]
         self.data_folders = [Path(folder) for folder in data_folders]
         

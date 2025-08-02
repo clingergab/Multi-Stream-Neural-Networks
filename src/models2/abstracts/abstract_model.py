@@ -22,7 +22,6 @@ class BaseModel(nn.Module, ABC):
     DEFAULT_COMPILE_CONFIG = {
         'learning_rate': 0.001,
         'weight_decay': 0.0,
-        'gradient_clip': 1.0,
         'scheduler': 'cosine'
     }
     
@@ -204,8 +203,8 @@ class BaseModel(nn.Module, ABC):
     
     def compile(self, optimizer: str = 'adam', learning_rate: float = None,
                 weight_decay: float = None, loss: str = 'cross_entropy', 
-                metrics: List[str] = None, gradient_clip: float = None, 
-                scheduler: str = None, min_lr: float = 1e-6, **kwargs):
+                metrics: List[str] = None, scheduler: str = None, 
+                min_lr: float = 1e-6, **kwargs):
         """
         Compile the model with the specified optimization parameters.
         
@@ -215,7 +214,6 @@ class BaseModel(nn.Module, ABC):
             weight_decay: Weight decay for regularization (uses class default if None)
             loss: Loss function name ('cross_entropy', 'focal')
             metrics: List of metrics to track
-            gradient_clip: Maximum norm for gradient clipping (uses class default if None)
             scheduler: Learning rate scheduler (uses class default if None)
             min_lr: Minimum learning rate for schedulers
             device: Device to use for computation ('cpu', 'cuda', 'mps', etc.)
@@ -230,8 +228,6 @@ class BaseModel(nn.Module, ABC):
             learning_rate = config['learning_rate']
         if weight_decay is None:
             weight_decay = config['weight_decay']
-        if gradient_clip is None:
-            gradient_clip = config['gradient_clip']
         if scheduler is None:
             scheduler = config['scheduler']
         
@@ -295,7 +291,6 @@ class BaseModel(nn.Module, ABC):
             'weight_decay': weight_decay,
             'loss': loss.lower(),
             'metrics': metrics or ['accuracy'],
-            'gradient_clip': gradient_clip,
             'scheduler': scheduler.lower() if scheduler else 'none',
             'min_lr': min_lr,
             'device': str(self.device),
@@ -311,9 +306,8 @@ class BaseModel(nn.Module, ABC):
         # Log compilation details
         model_name = self.__class__.__name__
         print(f"{model_name} compiled with {optimizer} optimizer, {loss} loss")
-        print(f"  Learning rate: {learning_rate}, Weight decay: {weight_decay}")
+        print(f"  Learning rate: {learning_rate}, Weight decay: {weight_decay}, Scheduler: {scheduler}")
         print(f"  Device: {self.device}, AMP: {self.use_amp}")
-        print(f"  Gradient clip: {gradient_clip}, Scheduler: {scheduler}")
         print("  Using architecture-specific defaults where applicable")
         
         return self
