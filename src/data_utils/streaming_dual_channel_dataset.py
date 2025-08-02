@@ -441,10 +441,10 @@ def create_imagenet_dual_channel_train_val_dataloaders(
     truth_file: str,
     train_transform: Optional[Callable] = None,
     val_transform: Optional[Callable] = None,
-    batch_size: int = 32,
+    batch_size: int = 64,
     val_batch_size: Optional[int] = None,
     image_size: Tuple[int, int] = (224, 224),
-    num_workers: int = 4,
+    num_workers: Optional[int] = None,
     pin_memory: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 2
@@ -471,11 +471,14 @@ def create_imagenet_dual_channel_train_val_dataloaders(
     Returns:
         Tuple of (train_dataloader, val_dataloader)
     """
-    
     # Default validation batch size to training batch size if not specified
     if val_batch_size is None:
         print("no val_batch_size specified, using training batch size for validation")
         val_batch_size = batch_size
+    
+    # Auto-calc num_workers based on available CPU cores if not specified
+    if num_workers is None:
+        num_workers = max(1, os.cpu_count() // 2)
     
     # Create datasets
     train_dataset = StreamingDualChannelDataset(

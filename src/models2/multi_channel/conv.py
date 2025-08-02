@@ -319,10 +319,40 @@ class MCConv2d(_MCConvNd):
         return color_out, brightness_out
     
     def forward(self, color_input: Tensor, brightness_input: Tensor) -> tuple[Tensor, Tensor]:
-        """Forward pass through both convolution streams."""
-        return self._conv_forward(color_input, brightness_input, 
-                                 self.color_weight, self.brightness_weight,
-                                 self.color_bias, self.brightness_bias)
+        """Forward pass through both convolution streams using grouped convolution."""
+        # Combine inputs along channel dimension
+        input_combined = torch.cat([color_input, brightness_input], dim=1)
+        # Combine weights along output channel dimension
+        weight_combined = torch.cat([self.color_weight, self.brightness_weight], dim=0)
+        # Combine biases if present
+        bias_combined = None
+        if self.color_bias is not None:
+            bias_combined = torch.cat([self.color_bias, self.brightness_bias], dim=0)
+        # Apply convolution with grouping
+        if self.padding_mode != "zeros":
+            input_combined = F.pad(input_combined, self._reversed_padding_repeated_twice, mode=self.padding_mode)
+            out_combined = F.conv2d(
+                input_combined,
+                weight_combined,
+                bias_combined,
+                self.stride,
+                _pair(0),
+                self.dilation,
+                self.groups
+            )
+        else:
+            out_combined = F.conv2d(
+                input_combined,
+                weight_combined,
+                bias_combined,
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.groups
+            )
+        # Split combined output back into separate streams
+        color_out, brightness_out = out_combined.chunk(2, dim=1)
+        return color_out, brightness_out
     
     def forward_color(self, color_input: Tensor) -> Tensor:
         """Forward pass through color stream only."""

@@ -657,9 +657,9 @@ class MCResNet(BaseModel):
                 train_total += targets.size(0)
                 train_correct += (predicted == targets).sum().item()
             
-            # OPTIMIZATION 3: More aggressive memory management for ImageNet
-            if batch_idx % 10 == 0 and self.device.type == 'cuda':  # Changed from 50 to 10
-                torch.cuda.empty_cache()
+            # # OPTIMIZATION 3: More aggressive memory management for ImageNet
+            # if batch_idx % 10 == 0 and self.device.type == 'cuda':  # Changed from 50 to 10
+            #     torch.cuda.empty_cache()
             
             # OPTIMIZATION 1: Update progress bar much less frequently - MAJOR SPEEDUP
             if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(train_loader) - 1):
@@ -702,7 +702,9 @@ class MCResNet(BaseModel):
         
         avg_train_loss = train_loss / train_batches
         train_accuracy = train_correct / train_total
-        
+        # OPTIMIZATION: clear CUDA cache once per epoch
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
         return avg_train_loss, train_accuracy
     
     def _validate(self, data_loader: DataLoader, 
