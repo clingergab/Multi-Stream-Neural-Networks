@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch import Tensor
 from torch.amp import autocast  # Add autocast import
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
 from data_utils.dual_channel_dataset import DualChannelDataset, create_dual_channel_dataloaders, create_dual_channel_dataloader 
 from models2.common import (
     setup_scheduler,
@@ -65,7 +65,7 @@ class MCResNet(BaseModel):
         layers: list[int],
         num_classes: int,
         zero_init_residual: bool = False,
-        groups: int = 1,
+        groups: int = 2,
         width_per_group: int = 64,
         replace_stride_with_dilation: Optional[list[bool]] = None,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
@@ -323,18 +323,18 @@ class MCResNet(BaseModel):
             raise ValueError("Model not compiled. Call compile() before fit().")
         
         # Handle tensor inputs by converting to DataLoaders
-        if train_loader is None:
-            # Create DataLoaders from tensor data
-            if train_color_data is None or train_brightness_data is None or train_targets is None:
-                raise ValueError("Either provide train_loader or all of train_color_data, train_brightness_data, and train_targets")
+        # if train_loader is None:
+        #     # Create DataLoaders from tensor data
+        #     if train_color_data is None or train_brightness_data is None or train_targets is None:
+        #         raise ValueError("Either provide train_loader or all of train_color_data, train_brightness_data, and train_targets")
             
-            # Create both train and validation DataLoaders
-            print("🔄 Creating DataLoaders from tensors in MCResNet fit() for training using create_dual_channel_dataloaders")
-            train_loader, val_loader = create_dual_channel_dataloaders(
-                train_color_data, train_brightness_data, train_targets,
-                val_color_data, val_brightness_data, val_targets,
-                batch_size=batch_size, num_workers=0
-            )
+        #     # Create both train and validation DataLoaders
+        #     print("🔄 Creating DataLoaders from tensors in MCResNet fit() for training using create_dual_channel_dataloaders")
+        #     train_loader, val_loader = create_dual_channel_dataloaders(
+        #         train_color_data, train_brightness_data, train_targets,
+        #         val_color_data, val_brightness_data, val_targets,
+        #         batch_size=batch_size, num_workers=0
+        #     )
         
         callbacks = callbacks or []
         
@@ -399,8 +399,9 @@ class MCResNet(BaseModel):
                             print("🔄 Restored best model weights")
                     break
             
-            # Update learning rate scheduler and get current LR
-            update_scheduler(self.scheduler, val_loss)
+            # Step ReduceLROnPlateau scheduler at epoch end if used
+            if self.scheduler is not None and isinstance(self.scheduler, ReduceLROnPlateau):
+                self.scheduler.step(val_loss)
             current_lr = self.optimizer.param_groups[0]['lr']
             
             # Update history and finalize progress bar
@@ -638,7 +639,12 @@ class MCResNet(BaseModel):
                 
                 # OPTIMIZATION 5: Only step optimizer every accumulation_steps
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx == len(train_loader) - 1:
+                    # 1) update weights
                     self.optimizer.step()
+                    # 2) step non-OneCycle and non-Plateau schedulers immediately
+                    if self.scheduler is not None and not isinstance(self.scheduler, (OneCycleLR, ReduceLROnPlateau)):
+                        self.scheduler.step()
+                        history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
             
             # Step OneCycleLR scheduler after each optimizer step (not every batch if accumulating)
             if self.scheduler is not None and isinstance(self.scheduler, OneCycleLR):
