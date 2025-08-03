@@ -65,7 +65,7 @@ class MCResNet(BaseModel):
         layers: list[int],
         num_classes: int,
         zero_init_residual: bool = False,
-        groups: int = 2,
+        groups: int = 1,
         width_per_group: int = 64,
         replace_stride_with_dilation: Optional[list[bool]] = None,
         norm_layer: Optional[Callable[..., nn.Module]] = None,

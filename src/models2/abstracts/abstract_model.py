@@ -307,7 +307,7 @@ class BaseModel(nn.Module, ABC):
         model_name = self.__class__.__name__
         print(f"{model_name} compiled with {optimizer} optimizer, {loss} loss")
         print(f"  Learning rate: {learning_rate}, Weight decay: {weight_decay}, Scheduler: {scheduler}")
-        print(f"  Device: {self.device}, AMP: {self.use_amp}")
+        print(f"  Device: {self.device}, AMP: {self.use_amp}, Groups: {self.groups}, Width per group: {self.base_width}")
         print("  Using architecture-specific defaults where applicable")
         
         return self

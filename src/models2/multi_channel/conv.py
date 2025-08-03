@@ -329,6 +329,8 @@ class MCConv2d(_MCConvNd):
         if self.color_bias is not None:
             bias_combined = torch.cat([self.color_bias, self.brightness_bias], dim=0)
         # Apply convolution with grouping
+        # Determine effective groups = original groups * 2 (one per stream)
+        effective_groups = self.groups * 2
         if self.padding_mode != "zeros":
             input_combined = F.pad(input_combined, self._reversed_padding_repeated_twice, mode=self.padding_mode)
             out_combined = F.conv2d(
@@ -338,7 +340,7 @@ class MCConv2d(_MCConvNd):
                 self.stride,
                 _pair(0),
                 self.dilation,
-                self.groups
+                effective_groups
             )
         else:
             out_combined = F.conv2d(
@@ -348,7 +350,7 @@ class MCConv2d(_MCConvNd):
                 self.stride,
                 self.padding,
                 self.dilation,
-                self.groups
+                effective_groups
             )
         # Split combined output back into separate streams
         color_out, brightness_out = out_combined.chunk(2, dim=1)
