@@ -12,8 +12,10 @@ from .dual_channel_dataset import (
 # Streaming dual-channel dataset for ImageNet (large datasets)
 from .streaming_dual_channel_dataset import (
     StreamingDualChannelDataset,
+    StreamingDataset,
     create_imagenet_dual_channel_train_val_dataloaders,
     create_imagenet_dual_channel_test_dataloader,
+    create_imagenet_train_val_dataloaders,
     create_default_imagenet_transforms
 )
 
@@ -50,8 +52,10 @@ __all__ = [
 
     # Streaming dual-channel dataset for ImageNet
     'StreamingDualChannelDataset',
+    'StreamingDataset',
     'create_imagenet_dual_channel_train_val_dataloaders',
-    'create_imagenet_dual_channel_test_dataloader', 
+    'create_imagenet_dual_channel_test_dataloader',
+    'create_imagenet_train_val_dataloaders',
     'create_default_imagenet_transforms',
 
     # Legacy support
