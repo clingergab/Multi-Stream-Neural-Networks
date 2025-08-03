@@ -1,8 +1,24 @@
 """
-Multi-Channel convolution layers for separate color and brightness processing.
+Multi-Channel convolution layers for separate color an    def __init__(
+        self,
+        color_in_channels: int,
+        brightness_in_channels: int,
+        color_out_channels: int,
+        brightness_out_channels: int,
+        kernel_size: _size_2_t,
+        stride: _size_2_t = 1,
+        padding: Union[str, _size_2_t] = 0,
+        dilation: _size_2_t = 1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = "zeros",
+        device=None,
+        dtype=None,
+    ) -> None:ssing.
 """
 
 import math
+from click import group
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -319,7 +335,20 @@ class MCConv2d(_MCConvNd):
         return color_out, brightness_out
     
     def forward(self, color_input: Tensor, brightness_input: Tensor) -> tuple[Tensor, Tensor]:
-        """Forward pass through both convolution streams using grouped convolution."""
+        """Forward pass through both convolution streams using optimized approach."""
+        # Simple check: use grouped convolution for equal channels, separate for asymmetric
+        if self.color_in_channels == self.brightness_in_channels:
+            # Equal channels: use fast grouped convolution
+            return self._forward_grouped(color_input, brightness_input)
+        else:
+            # Asymmetric channels: use separate convolutions
+            return self._conv_forward(
+                color_input, brightness_input, self.color_weight, self.brightness_weight,
+                self.color_bias, self.brightness_bias
+            )
+    
+    def _forward_grouped(self, color_input: Tensor, brightness_input: Tensor) -> tuple[Tensor, Tensor]:
+        """Efficient grouped convolution for equal channel counts."""
         # Combine inputs along channel dimension
         input_combined = torch.cat([color_input, brightness_input], dim=1)
         # Combine weights along output channel dimension
@@ -328,9 +357,8 @@ class MCConv2d(_MCConvNd):
         bias_combined = None
         if self.color_bias is not None:
             bias_combined = torch.cat([self.color_bias, self.brightness_bias], dim=0)
-        # Apply convolution with grouping
-        # Determine effective groups = original groups * 2 (one per stream)
-        effective_groups = self.groups * 2
+        
+        # Apply convolution with groups*2 (groups per stream * 2 streams)
         if self.padding_mode != "zeros":
             input_combined = F.pad(input_combined, self._reversed_padding_repeated_twice, mode=self.padding_mode)
             out_combined = F.conv2d(
@@ -340,7 +368,7 @@ class MCConv2d(_MCConvNd):
                 self.stride,
                 _pair(0),
                 self.dilation,
-                effective_groups
+                groups=self.groups * 2
             )
         else:
             out_combined = F.conv2d(
@@ -350,10 +378,12 @@ class MCConv2d(_MCConvNd):
                 self.stride,
                 self.padding,
                 self.dilation,
-                effective_groups
+                groups=self.groups * 2
             )
+        
         # Split combined output back into separate streams
-        color_out, brightness_out = out_combined.chunk(2, dim=1)
+        color_out = out_combined[:, :self.color_out_channels]
+        brightness_out = out_combined[:, self.color_out_channels:]
         return color_out, brightness_out
     
     def forward_color(self, color_input: Tensor) -> Tensor:
@@ -391,6 +421,139 @@ class MCConv2d(_MCConvNd):
         return F.conv2d(
             brightness_input, self.brightness_weight, self.brightness_bias, self.stride, self.padding, self.dilation, self.groups
         )
+    
+    def _forward_interleaved(self, color_input: Tensor, brightness_input: Tensor) -> tuple[Tensor, Tensor]:
+        """Forward pass using channel interleaving for balanced processing."""
+        # Repeat brightness to match color channels for interleaving
+        if self.brightness_in_channels < self.color_in_channels:
+            # Repeat brightness channels to match color
+            repeat_factor = self.color_in_channels // self.brightness_in_channels
+            remainder = self.color_in_channels % self.brightness_in_channels
+            
+            brightness_repeated = brightness_input.repeat(1, repeat_factor, 1, 1)
+            if remainder > 0:
+                brightness_extra = brightness_input[:, :remainder, :, :]
+                brightness_repeated = torch.cat([brightness_repeated, brightness_extra], dim=1)
+        else:
+            brightness_repeated = brightness_input
+        
+        # Interleave channels: [C1, B1, C2, B2, C3, B3, ...]
+        channels = []
+        for i in range(max(self.color_in_channels, self.brightness_in_channels)):
+            if i < self.color_in_channels:
+                channels.append(color_input[:, i:i+1, :, :])
+            if i < brightness_repeated.size(1):
+                channels.append(brightness_repeated[:, i:i+1, :, :])
+        
+        interleaved_input = torch.cat(channels, dim=1)
+        
+        # Create interleaved weights
+        color_weight_expanded = self.color_weight.repeat_interleave(2, dim=1)
+        brightness_weight_expanded = self.brightness_weight.repeat_interleave(2, dim=1)
+        weight_interleaved = torch.cat([color_weight_expanded, brightness_weight_expanded], dim=0)
+        
+        # Apply convolution
+        if self.padding_mode != "zeros":
+            interleaved_input = F.pad(interleaved_input, self._reversed_padding_repeated_twice, mode=self.padding_mode)
+            out_combined = F.conv2d(
+                interleaved_input, weight_interleaved, None,
+                self.stride, _pair(0), self.dilation, groups=2
+            )
+        else:
+            out_combined = F.conv2d(
+                interleaved_input, weight_interleaved, None,
+                self.stride, self.padding, self.dilation, groups=2
+            )
+        
+        # De-interleave outputs
+        color_out = out_combined[:, :self.color_out_channels, :, :]
+        brightness_out = out_combined[:, self.color_out_channels:, :, :]
+        
+        return color_out, brightness_out
+        """Efficient grouped convolution for asymmetric channel counts using padding."""
+        # Find the maximum channel count to pad to
+        max_in_channels = max(self.color_in_channels, self.brightness_in_channels)
+        max_out_channels = max(self.color_out_channels, self.brightness_out_channels)
+        
+        # Pad inputs to equal channel counts
+        if self.color_in_channels < max_in_channels:
+            padding = max_in_channels - self.color_in_channels
+            color_input = F.pad(color_input, (0, 0, 0, 0, 0, padding), mode='constant', value=0)
+        
+        if self.brightness_in_channels < max_in_channels:
+            padding = max_in_channels - self.brightness_in_channels
+            brightness_input = F.pad(brightness_input, (0, 0, 0, 0, 0, padding), mode='constant', value=0)
+        
+        # Pad weights to equal channel counts
+        color_weight_padded = self.color_weight
+        brightness_weight_padded = self.brightness_weight
+        
+        if self.color_in_channels < max_in_channels:
+            in_padding = max_in_channels - self.color_in_channels
+            color_weight_padded = F.pad(color_weight_padded, (0, 0, 0, 0, 0, in_padding), mode='constant', value=0)
+        
+        if self.brightness_in_channels < max_in_channels:
+            in_padding = max_in_channels - self.brightness_in_channels
+            brightness_weight_padded = F.pad(brightness_weight_padded, (0, 0, 0, 0, 0, in_padding), mode='constant', value=0)
+        
+        if self.color_out_channels < max_out_channels:
+            out_padding = max_out_channels - self.color_out_channels
+            color_weight_padded = F.pad(color_weight_padded, (0, 0, 0, 0, 0, 0, 0, out_padding), mode='constant', value=0)
+        
+        if self.brightness_out_channels < max_out_channels:
+            out_padding = max_out_channels - self.brightness_out_channels
+            brightness_weight_padded = F.pad(brightness_weight_padded, (0, 0, 0, 0, 0, 0, 0, out_padding), mode='constant', value=0)
+        
+        # Combine padded inputs and weights
+        input_combined = torch.cat([color_input, brightness_input], dim=1)
+        weight_combined = torch.cat([color_weight_padded, brightness_weight_padded], dim=0)
+        
+        # Handle biases
+        bias_combined = None
+        if self.color_bias is not None:
+            color_bias_padded = self.color_bias
+            brightness_bias_padded = self.brightness_bias
+            
+            if self.color_out_channels < max_out_channels:
+                out_padding = max_out_channels - self.color_out_channels
+                color_bias_padded = F.pad(color_bias_padded, (0, out_padding), mode='constant', value=0)
+            
+            if self.brightness_out_channels < max_out_channels:
+                out_padding = max_out_channels - self.brightness_out_channels
+                brightness_bias_padded = F.pad(brightness_bias_padded, (0, out_padding), mode='constant', value=0)
+            
+            bias_combined = torch.cat([color_bias_padded, brightness_bias_padded], dim=0)
+        
+        # Apply grouped convolution
+        if self.padding_mode != "zeros":
+            input_combined = F.pad(input_combined, self._reversed_padding_repeated_twice, mode=self.padding_mode)
+            out_combined = F.conv2d(
+                input_combined,
+                weight_combined,
+                bias_combined,
+                self.stride,
+                _pair(0),
+                self.dilation,
+                groups=2
+            )
+        else:
+            out_combined = F.conv2d(
+                input_combined,
+                weight_combined,
+                bias_combined,
+                self.stride,
+                self.padding,
+                self.dilation,
+                groups=2
+            )
+        
+        # Split and unpad outputs to original channel counts
+        color_out = out_combined[:, :self.color_out_channels]
+        brightness_out = out_combined[:, max_out_channels:max_out_channels + self.brightness_out_channels]
+        
+        return color_out, brightness_out
+    
+
 
 class _MCNormBase(nn.Module):
     """Common base for Multi-Channel normalization - follows PyTorch's _NormBase pattern exactly."""
