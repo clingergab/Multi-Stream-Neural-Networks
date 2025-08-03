@@ -435,6 +435,320 @@ class StreamingDualChannelDataset(Dataset):
         
         return transforms.Compose(compatible_transforms)
 
+
+class StreamingDataset(Dataset):
+    """
+    A PyTorch Dataset that provides single-channel RGB data, loading ImageNet images 
+    from local folders on-the-fly.
+    
+    Features:
+    - Loads ImageNet data on-demand from local folder structure
+    - Standard PyTorch Dataset interface - works with any DataLoader
+    - Memory efficient - no pre-loading required
+    - Handles train (class names in filenames) and val/test (truth file) splits
+    - Modular architecture with single-responsibility methods for maintainability
+    
+    Architecture:
+    - Dataset building: _build_dataset(), _build_training_dataset(), _build_validation_test_dataset()
+    - Data collection: _collect_image_paths_from_folder(), _collect_all_image_paths()
+    - Label handling: _extract_class_from_filename(), _load_labels_from_truth_file(), _create_dummy_labels_for_test()
+    - Image loading: _load_and_preprocess_image()
+    """
+    
+    def __init__(
+        self,
+        data_folders: Union[str, List[str]],
+        split: str = "train",
+        truth_file: Optional[str] = None,
+        transform: Optional[Callable] = None,
+        image_size: Tuple[int, int] = (224, 224),
+        valid_extensions: Tuple[str, ...] = ('.JPEG', '.jpg', '.jpeg', '.png')
+    ):
+        """
+        Initialize the streaming single-channel dataset.
+        
+        Args:
+            data_folders: Path to folder(s) containing images. Can be:
+                - Single folder path (str)
+                - List of folder paths for multiple train folders
+            split: Dataset split ("train", "validation", "test")
+            truth_file: Path to truth file for validation/test splits.
+                       Expected format: one label per line corresponding to image order
+            transform: Transform applied to RGB channel
+            image_size: Target image size (H, W) for resizing
+            valid_extensions: Valid image file extensions
+        """
+        self.split = split
+        self.transform = transform
+        self.image_size = image_size
+        self.valid_extensions = valid_extensions
+        
+        # Handle single folder or multiple folders
+        if isinstance(data_folders, (str, Path)):
+            data_folders = [data_folders]
+        self.data_folders = [Path(folder) for folder in data_folders]
+        
+        # Validate folders exist
+        for folder in self.data_folders:
+            if not folder.exists():
+                raise FileNotFoundError(f"Data folder not found: {folder}")
+        
+        # Build image paths and labels
+        self.image_paths, self.labels = self._build_dataset(truth_file)
+        
+        print(f"✅ Loaded {split} split: {len(self.image_paths)} images from {len(self.data_folders)} folder(s)")
+    
+    def _build_dataset(self, truth_file: Optional[str]) -> Tuple[List[Path], List[int]]:
+        """
+        Build the dataset by scanning folders and extracting labels.
+        
+        Args:
+            truth_file: Path to truth file for val/test splits
+            
+        Returns:
+            Tuple of (image_paths, labels)
+        """
+        if self.split == "train":
+            return self._build_training_dataset()
+        else:
+            return self._build_validation_test_dataset(truth_file)
+    
+    def _build_training_dataset(self) -> Tuple[List[Path], List[int]]:
+        """
+        Build training dataset by extracting labels from filenames.
+        
+        Returns:
+            Tuple of (image_paths, labels)
+        """
+        image_paths = []
+        labels = []
+        class_to_idx = {}
+        
+        # Process all folders to collect paths and build class mapping
+        for folder in self.data_folders:
+            folder_paths, folder_labels, class_to_idx = self._process_training_folder(
+                folder, class_to_idx, len(class_to_idx)
+            )
+            image_paths.extend(folder_paths)
+            labels.extend(folder_labels)
+        
+        print(f"Found {len(class_to_idx)} classes in training data")
+        self.class_to_idx = class_to_idx
+        
+        return image_paths, labels
+    
+    def _process_training_folder(
+        self, 
+        folder: Path, 
+        class_to_idx: Dict[str, int], 
+        current_idx: int
+    ) -> Tuple[List[Path], List[int], Dict[str, int]]:
+        """
+        Process a single training folder to extract paths and labels.
+        
+        Args:
+            folder: Path to training folder
+            class_to_idx: Existing class name to index mapping
+            current_idx: Next available class index
+            
+        Returns:
+            Tuple of (folder_image_paths, folder_labels, updated_class_to_idx)
+        """
+        folder_image_paths = self._collect_image_paths_from_folder(folder)
+        valid_paths = []
+        folder_labels = []
+        
+        for img_path in folder_image_paths:
+            class_name = self._extract_class_from_filename(img_path)
+            if class_name:
+                # Map class name to index
+                if class_name not in class_to_idx:
+                    class_to_idx[class_name] = current_idx
+                    current_idx += 1
+                
+                valid_paths.append(img_path)
+                folder_labels.append(class_to_idx[class_name])
+        
+        return valid_paths, folder_labels, class_to_idx
+    
+    def _build_validation_test_dataset(self, truth_file: Optional[str]) -> Tuple[List[Path], List[int]]:
+        """
+        Build validation or test dataset using truth file or dummy labels.
+        
+        Args:
+            truth_file: Path to truth file for labels
+            
+        Returns:
+            Tuple of (image_paths, labels)
+        """
+        # Collect all image paths from all folders
+        image_paths = self._collect_all_image_paths()
+        
+        # Get labels from truth file or create dummy labels
+        labels = self._get_validation_test_labels(truth_file, len(image_paths))
+        
+        self.class_to_idx = None  # Not needed for val/test
+        return image_paths, labels
+    
+    def _collect_all_image_paths(self) -> List[Path]:
+        """
+        Collect all image paths from all data folders.
+        
+        Returns:
+            Sorted list of all image paths
+        """
+        all_image_paths = []
+        for folder in self.data_folders:
+            folder_image_paths = self._collect_image_paths_from_folder(folder)
+            all_image_paths.extend(folder_image_paths)
+        return sorted(all_image_paths)
+    
+    def _get_validation_test_labels(self, truth_file: Optional[str], num_images: int) -> List[int]:
+        """
+        Get labels for validation/test dataset from truth file or create dummy labels.
+        
+        Args:
+            truth_file: Path to truth file (optional)
+            num_images: Number of images in dataset
+            
+        Returns:
+            List of integer labels
+        """
+        if truth_file is None:
+            return self._create_dummy_labels_for_test(num_images)
+        else:
+            return self._load_labels_from_truth_file(truth_file, num_images)
+    
+    def _collect_image_paths_from_folder(self, folder: Path) -> List[Path]:
+        """
+        Collect all valid image paths from a single folder.
+        
+        Args:
+            folder: Path to folder to scan
+            
+        Returns:
+            Sorted list of image paths
+        """
+        folder_paths = []
+        for ext in self.valid_extensions:
+            folder_paths.extend(folder.glob(f"*{ext}"))
+        return sorted(folder_paths)
+    
+    def _extract_class_from_filename(self, img_path: Path) -> Optional[str]:
+        """
+        Extract class name from ImageNet training filename.
+        
+        Args:
+            img_path: Path to image file
+            
+        Returns:
+            Class name if valid format, None otherwise
+        """
+        filename = img_path.stem
+        if '_' in filename:
+            return filename.split('_')[0]  # First part before underscore
+        return None
+    
+    def _create_dummy_labels_for_test(self, num_images: int) -> List[int]:
+        """
+        Create dummy labels for test set when no truth file is provided.
+        
+        Args:
+            num_images: Number of images in dataset
+            
+        Returns:
+            List of dummy labels (all zeros)
+        """
+        if self.split == "test":
+            print(f"Warning: No truth file provided for test split. Using dummy labels.")
+            return [0] * num_images
+        else:
+            raise ValueError(f"truth_file required for {self.split} split")
+    
+    def _load_labels_from_truth_file(self, truth_file: str, num_images: int) -> List[int]:
+        """
+        Load labels from truth file and validate count.
+        
+        Args:
+            truth_file: Path to truth file
+            num_images: Expected number of images
+            
+        Returns:
+            List of integer labels
+            
+        Raises:
+            FileNotFoundError: If truth file doesn't exist
+            ValueError: If label count doesn't match image count
+        """
+        truth_path = Path(truth_file)
+        if not truth_path.exists():
+            raise FileNotFoundError(f"Truth file not found: {truth_path}")
+        
+        # Load truth labels
+        with open(truth_path, 'r') as f:
+            truth_labels = [int(line.strip()) for line in f]
+        
+        # Validate we have the right number of labels
+        if num_images != len(truth_labels):
+            raise ValueError(
+                f"Mismatch between images ({num_images}) and truth labels ({len(truth_labels)})"
+            )
+        
+        return truth_labels
+    
+    def __len__(self) -> int:
+        """Return dataset length."""
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get a single sample.
+        
+        Returns:
+            Tuple of (rgb_tensor, label)
+        """
+        # Load image and label
+        img_path = self.image_paths[idx]
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        
+        # Load and preprocess RGB image
+        rgb = self._load_and_preprocess_image(img_path)
+        
+        # Apply transform if provided
+        if self.transform:
+            rgb = self.transform(rgb)
+        
+        return rgb, label
+    
+    def _load_and_preprocess_image(self, img_path: Path) -> torch.Tensor:
+        """
+        Load image from path and convert to RGB tensor.
+        
+        Args:
+            img_path: Path to image file
+            
+        Returns:
+            RGB tensor
+            
+        Raises:
+            RuntimeError: If image loading fails
+        """
+        try:
+            # Load and convert to RGB
+            image = Image.open(img_path).convert('RGB')
+            
+            # Resize to target size
+            image = image.resize(self.image_size, Image.LANCZOS)
+            
+            # Convert to tensor
+            rgb = transforms.ToTensor()(image)
+            
+            return rgb
+            
+        except Exception as e:
+            raise RuntimeError(f"Error loading image {img_path}: {e}")
+
+
 def create_imagenet_dual_channel_train_val_dataloaders(
     train_folders: Union[str, List[str]],
     val_folder: str,
@@ -574,6 +888,94 @@ def create_imagenet_dual_channel_test_dataloader(
     )
 
     return test_loader
+
+
+def create_imagenet_train_val_dataloaders(
+    train_folders: Union[str, List[str]],
+    val_folder: str,
+    truth_file: str,
+    train_transform: Optional[Callable] = None,
+    val_transform: Optional[Callable] = None,
+    batch_size: int = 64,
+    val_batch_size: Optional[int] = None,
+    image_size: Tuple[int, int] = (224, 224),
+    num_workers: Optional[int] = None,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 2
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Create train and validation dataloaders for ImageNet with single-channel (RGB only) output.
+    
+    Args:
+        train_folders: Path(s) to training folder(s). Can be:
+            - Single folder: '/path/to/train_images_0'
+            - Multiple folders: ['/path/to/train_images_0', '/path/to/train_images_1', ...]
+        val_folder: Path to validation folder
+        truth_file: Path to validation truth file (ILSVRC2012_validation_ground_truth.txt)
+        train_transform: Transform to apply to training data (RGB only)
+        val_transform: Transform to apply to validation data (RGB only)
+        batch_size: Batch size for training
+        val_batch_size: Batch size for validation (defaults to batch_size if not specified)
+        image_size: Target image size (H, W) for resizing
+        num_workers: Number of parallel data loading workers
+        pin_memory: Whether to pin memory for faster CPU→GPU transfer
+        persistent_workers: Whether to keep workers alive between epochs
+        prefetch_factor: Number of batches to prefetch per worker
+    
+    Returns:
+        Tuple of (train_dataloader, val_dataloader) - each returns (rgb_tensor, label)
+    """
+    # Default validation batch size to training batch size if not specified
+    if val_batch_size is None:
+        print("no val_batch_size specified, using training batch size for validation")
+        val_batch_size = batch_size
+    
+    # Auto-calc num_workers based on available CPU cores if not specified
+    if num_workers is None:
+        num_workers = max(1, os.cpu_count() // 2)
+    
+    # Create datasets
+    train_dataset = StreamingDataset(
+        data_folders=train_folders,
+        split="train",
+        truth_file=None,  # Training uses filename labels
+        transform=train_transform,
+        image_size=image_size
+    )
+    
+    val_dataset = StreamingDataset(
+        data_folders=val_folder,
+        split="validation",
+        truth_file=truth_file,
+        transform=val_transform,
+        image_size=image_size
+    )
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        drop_last=True  # Drop incomplete batches for consistent training
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=val_batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        drop_last=False  # Keep all validation samples
+    )
+    
+    return train_loader, val_loader
 
 
 def create_default_imagenet_transforms(
