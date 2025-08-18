@@ -292,8 +292,8 @@ class MCConv2d(_MCConvNd):
             **factory_kwargs,
         )
         # Create dedicated streams for each pathway
-        self.color_stream = torch.cuda.Stream()
-        self.brightness_stream = torch.cuda.Stream()
+        # self.color_stream = torch.cuda.Stream()
+        # self.brightness_stream = torch.cuda.Stream()
     
     def _conv_forward(self, color_input: Tensor, brightness_input: Tensor,
                      color_weight: Tensor, brightness_weight: Tensor,
@@ -389,22 +389,39 @@ class MCConv2d(_MCConvNd):
     def forward_streams(self, color_input: Tensor, brightness_input: Tensor) -> tuple[Tensor, Tensor]:
         """Optimized forward with CUDA streams while maintaining separation."""
         
-        # Use separate streams for true parallelism
-        with torch.cuda.stream(self.color_stream):
+        # Only use CUDA streams if CUDA is available and inputs are on CUDA
+        if torch.cuda.is_available() and color_input.is_cuda and brightness_input.is_cuda:
+            # Create streams lazily
+            if self._color_stream is None:
+                self._color_stream = torch.cuda.Stream()
+                self._brightness_stream = torch.cuda.Stream()
+            
+            # Use separate streams for true parallelism
+            with torch.cuda.stream(self._color_stream):
+                color_output = F.conv2d(
+                    color_input, self.color_weight, self.color_bias,
+                    self.stride, self.padding, self.dilation, self.groups
+                )
+            
+            with torch.cuda.stream(self._brightness_stream):
+                brightness_output = F.conv2d(
+                    brightness_input, self.brightness_weight, self.brightness_bias,
+                    self.stride, self.padding, self.dilation, self.groups
+                )
+            
+            # Synchronize both streams before returning
+            self._color_stream.synchronize()
+            self._brightness_stream.synchronize()
+        else:
+            # Fall back to regular forward pass without streams
             color_output = F.conv2d(
                 color_input, self.color_weight, self.color_bias,
                 self.stride, self.padding, self.dilation, self.groups
             )
-        
-        with torch.cuda.stream(self.brightness_stream):
             brightness_output = F.conv2d(
                 brightness_input, self.brightness_weight, self.brightness_bias,
                 self.stride, self.padding, self.dilation, self.groups
             )
-        
-        # Synchronize both streams before returning
-        self.color_stream.synchronize()
-        self.brightness_stream.synchronize()
         
         return color_output, brightness_output
 
