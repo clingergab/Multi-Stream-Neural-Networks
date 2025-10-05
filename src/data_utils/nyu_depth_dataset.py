@@ -46,9 +46,10 @@ class NYUDepthV2Dataset(Dataset):
         self.num_classes = num_classes
 
         # Load images and depths
-        self.images = self.h5_file['images']  # Shape: [3, 640, 480, N]
-        self.depths = self.h5_file['depths']  # Shape: [640, 480, N]
-        self.labels = self.h5_file['labels']  # Shape: [640, 480, N] - semantic labels
+        # MATLAB stores in column-major order, so dimensions are reversed
+        self.images = self.h5_file['images']  # Actual shape in HDF5: [N, W, H, 3] due to MATLAB
+        self.depths = self.h5_file['depths']  # Actual shape in HDF5: [N, W, H] due to MATLAB
+        self.labels = self.h5_file['labels']  # Actual shape in HDF5: [N, W, H] due to MATLAB
 
         # Get scene labels (if available) or create from semantic labels
         if 'scenes' in self.h5_file:
@@ -58,7 +59,8 @@ class NYUDepthV2Dataset(Dataset):
             self.scenes = self._create_scene_labels()
 
         # Train/test split (80/20)
-        num_samples = self.images.shape[3]
+        # Due to MATLAB format, samples are in first dimension
+        num_samples = self.images.shape[0]
         split_idx = int(num_samples * 0.8)
 
         if train:
@@ -70,13 +72,13 @@ class NYUDepthV2Dataset(Dataset):
         """Create scene labels from semantic segmentation (fallback)."""
         # This is a simplified approach - you may need to customize
         # based on actual NYU Depth V2 label structure
-        num_samples = self.labels.shape[2]
+        num_samples = self.labels.shape[0]  # MATLAB format: samples in first dim
         scene_labels = np.zeros(num_samples, dtype=np.int64)
 
         # Map semantic labels to scene categories (simplified)
         # You'll need to implement proper mapping based on NYU label definitions
         for i in range(num_samples):
-            label_img = self.labels[:, :, i]
+            label_img = self.labels[i, :, :]  # MATLAB format indexing
             # Use mode (most common label) as scene indicator
             unique, counts = np.unique(label_img, return_counts=True)
             dominant_label = unique[np.argmax(counts)]
@@ -96,13 +98,28 @@ class NYUDepthV2Dataset(Dataset):
         """
         real_idx = self.indices[idx]
 
-        # Load RGB image [3, 640, 480]
-        rgb = self.images[:, :, :, real_idx]
-        rgb = np.transpose(rgb, (1, 2, 0))  # [640, 480, 3]
-        rgb = Image.fromarray(rgb.astype(np.uint8))
+        # Load RGB image - MATLAB HDF5 format is [N, W, H, 3] (reversed from Python)
+        rgb = self.images[real_idx, :, :, :]  # Shape: [W, H, 3]
 
-        # Load Depth map [640, 480]
-        depth = self.depths[:, :, real_idx]
+        # Transpose from MATLAB [W, H, C] to PIL [H, W, C]
+        rgb = np.transpose(rgb, (1, 0, 2))  # [H, W, 3]
+
+        # Handle potential data type issues
+        if rgb.dtype != np.uint8:
+            # Scale to 0-255 if needed
+            if rgb.max() <= 1.0:
+                rgb = (rgb * 255).astype(np.uint8)
+            else:
+                rgb = rgb.astype(np.uint8)
+
+        rgb = Image.fromarray(rgb, mode='RGB')
+
+        # Load Depth map - MATLAB format [N, W, H]
+        depth = self.depths[real_idx, :, :]  # Shape: [W, H]
+
+        # Transpose from MATLAB [W, H] to PIL [H, W]
+        depth = np.transpose(depth)  # [H, W]
+
         # Normalize depth to 0-255 range for visualization/processing
         depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
         depth = (depth * 255).astype(np.uint8)
