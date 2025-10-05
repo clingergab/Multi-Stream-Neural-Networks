@@ -6,7 +6,7 @@ Provides RGB images + Depth maps for scene classification.
 import h5py
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from typing import Optional, Tuple, Callable
@@ -46,10 +46,10 @@ class NYUDepthV2Dataset(Dataset):
         self.num_classes = num_classes
 
         # Load images and depths
-        # MATLAB stores in column-major order, so dimensions are reversed
-        self.images = self.h5_file['images']  # Actual shape in HDF5: [N, W, H, 3] due to MATLAB
-        self.depths = self.h5_file['depths']  # Actual shape in HDF5: [N, W, H] due to MATLAB
-        self.labels = self.h5_file['labels']  # Actual shape in HDF5: [N, W, H] due to MATLAB
+        # NYU Depth V2 HDF5 format: [N, C, H, W] for images, [N, H, W] for depths
+        self.images = self.h5_file['images']  # Shape: [1449, 3, 640, 480]
+        self.depths = self.h5_file['depths']  # Shape: [1449, 640, 480]
+        self.labels = self.h5_file['labels']  # Shape: [1449, 640, 480]
 
         # Get scene labels (if available) or create from semantic labels
         if 'scenes' in self.h5_file:
@@ -59,9 +59,8 @@ class NYUDepthV2Dataset(Dataset):
             self.scenes = self._create_scene_labels()
 
         # Train/test split (80/20)
-        # Due to MATLAB format, samples are in first dimension
-        num_samples = self.images.shape[0]
-        split_idx = int(num_samples * 0.8)
+        num_samples = self.images.shape[0]  # 1449 total samples
+        split_idx = int(num_samples * 0.8)  # 1159 train, 290 val
 
         if train:
             self.indices = list(range(0, split_idx))
@@ -72,13 +71,13 @@ class NYUDepthV2Dataset(Dataset):
         """Create scene labels from semantic segmentation (fallback)."""
         # This is a simplified approach - you may need to customize
         # based on actual NYU Depth V2 label structure
-        num_samples = self.labels.shape[0]  # MATLAB format: samples in first dim
+        num_samples = self.labels.shape[0]
         scene_labels = np.zeros(num_samples, dtype=np.int64)
 
         # Map semantic labels to scene categories (simplified)
         # You'll need to implement proper mapping based on NYU label definitions
         for i in range(num_samples):
-            label_img = self.labels[i, :, :]  # MATLAB format indexing
+            label_img = self.labels[i, :, :]  # [H, W]
             # Use mode (most common label) as scene indicator
             unique, counts = np.unique(label_img, return_counts=True)
             dominant_label = unique[np.argmax(counts)]
@@ -98,11 +97,11 @@ class NYUDepthV2Dataset(Dataset):
         """
         real_idx = self.indices[idx]
 
-        # Load RGB image - MATLAB HDF5 format is [N, W, H, 3] (reversed from Python)
-        rgb = self.images[real_idx, :, :, :]  # Shape: [W, H, 3]
+        # Load RGB image - Format: [N, C, H, W] = [1449, 3, 640, 480]
+        rgb = self.images[real_idx, :, :, :]  # Shape: [3, 640, 480]
 
-        # Transpose from MATLAB [W, H, C] to PIL [H, W, C]
-        rgb = np.transpose(rgb, (1, 0, 2))  # [H, W, 3]
+        # Transpose from [C, H, W] to [H, W, C] for PIL
+        rgb = np.transpose(rgb, (1, 2, 0))  # [640, 480, 3]
 
         # Handle potential data type issues
         if rgb.dtype != np.uint8:
@@ -114,11 +113,8 @@ class NYUDepthV2Dataset(Dataset):
 
         rgb = Image.fromarray(rgb, mode='RGB')
 
-        # Load Depth map - MATLAB format [N, W, H]
-        depth = self.depths[real_idx, :, :]  # Shape: [W, H]
-
-        # Transpose from MATLAB [W, H] to PIL [H, W]
-        depth = np.transpose(depth)  # [H, W]
+        # Load Depth map - Format: [N, H, W] = [1449, 640, 480]
+        depth = self.depths[real_idx, :, :]  # Shape: [640, 480]
 
         # Normalize depth to 0-255 range for visualization/processing
         depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
@@ -205,8 +201,6 @@ def create_nyu_dataloaders(
     Returns:
         Tuple of (train_loader, val_loader)
     """
-    from torch.utils.data import DataLoader
-
     # Create datasets
     train_dataset = NYUDepthV2Dataset(
         h5_file_path,
