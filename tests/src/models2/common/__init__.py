@@ -1,1 +1,0 @@
-# Common model helpers tests

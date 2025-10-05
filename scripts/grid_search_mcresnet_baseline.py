@@ -26,7 +26,7 @@ from torchvision import transforms
 try:
     from data_utils.dataset_utils import load_cifar100_data
     from data_utils.rgb_to_rgbl import RGBtoRGBL
-    from models2.multi_channel.mc_resnet import mc_resnet50
+    from models.multi_channel.mc_resnet import mc_resnet50
     from data_utils.dual_channel_dataset import create_dual_channel_dataloaders
 except ImportError as e:
     print(f"Error importing modules: {e}")

@@ -11,7 +11,7 @@ __email__ = "your.email@example.com"
 
 # Import main model implementations
 try:
-    from .models2 import (
+    from .models import (
         BaseModel, MCResNet, 
         mc_resnet18, mc_resnet34, mc_resnet50, mc_resnet101, mc_resnet152
     )
