@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # Loss function imports
-from training.losses import FocalLoss
+from src.training.losses import FocalLoss
 
 class BaseModel(nn.Module, ABC):
     """

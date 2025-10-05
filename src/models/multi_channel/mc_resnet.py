@@ -9,7 +9,7 @@ import numpy as np
 if TYPE_CHECKING:
     from tqdm import tqdm as TqdmType
 
-from models.abstracts.abstract_model import BaseModel
+from src.models.abstracts.abstract_model import BaseModel
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -17,8 +17,8 @@ from torch.amp import autocast
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
-from data_utils.dual_channel_dataset import DualChannelDataset, create_dual_channel_dataloaders, create_dual_channel_dataloader 
-from models.common import (
+from src.data_utils.dual_channel_dataset import DualChannelDataset, create_dual_channel_dataloaders, create_dual_channel_dataloader
+from src.models.common import (
     setup_scheduler,
     update_scheduler,
     save_checkpoint,
@@ -46,10 +46,10 @@ except:
     from tqdm import tqdm
 
 # Import the multi-channel components
-from models.multi_channel.conv import MCConv2d, MCBatchNorm2d
-from models.multi_channel.blocks import MCBasicBlock, MCBottleneck
-from models.multi_channel.container import MCSequential, MCReLU
-from models.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
+from src.models.multi_channel.conv import MCConv2d, MCBatchNorm2d
+from src.models.multi_channel.blocks import MCBasicBlock, MCBottleneck
+from src.models.multi_channel.container import MCSequential, MCReLU
+from src.models.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
 
 
 class MCResNet(BaseModel):

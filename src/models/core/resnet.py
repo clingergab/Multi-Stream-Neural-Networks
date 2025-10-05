@@ -8,8 +8,8 @@ from torch.amp import GradScaler  # Add GradScaler import
 from torch.utils.data import DataLoader
 from torch.optim import Adam, SGD, AdamW
 from torch.optim.lr_scheduler import OneCycleLR
-from training.losses import FocalLoss
-from models.common import (
+from src.training.losses import FocalLoss
+from src.models.common import (
     setup_scheduler,
     update_scheduler,
     save_checkpoint,
