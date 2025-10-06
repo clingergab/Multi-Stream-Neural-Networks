@@ -628,6 +628,16 @@ class MCResNet(BaseModel):
 
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+
+                    # Step scheduler after optimizer update
+                    if self.scheduler is not None:
+                        if isinstance(self.scheduler, OneCycleLR):
+                            self.scheduler.step()
+                            history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
+                        elif not isinstance(self.scheduler, ReduceLROnPlateau):
+                            # Other schedulers (Cosine, Step, etc.) step per optimizer update
+                            self.scheduler.step()
+                            history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
             else:
                 # Standard precision training
                 outputs = self(rgb_batch, brightness_batch)
