@@ -293,7 +293,9 @@ class BaseModel(nn.Module, ABC):
         
         # Configure loss function - only standard losses supported
         if loss.lower() == 'cross_entropy':
-            self.criterion = nn.CrossEntropyLoss()
+            # Add label smoothing for better regularization (prevents overconfident predictions)
+            label_smoothing = kwargs.get('label_smoothing', 0.0)
+            self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         elif loss.lower() == 'focal':
             alpha = kwargs.get('alpha', 1.0)
             gamma = kwargs.get('gamma', 2.0)
