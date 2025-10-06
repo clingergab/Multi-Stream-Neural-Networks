@@ -53,11 +53,9 @@ class NYUDepthV2Dataset(Dataset):
             # Get scene labels (if available) or create from semantic labels
             if 'scenes' in f:
                 scenes_data = f['scenes']
-                print(f"[DEBUG INIT] scenes shape: {scenes_data.shape}, dtype: {scenes_data.dtype}")
 
-                # Check if it contains HDF5 references
+                # Check if it contains HDF5 references (MATLAB format)
                 if scenes_data.dtype == h5py.ref_dtype:
-                    print("[DEBUG INIT] scenes contains HDF5 references, dereferencing...")
                     # Dereference each element
                     self.scenes = np.zeros((1, num_samples), dtype=np.int64)
                     for i in range(num_samples):
@@ -65,8 +63,6 @@ class NYUDepthV2Dataset(Dataset):
                         self.scenes[0, i] = int(f[ref][0]) if ref else 0
                 else:
                     self.scenes = np.array(scenes_data)  # Load into memory
-
-                print(f"[DEBUG INIT] scenes loaded: shape {self.scenes.shape}, dtype {self.scenes.dtype}")
             else:
                 # Create scene labels from dominant semantic class
                 self.scenes = self._create_scene_labels_from_file(f)
@@ -84,6 +80,12 @@ class NYUDepthV2Dataset(Dataset):
         self._images = None
         self._depths = None
         self._labels = None
+
+        # Pre-create normalization transform (reusable)
+        self.rgb_normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
 
     def _create_scene_labels_from_file(self, h5_file):
         """Create scene labels from semantic segmentation (fallback)."""
@@ -107,12 +109,10 @@ class NYUDepthV2Dataset(Dataset):
     def _open_hdf5(self):
         """Open HDF5 file in current process/worker."""
         if self._h5_file is None:
-            print(f"[DEBUG] Opening HDF5 file: {self.h5_file_path}")
             self._h5_file = h5py.File(self.h5_file_path, 'r')
             self._images = self._h5_file['images']
             self._depths = self._h5_file['depths']
             self._labels = self._h5_file['labels']
-            print(f"[DEBUG] HDF5 opened. Images shape: {self._images.shape}, Depths shape: {self._depths.shape}")
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -129,30 +129,16 @@ class NYUDepthV2Dataset(Dataset):
 
         real_idx = self.indices[idx]
 
-        # DEBUG: Print dataset info
-        print(f"[DEBUG] Worker accessing index {idx} -> real_idx {real_idx}")
-        print(f"[DEBUG] Images dataset shape: {self._images.shape}")
-        print(f"[DEBUG] Images dataset type: {type(self._images)}")
-
         # Load RGB image - Format: [N, C, H, W] = [1449, 3, 640, 480]
         # HDF5 requires explicit conversion to numpy array
-        rgb_raw = self._images[real_idx]
-        print(f"[DEBUG] After indexing, rgb_raw shape: {rgb_raw.shape}, type: {type(rgb_raw)}")
-
-        rgb = np.array(rgb_raw)  # Shape: [3, 640, 480]
-        print(f"[DEBUG] After np.array(), rgb shape: {rgb.shape}, dtype: {rgb.dtype}")
+        rgb = np.array(self._images[real_idx])  # Shape: [3, 640, 480]
 
         # Transpose from [C, H, W] to [H, W, C] for PIL
         rgb = np.transpose(rgb, (1, 2, 0))  # [640, 480, 3]
-        print(f"[DEBUG] After transpose, rgb shape: {rgb.shape}")
 
-        # Handle potential data type issues
+        # NYU Depth V2 images are already uint8, but handle edge cases
         if rgb.dtype != np.uint8:
-            # Scale to 0-255 if needed
-            if rgb.max() <= 1.0:
-                rgb = (rgb * 255).astype(np.uint8)
-            else:
-                rgb = rgb.astype(np.uint8)
+            rgb = rgb.astype(np.uint8)
 
         rgb = Image.fromarray(rgb, mode='RGB')
 
@@ -195,10 +181,7 @@ class NYUDepthV2Dataset(Dataset):
             depth = self.transform(depth)
 
         # Apply ImageNet normalization to RGB only
-        rgb = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )(rgb)
+        rgb = self.rgb_normalize(rgb)
 
         return rgb, depth, label
 
