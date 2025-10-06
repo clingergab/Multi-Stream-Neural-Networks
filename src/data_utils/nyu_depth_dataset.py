@@ -236,12 +236,6 @@ def get_nyu_transforms(train: bool = True):
         return transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomRotation(degrees=15),  # Increased from 10 to 15
-            # Add random cropping for better regularization
-            transforms.RandomResizedCrop(
-                size=(416, 544),  # Target size (will be overridden by dataset)
-                scale=(0.8, 1.0),   # Crop 80-100% of image
-                ratio=(0.75, 1.33)  # Preserve roughly 3:4 aspect ratio
-            ),
         ])
     else:
         return None  # No augmentation for validation
