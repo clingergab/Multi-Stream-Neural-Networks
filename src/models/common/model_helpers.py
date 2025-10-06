@@ -38,8 +38,9 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         return None
         
     if scheduler_type == 'cosine':
-        # Default t_max is set to number of epochs
-        t_max = scheduler_kwargs.get('t_max', epochs)
+        # T_max should be total number of steps (epochs * batches_per_epoch)
+        # since scheduler.step() is called per batch
+        t_max = scheduler_kwargs.get('t_max', epochs * train_loader_len)
         return CosineAnnealingLR(optimizer, T_max=t_max)
     elif scheduler_type == 'onecycle':
         # For OneCycleLR, we need total number of steps (epochs * steps_per_epoch)
