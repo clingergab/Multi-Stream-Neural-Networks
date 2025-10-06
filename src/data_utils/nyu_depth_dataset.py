@@ -93,10 +93,12 @@ class NYUDepthV2Dataset(Dataset):
     def _open_hdf5(self):
         """Open HDF5 file in current process/worker."""
         if self._h5_file is None:
+            print(f"[DEBUG] Opening HDF5 file: {self.h5_file_path}")
             self._h5_file = h5py.File(self.h5_file_path, 'r')
             self._images = self._h5_file['images']
             self._depths = self._h5_file['depths']
             self._labels = self._h5_file['labels']
+            print(f"[DEBUG] HDF5 opened. Images shape: {self._images.shape}, Depths shape: {self._depths.shape}")
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -113,12 +115,22 @@ class NYUDepthV2Dataset(Dataset):
 
         real_idx = self.indices[idx]
 
+        # DEBUG: Print dataset info
+        print(f"[DEBUG] Worker accessing index {idx} -> real_idx {real_idx}")
+        print(f"[DEBUG] Images dataset shape: {self._images.shape}")
+        print(f"[DEBUG] Images dataset type: {type(self._images)}")
+
         # Load RGB image - Format: [N, C, H, W] = [1449, 3, 640, 480]
         # HDF5 requires explicit conversion to numpy array
-        rgb = np.array(self._images[real_idx])  # Shape: [3, 640, 480]
+        rgb_raw = self._images[real_idx]
+        print(f"[DEBUG] After indexing, rgb_raw shape: {rgb_raw.shape}, type: {type(rgb_raw)}")
+
+        rgb = np.array(rgb_raw)  # Shape: [3, 640, 480]
+        print(f"[DEBUG] After np.array(), rgb shape: {rgb.shape}, dtype: {rgb.dtype}")
 
         # Transpose from [C, H, W] to [H, W, C] for PIL
         rgb = np.transpose(rgb, (1, 2, 0))  # [640, 480, 3]
+        print(f"[DEBUG] After transpose, rgb shape: {rgb.shape}")
 
         # Handle potential data type issues
         if rgb.dtype != np.uint8:
