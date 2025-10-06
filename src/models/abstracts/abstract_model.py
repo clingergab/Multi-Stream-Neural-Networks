@@ -189,25 +189,20 @@ class BaseModel(nn.Module, ABC):
             The stream2 pathway output tensor.
         """
         pass
-    
-    @property
-    @abstractmethod
-    def fusion_type(self) -> str:
-        """
-        The type of fusion used in the model.
-        
-        Returns:
-            A string representing the fusion type.
-        """
-        pass
-    
+
     def compile(self, optimizer: str = 'adam', learning_rate: float = None,
-                weight_decay: float = None, loss: str = 'cross_entropy', 
-                metrics: List[str] = None, scheduler: str = None, 
-                min_lr: float = 1e-6, **kwargs):
+                weight_decay: float = None, loss: str = 'cross_entropy',
+                metrics: List[str] = None, scheduler: str = None,
+                min_lr: float = 1e-6,
+                # Stream-specific optimization parameters
+                stream1_lr: float = None,
+                stream2_lr: float = None,
+                stream1_weight_decay: float = None,
+                stream2_weight_decay: float = None,
+                **kwargs):
         """
         Compile the model with the specified optimization parameters.
-        
+
         Args:
             optimizer: Optimizer name ('adam', 'adamw', 'sgd', 'rmsprop')
             learning_rate: Learning rate (uses class default if None)
@@ -216,6 +211,10 @@ class BaseModel(nn.Module, ABC):
             metrics: List of metrics to track
             scheduler: Learning rate scheduler (uses class default if None)
             min_lr: Minimum learning rate for schedulers
+            stream1_lr: Learning rate for stream1 pathway (if None, uses learning_rate)
+            stream2_lr: Learning rate for stream2 pathway (if None, uses learning_rate)
+            stream1_weight_decay: Weight decay for stream1 pathway (if None, uses weight_decay)
+            stream2_weight_decay: Weight decay for stream2 pathway (if None, uses weight_decay)
             device: Device to use for computation ('cpu', 'cuda', 'mps', etc.)
             use_amp: Whether to use automatic mixed precision training (only for CUDA)
             **kwargs: Additional arguments for optimizers and loss functions
@@ -261,35 +260,91 @@ class BaseModel(nn.Module, ABC):
         
         # Filter kwargs to only include allowed optimizer parameters
         optimizer_kwargs = {k: v for k, v in kwargs.items() if k in allowed_params}
-        
-        # Configure optimizers with appropriate parameters
-        if optimizer.lower() == 'adam':
-            self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=1e-8, **optimizer_kwargs)
-        elif optimizer.lower() == 'adamw':
-            self.optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=1e-8, **optimizer_kwargs)
-        elif optimizer.lower() == 'sgd':
-            # Use SGD with Nesterov momentum (standard practice)
-            # momentum and nesterov are handled explicitly (not in optimizer_kwargs) to provide defaults
-            momentum = kwargs.get('momentum', 0.9)
-            nesterov = kwargs.get('nesterov', True)
-            # PyTorch constraint: Nesterov requires zero dampening
-            # If user wants custom dampening, they must disable nesterov
-            dampening = kwargs.get('dampening', 0)
-            if nesterov and dampening != 0:
-                raise ValueError("Nesterov momentum requires zero dampening. Either disable nesterov or set dampening=0")
-            self.optimizer = torch.optim.SGD(
-                self.parameters(),
-                lr=learning_rate,
-                momentum=momentum,
-                dampening=dampening,
-                weight_decay=weight_decay,
-                nesterov=nesterov,
-                **optimizer_kwargs
-            )
-        elif optimizer.lower() == 'rmsprop':
-            self.optimizer = torch.optim.RMSprop(self.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9, **optimizer_kwargs)
+
+        # Check if stream-specific optimization is requested
+        use_stream_specific = any([stream1_lr is not None, stream2_lr is not None,
+                                   stream1_weight_decay is not None, stream2_weight_decay is not None])
+
+        if use_stream_specific:
+            # Set defaults for stream-specific parameters
+            stream1_lr = stream1_lr if stream1_lr is not None else learning_rate
+            stream2_lr = stream2_lr if stream2_lr is not None else learning_rate
+            stream1_weight_decay = stream1_weight_decay if stream1_weight_decay is not None else weight_decay
+            stream2_weight_decay = stream2_weight_decay if stream2_weight_decay is not None else weight_decay
+
+            # Separate parameters by stream
+            stream1_params = []
+            stream2_params = []
+            shared_params = []
+
+            for name, param in self.named_parameters():
+                if 'stream1' in name:
+                    stream1_params.append(param)
+                elif 'stream2' in name:
+                    stream2_params.append(param)
+                else:
+                    shared_params.append(param)
+
+            # Create parameter groups
+            param_groups = []
+            if stream1_params:
+                param_groups.append({'params': stream1_params, 'lr': stream1_lr, 'weight_decay': stream1_weight_decay})
+            if stream2_params:
+                param_groups.append({'params': stream2_params, 'lr': stream2_lr, 'weight_decay': stream2_weight_decay})
+            if shared_params:
+                param_groups.append({'params': shared_params, 'lr': learning_rate, 'weight_decay': weight_decay})
+
+            # Configure optimizer with parameter groups
+            if optimizer.lower() == 'adam':
+                self.optimizer = torch.optim.Adam(param_groups, eps=1e-8, **optimizer_kwargs)
+            elif optimizer.lower() == 'adamw':
+                self.optimizer = torch.optim.AdamW(param_groups, eps=1e-8, **optimizer_kwargs)
+            elif optimizer.lower() == 'sgd':
+                momentum = kwargs.get('momentum', 0.9)
+                nesterov = kwargs.get('nesterov', True)
+                dampening = kwargs.get('dampening', 0)
+                if nesterov and dampening != 0:
+                    raise ValueError("Nesterov momentum requires zero dampening. Either disable nesterov or set dampening=0")
+                self.optimizer = torch.optim.SGD(
+                    param_groups,
+                    momentum=momentum,
+                    dampening=dampening,
+                    nesterov=nesterov,
+                    **optimizer_kwargs
+                )
+            elif optimizer.lower() == 'rmsprop':
+                self.optimizer = torch.optim.RMSprop(param_groups, momentum=0.9, **optimizer_kwargs)
+            else:
+                raise ValueError(f"Unsupported optimizer: {optimizer}")
         else:
-            raise ValueError(f"Unsupported optimizer: {optimizer}")
+            # Standard single-LR optimization
+            if optimizer.lower() == 'adam':
+                self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=1e-8, **optimizer_kwargs)
+            elif optimizer.lower() == 'adamw':
+                self.optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=1e-8, **optimizer_kwargs)
+            elif optimizer.lower() == 'sgd':
+                # Use SGD with Nesterov momentum (standard practice)
+                # momentum and nesterov are handled explicitly (not in optimizer_kwargs) to provide defaults
+                momentum = kwargs.get('momentum', 0.9)
+                nesterov = kwargs.get('nesterov', True)
+                # PyTorch constraint: Nesterov requires zero dampening
+                # If user wants custom dampening, they must disable nesterov
+                dampening = kwargs.get('dampening', 0)
+                if nesterov and dampening != 0:
+                    raise ValueError("Nesterov momentum requires zero dampening. Either disable nesterov or set dampening=0")
+                self.optimizer = torch.optim.SGD(
+                    self.parameters(),
+                    lr=learning_rate,
+                    momentum=momentum,
+                    dampening=dampening,
+                    weight_decay=weight_decay,
+                    nesterov=nesterov,
+                    **optimizer_kwargs
+                )
+            elif optimizer.lower() == 'rmsprop':
+                self.optimizer = torch.optim.RMSprop(self.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9, **optimizer_kwargs)
+            else:
+                raise ValueError(f"Unsupported optimizer: {optimizer}")
         
         # Configure loss function - only standard losses supported
         if loss.lower() == 'cross_entropy':

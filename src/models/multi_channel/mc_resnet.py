@@ -50,6 +50,7 @@ from src.models.multi_channel.conv import MCConv2d, MCBatchNorm2d
 from src.models.multi_channel.blocks import MCBasicBlock, MCBottleneck
 from src.models.multi_channel.container import MCSequential, MCReLU
 from src.models.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
+from src.models.multi_channel.fusion import create_fusion
 
 
 class MCResNet(BaseModel):
@@ -76,6 +77,7 @@ class MCResNet(BaseModel):
         stream1_input_channels: int = 3,
         stream2_input_channels: int = 1,
         dropout_p: float = 0.0,  # Dropout probability (0.0 = no dropout, 0.5 = 50% dropout)
+        fusion_type: str = 'concat',  # Type of fusion ('concat', 'weighted', 'gated')
         **kwargs
     ) -> None:
         # Store MCResNet-specific parameters BEFORE calling super().__init__
@@ -83,6 +85,7 @@ class MCResNet(BaseModel):
         self.stream1_input_channels = stream1_input_channels
         self.stream2_input_channels = stream2_input_channels
         self.dropout_p = dropout_p
+        self.fusion_type = fusion_type
         
         # Set MCResNet default norm layer if not specified
         if norm_layer is None:
@@ -128,11 +131,15 @@ class MCResNet(BaseModel):
         self.layer4 = self._make_layer(block, 512, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])  # Equal scaling: 512, 512
         self.avgpool = MCAdaptiveAvgPool2d((1, 1))
 
+        # Create fusion module
+        feature_dim = 512 * block.expansion
+        self.fusion = create_fusion(self.fusion_type, feature_dim)
+
         # Add dropout for regularization (configurable, critical for small datasets)
         self.dropout = nn.Dropout(p=self.dropout_p) if self.dropout_p > 0.0 else nn.Identity()
 
         # Single classifier for integrated features
-        self.fc = nn.Linear(512 * block.expansion * 2, self.num_classes)  # *2 for concatenated features
+        self.fc = nn.Linear(self.fusion.output_dim, self.num_classes)
     
     def _initialize_weights(self, zero_init_residual: bool):
         """Initialize network weights - exactly like ResNet."""
@@ -263,11 +270,11 @@ class MCResNet(BaseModel):
         color_x, brightness_x = self.avgpool(color_x, brightness_x)
         
         # Flatten
-        color_x = torch.flatten(color_x, 1)
-        brightness_x = torch.flatten(brightness_x, 1)
+        stream1_features = torch.flatten(color_x, 1)
+        stream2_features = torch.flatten(brightness_x, 1)
 
-        # Concatenate features
-        fused_features = torch.cat([color_x, brightness_x], dim=1)
+        # Fuse features using configured fusion strategy
+        fused_features = self.fusion(stream1_features, stream2_features)
 
         # Apply dropout (only active during training if dropout_p > 0)
         fused_features = self.dropout(fused_features)
@@ -803,14 +810,14 @@ class MCResNet(BaseModel):
         return avg_loss, accuracy
 
     @property
-    def fusion_type(self) -> str:
+    def fusion_strategy(self) -> str:
         """
         The type of fusion used in the model.
-        
+
         Returns:
             A string representing the fusion type.
         """
-        return "concatenation"
+        return self.fusion_type
     
     def _forward_stream1_pathway(self, stream1_input: torch.Tensor) -> torch.Tensor:
         """
