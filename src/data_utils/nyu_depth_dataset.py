@@ -56,16 +56,39 @@ class NYUDepthV2Dataset(Dataset):
 
                 # Check if it contains HDF5 references (MATLAB format)
                 if scenes_data.dtype == h5py.ref_dtype:
-                    # Dereference each element
-                    self.scenes = np.zeros((1, num_samples), dtype=np.int64)
+                    # Dereference and decode string labels to numeric IDs
+                    scene_strings = []
                     for i in range(num_samples):
                         ref = scenes_data[0, i]
-                        self.scenes[0, i] = int(f[ref][0]) if ref else 0
+                        if ref:
+                            # Decode ASCII array to string
+                            ascii_array = np.array(f[ref])
+                            scene_name = ''.join([chr(int(c)) for c in ascii_array.flatten()])
+                            # Extract scene type (e.g., 'bedroom' from 'bedroom_0001')
+                            scene_type = scene_name.rsplit('_', 1)[0]  # Remove _XXXX suffix
+                            scene_strings.append(scene_type)
+                        else:
+                            scene_strings.append('unknown')
+
+                    # Create mapping from scene types to numeric IDs
+                    unique_scenes = sorted(set(scene_strings))
+                    scene_to_id = {scene: idx for idx, scene in enumerate(unique_scenes)}
+
+                    # Convert to numeric IDs
+                    self.scenes = np.zeros((1, num_samples), dtype=np.int64)
+                    for i, scene_type in enumerate(scene_strings):
+                        self.scenes[0, i] = scene_to_id[scene_type]
+
+                    # Store mapping for reference
+                    self.scene_names = unique_scenes
+                    print(f"Found {len(unique_scenes)} unique scene types: {unique_scenes}")
                 else:
                     self.scenes = np.array(scenes_data)  # Load into memory
+                    self.scene_names = None
             else:
                 # Create scene labels from dominant semantic class
                 self.scenes = self._create_scene_labels_from_file(f)
+                self.scene_names = None
 
         # Train/test split (80/20)
         split_idx = int(num_samples * 0.8)  # 1159 train, 290 val
