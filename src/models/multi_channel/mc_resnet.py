@@ -75,12 +75,14 @@ class MCResNet(BaseModel):
         # MCResNet-specific parameters come AFTER all ResNet parameters
         stream1_input_channels: int = 3,
         stream2_input_channels: int = 1,
+        dropout_p: float = 0.0,  # Dropout probability (0.0 = no dropout, 0.5 = 50% dropout)
         **kwargs
     ) -> None:
         # Store MCResNet-specific parameters BEFORE calling super().__init__
         # because _build_network() (called by super()) needs these attributes
         self.stream1_input_channels = stream1_input_channels
         self.stream2_input_channels = stream2_input_channels
+        self.dropout_p = dropout_p
         
         # Set MCResNet default norm layer if not specified
         if norm_layer is None:
@@ -125,7 +127,10 @@ class MCResNet(BaseModel):
         self.layer3 = self._make_layer(block, 256, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])  # Equal scaling: 256, 256
         self.layer4 = self._make_layer(block, 512, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])  # Equal scaling: 512, 512
         self.avgpool = MCAdaptiveAvgPool2d((1, 1))
-        
+
+        # Add dropout for regularization (configurable, critical for small datasets)
+        self.dropout = nn.Dropout(p=self.dropout_p) if self.dropout_p > 0.0 else nn.Identity()
+
         # Single classifier for integrated features
         self.fc = nn.Linear(512 * block.expansion * 2, self.num_classes)  # *2 for concatenated features
     
@@ -260,9 +265,14 @@ class MCResNet(BaseModel):
         # Flatten
         color_x = torch.flatten(color_x, 1)
         brightness_x = torch.flatten(brightness_x, 1)
-        
-        # Concatenate features and classify
+
+        # Concatenate features
         fused_features = torch.cat([color_x, brightness_x], dim=1)
+
+        # Apply dropout (only active during training if dropout_p > 0)
+        fused_features = self.dropout(fused_features)
+
+        # Classify
         logits = self.fc(fused_features)
         return logits
 
