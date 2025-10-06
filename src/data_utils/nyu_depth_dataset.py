@@ -158,9 +158,6 @@ class NYUDepthV2Dataset(Dataset):
         else:
             label = int(self.scenes[real_idx])
 
-        # NYU Depth V2 scenes are 1-indexed (1-13), convert to 0-indexed (0-12) for PyTorch
-        label = label - 1
-
         # Clamp to valid range [0, num_classes-1] for safety
         label = max(0, min(label, self.num_classes - 1))
 
