@@ -207,6 +207,7 @@ class StreamMonitor:
 
         with torch.no_grad():
             # Evaluate on train set (multiple batches)
+            train_batches_processed = 0
             for batch_idx, (stream1_train, stream2_train, targets_train) in enumerate(train_loader):
                 if batch_idx >= max_batches:
                     break
@@ -218,7 +219,9 @@ class StreamMonitor:
                 # Stream1 only performance
                 stream1_train_features = self.model._forward_stream1_pathway(stream1_train)
                 stream2_dummy_train = torch.zeros_like(stream1_train_features)
-                stream1_train_fused = torch.cat([stream1_train_features, stream2_dummy_train], dim=1)
+                # Use the model's fusion layer (handles weighted, gated, concat)
+                stream1_train_fused = self.model.fusion(stream1_train_features, stream2_dummy_train)
+                stream1_train_fused = self.model.dropout(stream1_train_fused)
                 stream1_train_out = self.model.fc(stream1_train_fused)
                 stream1_train_loss_sum += self.model.criterion(stream1_train_out, targets_train).item()
                 stream1_train_correct += (stream1_train_out.argmax(1) == targets_train).sum().item()
@@ -227,13 +230,18 @@ class StreamMonitor:
                 # Stream2 only performance
                 stream2_train_features = self.model._forward_stream2_pathway(stream2_train)
                 stream1_dummy_train = torch.zeros_like(stream2_train_features)
-                stream2_train_fused = torch.cat([stream1_dummy_train, stream2_train_features], dim=1)
+                # Use the model's fusion layer (handles weighted, gated, concat)
+                stream2_train_fused = self.model.fusion(stream1_dummy_train, stream2_train_features)
+                stream2_train_fused = self.model.dropout(stream2_train_fused)
                 stream2_train_out = self.model.fc(stream2_train_fused)
                 stream2_train_loss_sum += self.model.criterion(stream2_train_out, targets_train).item()
                 stream2_train_correct += (stream2_train_out.argmax(1) == targets_train).sum().item()
                 stream2_train_total += targets_train.size(0)
 
+                train_batches_processed += 1
+
             # Evaluate on val set (multiple batches)
+            val_batches_processed = 0
             for batch_idx, (stream1_val, stream2_val, targets_val) in enumerate(val_loader):
                 if batch_idx >= max_batches:
                     break
@@ -245,7 +253,9 @@ class StreamMonitor:
                 # Stream1 only performance
                 stream1_val_features = self.model._forward_stream1_pathway(stream1_val)
                 stream2_dummy_val = torch.zeros_like(stream1_val_features)
-                stream1_val_fused = torch.cat([stream1_val_features, stream2_dummy_val], dim=1)
+                # Use the model's fusion layer (handles weighted, gated, concat)
+                stream1_val_fused = self.model.fusion(stream1_val_features, stream2_dummy_val)
+                stream1_val_fused = self.model.dropout(stream1_val_fused)
                 stream1_val_out = self.model.fc(stream1_val_fused)
                 stream1_val_loss_sum += self.model.criterion(stream1_val_out, targets_val).item()
                 stream1_val_correct += (stream1_val_out.argmax(1) == targets_val).sum().item()
@@ -254,21 +264,25 @@ class StreamMonitor:
                 # Stream2 only performance
                 stream2_val_features = self.model._forward_stream2_pathway(stream2_val)
                 stream1_dummy_val = torch.zeros_like(stream2_val_features)
-                stream2_val_fused = torch.cat([stream1_dummy_val, stream2_val_features], dim=1)
+                # Use the model's fusion layer (handles weighted, gated, concat)
+                stream2_val_fused = self.model.fusion(stream1_dummy_val, stream2_val_features)
+                stream2_val_fused = self.model.dropout(stream2_val_fused)
                 stream2_val_out = self.model.fc(stream2_val_fused)
                 stream2_val_loss_sum += self.model.criterion(stream2_val_out, targets_val).item()
                 stream2_val_correct += (stream2_val_out.argmax(1) == targets_val).sum().item()
                 stream2_val_total += targets_val.size(0)
 
-        # Calculate averages
-        stream1_train_loss = stream1_train_loss_sum / max(batch_idx + 1, 1)
+                val_batches_processed += 1
+
+        # Calculate averages - use correct batch counts
+        stream1_train_loss = stream1_train_loss_sum / max(train_batches_processed, 1)
         stream1_train_acc = stream1_train_correct / max(stream1_train_total, 1)
-        stream2_train_loss = stream2_train_loss_sum / max(batch_idx + 1, 1)
+        stream2_train_loss = stream2_train_loss_sum / max(train_batches_processed, 1)
         stream2_train_acc = stream2_train_correct / max(stream2_train_total, 1)
 
-        stream1_val_loss = stream1_val_loss_sum / max(batch_idx + 1, 1)
+        stream1_val_loss = stream1_val_loss_sum / max(val_batches_processed, 1)
         stream1_val_acc = stream1_val_correct / max(stream1_val_total, 1)
-        stream2_val_loss = stream2_val_loss_sum / max(batch_idx + 1, 1)
+        stream2_val_loss = stream2_val_loss_sum / max(val_batches_processed, 1)
         stream2_val_acc = stream2_val_correct / max(stream2_val_total, 1)
 
         # Calculate overfitting indicators
