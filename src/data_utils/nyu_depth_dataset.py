@@ -52,7 +52,21 @@ class NYUDepthV2Dataset(Dataset):
 
             # Get scene labels (if available) or create from semantic labels
             if 'scenes' in f:
-                self.scenes = np.array(f['scenes'])  # Load into memory
+                scenes_data = f['scenes']
+                print(f"[DEBUG INIT] scenes shape: {scenes_data.shape}, dtype: {scenes_data.dtype}")
+
+                # Check if it contains HDF5 references
+                if scenes_data.dtype == h5py.ref_dtype:
+                    print("[DEBUG INIT] scenes contains HDF5 references, dereferencing...")
+                    # Dereference each element
+                    self.scenes = np.zeros((1, num_samples), dtype=np.int64)
+                    for i in range(num_samples):
+                        ref = scenes_data[0, i]
+                        self.scenes[0, i] = int(f[ref][0]) if ref else 0
+                else:
+                    self.scenes = np.array(scenes_data)  # Load into memory
+
+                print(f"[DEBUG INIT] scenes loaded: shape {self.scenes.shape}, dtype {self.scenes.dtype}")
             else:
                 # Create scene labels from dominant semantic class
                 self.scenes = self._create_scene_labels_from_file(f)
