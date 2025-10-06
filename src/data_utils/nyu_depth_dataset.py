@@ -181,9 +181,6 @@ class NYUDepthV2Dataset(Dataset):
         else:
             label = int(self.scenes[real_idx])
 
-        # Clamp to valid range [0, num_classes-1] for safety
-        label = max(0, min(label, self.num_classes - 1))
-
         label = torch.tensor(label, dtype=torch.long)
 
         # Resize to target size
@@ -246,7 +243,8 @@ def create_nyu_dataloaders(
     batch_size: int = 32,
     num_workers: int = 4,
     target_size: Tuple[int, int] = (224, 224),
-    num_classes: int = 13
+    num_classes: int = 13,
+    return_train_no_aug: bool = False
 ):
     """
     Create train and validation dataloaders for NYU Depth V2.
@@ -257,9 +255,12 @@ def create_nyu_dataloaders(
         num_workers: Number of data loading workers
         target_size: Image resize dimensions
         num_classes: Number of scene classes
+        return_train_no_aug: If True, return (train_loader, val_loader, train_loader_no_aug)
+            where train_loader_no_aug has same data as train but without augmentation
 
     Returns:
-        Tuple of (train_loader, val_loader)
+        If return_train_no_aug=False: Tuple of (train_loader, val_loader)
+        If return_train_no_aug=True: Tuple of (train_loader, val_loader, train_loader_no_aug)
     """
     # Create datasets
     train_dataset = NYUDepthV2Dataset(

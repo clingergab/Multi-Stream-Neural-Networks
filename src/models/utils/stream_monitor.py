@@ -170,23 +170,38 @@ class StreamMonitor:
                                              val_acc: float,
                                              train_loader: torch.utils.data.DataLoader,
                                              val_loader: torch.utils.data.DataLoader,
-                                             max_batches: int = 5) -> Dict[str, float]:
+                                             max_batches: int = 5,
+                                             train_loader_no_aug: torch.utils.data.DataLoader = None) -> Dict[str, float]:
         """
         Compute overfitting indicators for each stream separately.
+
+        IMPORTANT: For fair comparison, train_loader_no_aug should be provided with
+        the same data as train_loader but WITHOUT augmentation. Otherwise, metrics
+        will be misleading (augmented train data is harder than val data).
 
         Args:
             train_loss: Training loss
             val_loss: Validation loss
             train_acc: Training accuracy
             val_acc: Validation accuracy
-            train_loader: Training data loader
-            val_loader: Validation data loader
+            train_loader: Training data loader (WITH augmentation)
+            val_loader: Validation data loader (no augmentation)
             max_batches: Maximum number of batches to evaluate (for speed)
+            train_loader_no_aug: Training data loader WITHOUT augmentation (recommended!)
+                If None, will use train_loader (but results may be misleading)
 
         Returns:
             Dictionary with overfitting indicators per stream
         """
-        # Get stream-specific performance on multiple batches for stability
+        # Note: For weighted/gated fusion, isolated stream testing measures how much
+        # the FC layer can classify using each stream alone (with zeros for the other).
+        # Low accuracy means the FC layer didn't learn to use that stream's features.
+        # This IS meaningful - it shows stream contribution/reliance!
+
+        # Use non-augmented train loader if provided, otherwise fall back to train_loader
+        effective_train_loader = train_loader_no_aug if train_loader_no_aug is not None else train_loader
+
+        fusion_type = self.model.fusion.__class__.__name__
         self.model.eval()
 
         # Accumulators for train set
@@ -207,9 +222,13 @@ class StreamMonitor:
 
         with torch.no_grad():
             # Evaluate on train set (multiple batches)
+            # Create fresh iterator to avoid caching issues between epochs
             train_batches_processed = 0
-            for batch_idx, (stream1_train, stream2_train, targets_train) in enumerate(train_loader):
-                if batch_idx >= max_batches:
+            train_iter = iter(effective_train_loader)
+            for _ in range(max_batches):
+                try:
+                    stream1_train, stream2_train, targets_train = next(train_iter)
+                except StopIteration:
                     break
 
                 stream1_train = stream1_train.to(self.model.device)
@@ -219,7 +238,6 @@ class StreamMonitor:
                 # Stream1 only performance
                 stream1_train_features = self.model._forward_stream1_pathway(stream1_train)
                 stream2_dummy_train = torch.zeros_like(stream1_train_features)
-                # Use the model's fusion layer (handles weighted, gated, concat)
                 stream1_train_fused = self.model.fusion(stream1_train_features, stream2_dummy_train)
                 stream1_train_fused = self.model.dropout(stream1_train_fused)
                 stream1_train_out = self.model.fc(stream1_train_fused)
@@ -230,7 +248,6 @@ class StreamMonitor:
                 # Stream2 only performance
                 stream2_train_features = self.model._forward_stream2_pathway(stream2_train)
                 stream1_dummy_train = torch.zeros_like(stream2_train_features)
-                # Use the model's fusion layer (handles weighted, gated, concat)
                 stream2_train_fused = self.model.fusion(stream1_dummy_train, stream2_train_features)
                 stream2_train_fused = self.model.dropout(stream2_train_fused)
                 stream2_train_out = self.model.fc(stream2_train_fused)
@@ -241,9 +258,13 @@ class StreamMonitor:
                 train_batches_processed += 1
 
             # Evaluate on val set (multiple batches)
+            # Create fresh iterator to avoid caching issues between epochs
             val_batches_processed = 0
-            for batch_idx, (stream1_val, stream2_val, targets_val) in enumerate(val_loader):
-                if batch_idx >= max_batches:
+            val_iter = iter(val_loader)
+            for _ in range(max_batches):
+                try:
+                    stream1_val, stream2_val, targets_val = next(val_iter)
+                except StopIteration:
                     break
 
                 stream1_val = stream1_val.to(self.model.device)
@@ -253,7 +274,6 @@ class StreamMonitor:
                 # Stream1 only performance
                 stream1_val_features = self.model._forward_stream1_pathway(stream1_val)
                 stream2_dummy_val = torch.zeros_like(stream1_val_features)
-                # Use the model's fusion layer (handles weighted, gated, concat)
                 stream1_val_fused = self.model.fusion(stream1_val_features, stream2_dummy_val)
                 stream1_val_fused = self.model.dropout(stream1_val_fused)
                 stream1_val_out = self.model.fc(stream1_val_fused)
@@ -264,7 +284,6 @@ class StreamMonitor:
                 # Stream2 only performance
                 stream2_val_features = self.model._forward_stream2_pathway(stream2_val)
                 stream1_dummy_val = torch.zeros_like(stream2_val_features)
-                # Use the model's fusion layer (handles weighted, gated, concat)
                 stream2_val_fused = self.model.fusion(stream1_dummy_val, stream2_val_features)
                 stream2_val_fused = self.model.dropout(stream2_val_fused)
                 stream2_val_out = self.model.fc(stream2_val_fused)
@@ -316,7 +335,8 @@ class StreamMonitor:
             # Comparison
             'stream1_vs_stream2_overfit_ratio': (stream1_loss_gap + stream1_acc_gap) / (stream2_loss_gap + stream2_acc_gap) if (stream2_loss_gap + stream2_acc_gap) > 0 else 0,
             'full_model_loss_gap': full_loss_gap,
-            'full_model_acc_gap': full_acc_gap
+            'full_model_acc_gap': full_acc_gap,
+            'fusion_type': fusion_type
         }
 
     def log_metrics(self, epoch: int, metrics: Dict[str, float]):
