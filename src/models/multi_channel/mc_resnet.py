@@ -866,23 +866,23 @@ class MCResNet(BaseModel):
             # RGB stream
             rgb_lr = param_groups[0]['lr']
             rgb_wd = param_groups[0]['weight_decay']
-            rgb_train = overfitting_stats['stream1_train_acc'] * 100
-            rgb_val = overfitting_stats['stream1_val_acc'] * 100
+            rgb_train = overfitting_stats['stream1_train_acc']
+            rgb_val = overfitting_stats['stream1_val_acc']
 
             # Depth stream
             depth_lr = param_groups[1]['lr']
             depth_wd = param_groups[1]['weight_decay']
-            depth_train = overfitting_stats['stream2_train_acc'] * 100
-            depth_val = overfitting_stats['stream2_val_acc'] * 100
+            depth_train = overfitting_stats['stream2_train_acc']
+            depth_val = overfitting_stats['stream2_val_acc']
 
             # Fusion
             fuse_lr = param_groups[2]['lr']
             fuse_wd = param_groups[2]['weight_decay']
 
             # Single line output
-            print(f"Stream1: [LR:{rgb_lr:.6f} WD:{rgb_wd:.4f} T:{rgb_train:5.2f}% V:{rgb_val:5.2f}%] "
-                  f"Stream2: [LR:{depth_lr:.6f} WD:{depth_wd:.4f} T:{depth_train:5.2f}% V:{depth_val:5.2f}%] "
-                  f"Fuse: [LR:{fuse_lr:.6f} WD:{fuse_wd:.4f}]")
+            print(f"  Stream1: [LR:{rgb_lr:.6f}, WD:{rgb_wd:.4f}, T_acc:{rgb_train:.4f}, V_acc:{rgb_val:.4f}], "
+                  f"Stream2: [LR:{depth_lr:.6f}, WD:{depth_wd:.4f}, T_acc:{depth_train:.4f}, V_acc:{depth_val:.4f}], "
+                  f"Fuse: [LR:{fuse_lr:.6f}, WD:{fuse_wd:.4f}]")
 
     @property
     def fusion_strategy(self) -> str:
