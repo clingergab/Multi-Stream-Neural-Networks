@@ -419,9 +419,6 @@ class MCResNet(BaseModel):
             if self.scheduler is not None and isinstance(self.scheduler, ReduceLROnPlateau):
                 self.scheduler.step(val_loss)
             current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
-            print(">>>debug: current_lr =", current_lr)  # Debugging line to check current_lr value
-            print(">>>debug: self.optimizer.param_groups =", self.optimizer.param_groups)  # Debugging line to check param groups
-            print(">>>stream_monitor_instance =", stream_monitor_instance)  # Debugging line to check stream monitor
             
             # Update history and finalize progress bar
             update_history(history, avg_train_loss, train_accuracy, val_loss, val_acc, current_lr, bool(val_loader))
@@ -720,7 +717,8 @@ class MCResNet(BaseModel):
 
             # OPTIMIZATION 1: Update progress bar much less frequently - MAJOR SPEEDUP
             if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(train_loader) - 1):
-                current_lr = self.optimizer.param_groups[0]['lr']
+                # Get base LR (last param group if using stream-specific, otherwise first)
+                current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
                 current_train_loss = train_loss / train_batches
                 current_train_acc = train_correct / train_total
                 
@@ -802,7 +800,8 @@ class MCResNet(BaseModel):
                 if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(data_loader) - 1):
                     current_val_loss = total_loss / (batch_idx + 1)
                     current_val_acc = correct / total
-                    current_lr = self.optimizer.param_groups[0]['lr']
+                    # Get base LR (last param group if using stream-specific, otherwise first)
+                    current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
                     
                     # Get existing postfix and update with validation metrics
                     current_postfix = getattr(pbar, 'postfix', {})
