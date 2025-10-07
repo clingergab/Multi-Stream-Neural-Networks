@@ -418,7 +418,7 @@ class MCResNet(BaseModel):
             # Step ReduceLROnPlateau scheduler at epoch end if used
             if self.scheduler is not None and isinstance(self.scheduler, ReduceLROnPlateau):
                 self.scheduler.step(val_loss)
-            current_lr = self.optimizer.param_groups[0]['lr']
+            current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
             
             # Update history and finalize progress bar
             update_history(history, avg_train_loss, train_accuracy, val_loss, val_acc, current_lr, bool(val_loader))
@@ -427,7 +427,7 @@ class MCResNet(BaseModel):
                 val_loss, val_acc, early_stopping_state, current_lr
             )
 
-            # Stream-specific monitoring
+            # Stream-specific monitoring (print immediately after progress bar, on same line continuation)
             if stream_monitor_instance is not None:
                 self._print_stream_monitoring(
                     train_loader=train_loader,
