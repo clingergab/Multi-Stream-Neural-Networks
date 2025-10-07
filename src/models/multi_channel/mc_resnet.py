@@ -419,6 +419,9 @@ class MCResNet(BaseModel):
             if self.scheduler is not None and isinstance(self.scheduler, ReduceLROnPlateau):
                 self.scheduler.step(val_loss)
             current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
+            print(">>>debug: current_lr =", current_lr)  # Debugging line to check current_lr value
+            print(">>>debug: self.optimizer.param_groups =", self.optimizer.param_groups)  # Debugging line to check param groups
+            print(">>>stream_monitor_instance =", stream_monitor_instance)  # Debugging line to check stream monitor
             
             # Update history and finalize progress bar
             update_history(history, avg_train_loss, train_accuracy, val_loss, val_acc, current_lr, bool(val_loader))
