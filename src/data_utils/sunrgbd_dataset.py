@@ -261,6 +261,7 @@ def get_sunrgbd_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True
     )
 
     val_loader = torch.utils.data.DataLoader(
@@ -269,6 +270,7 @@ def get_sunrgbd_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True
     )
 
     print(f"\nDataLoader Info:")
