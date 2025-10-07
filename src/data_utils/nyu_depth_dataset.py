@@ -90,13 +90,18 @@ class NYUDepthV2Dataset(Dataset):
                 self.scenes = self._create_scene_labels_from_file(f)
                 self.scene_names = None
 
-        # Train/test split (80/20)
+        # Train/test split (80/20) with shuffling to ensure class diversity
+        # Note: Using fixed seed for reproducibility
+        np.random.seed(42)
+        all_indices = np.arange(num_samples)
+        np.random.shuffle(all_indices)
+
         split_idx = int(num_samples * 0.8)  # 1159 train, 290 val
 
         if train:
-            self.indices = list(range(0, split_idx))
+            self.indices = all_indices[:split_idx].tolist()
         else:
-            self.indices = list(range(split_idx, num_samples))
+            self.indices = all_indices[split_idx:].tolist()
 
         # HDF5 file handle - will be opened per worker
         self._h5_file = None
