@@ -880,9 +880,9 @@ class MCResNet(BaseModel):
             fuse_wd = param_groups[2]['weight_decay']
 
             # Single line output
-            print(f"  Stream1: [LR:{rgb_lr:.6f}, WD:{rgb_wd:.4f}, T_acc:{rgb_train:.4f}, V_acc:{rgb_val:.4f}], "
-                  f"Stream2: [LR:{depth_lr:.6f}, WD:{depth_wd:.4f}, T_acc:{depth_train:.4f}, V_acc:{depth_val:.4f}], "
-                  f"Fuse: [LR:{fuse_lr:.6f}, WD:{fuse_wd:.4f}]")
+            print(f"  Stream1: [LR:{rgb_lr:.6f}, WD:{rgb_wd:.5f}, T_acc:{rgb_train:.4f}, V_acc:{rgb_val:.4f}] | "
+                  f"Stream2: [LR:{depth_lr:.6f}, WD:{depth_wd:.5f}, T_acc:{depth_train:.4f}, V_acc:{depth_val:.4f}] | "
+                  f"Fuse: [LR:{fuse_lr:.6f}, WD:{fuse_wd:.5f}]")
 
     @property
     def fusion_strategy(self) -> str:
