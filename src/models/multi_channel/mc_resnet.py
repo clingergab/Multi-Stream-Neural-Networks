@@ -28,6 +28,7 @@ from src.models.common import (
     finalize_progress_bar,
     update_history
 )
+from src.models.utils.stream_monitor import StreamMonitor
 
 # Smart tqdm import - detect environment
 try:
@@ -306,6 +307,7 @@ class MCResNet(BaseModel):
         gradient_accumulation_steps: int = 1,  # Gradient accumulation for larger effective batch size
         grad_clip_norm: Optional[float] = None,  # Gradient clipping max norm (None = disabled)
         clear_cache_per_epoch: bool = False,  # Clear CUDA cache after each epoch (only if experiencing OOM)
+        stream_monitoring: bool = False,  # Enable stream-specific monitoring (LR, WD, acc per stream)
         **scheduler_kwargs
     ) -> dict:
         """
@@ -330,6 +332,7 @@ class MCResNet(BaseModel):
                                        Useful for simulating larger batch sizes (e.g., 4 steps = 4x effective batch size)
             grad_clip_norm: Maximum gradient norm for clipping (None to disable). Standard values: 1.0 or 5.0
             clear_cache_per_epoch: Whether to clear CUDA cache after each epoch (only enable if OOM issues)
+            stream_monitoring: Enable stream-specific monitoring. Shows per-stream LR, WD, train/val acc
             **scheduler_kwargs: Additional arguments for the scheduler:
                 - For 'step' scheduler: step_size, gamma
                 - For 'cosine' scheduler: t_max
@@ -363,7 +366,12 @@ class MCResNet(BaseModel):
         
         # Set up scheduler
         self.scheduler = setup_scheduler(self.optimizer, self.scheduler_type, epochs, len(train_loader), **scheduler_kwargs)
-        
+
+        # Initialize StreamMonitor once for the entire fit() call (preserves history across epochs)
+        stream_monitor_instance = None
+        if stream_monitoring and len(self.optimizer.param_groups) > 1:
+            stream_monitor_instance = StreamMonitor(self)
+
         for epoch in range(epochs):
             # Calculate total steps for this epoch (training + validation)
             total_steps = len(train_loader)
@@ -415,10 +423,22 @@ class MCResNet(BaseModel):
             # Update history and finalize progress bar
             update_history(history, avg_train_loss, train_accuracy, val_loss, val_acc, current_lr, bool(val_loader))
             finalize_progress_bar(
-                pbar, avg_train_loss, train_accuracy, val_loader, 
+                pbar, avg_train_loss, train_accuracy, val_loader,
                 val_loss, val_acc, early_stopping_state, current_lr
             )
-            
+
+            # Stream-specific monitoring
+            if stream_monitor_instance is not None:
+                self._print_stream_monitoring(
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    monitor=stream_monitor_instance,
+                    train_loss=avg_train_loss,
+                    train_acc=train_accuracy,
+                    val_loss=val_loss,
+                    val_acc=val_acc
+                )
+
             # Call callbacks
             for callback in callbacks:
                 callback.on_epoch_end(epoch, {
@@ -808,6 +828,59 @@ class MCResNet(BaseModel):
         accuracy = correct / total
         
         return avg_loss, accuracy
+
+    def _print_stream_monitoring(self, train_loader: DataLoader, val_loader: DataLoader,
+                                 monitor: 'StreamMonitor', train_loss: float, train_acc: float,
+                                 val_loss: float, val_acc: float):
+        """
+        Print stream-specific monitoring using StreamMonitor.
+
+        Args:
+            train_loader: Training data loader
+            val_loader: Validation data loader
+            monitor: StreamMonitor instance (reused across epochs to preserve history)
+            train_loss: Overall training loss (from full epoch)
+            train_acc: Overall training accuracy (from full epoch)
+            val_loss: Overall validation loss (from full epoch)
+            val_acc: Overall validation accuracy (from full epoch)
+        """
+        # Compute stream-specific overfitting indicators (includes train/val acc per stream)
+        # Use max_batches to limit evaluation time (5 batches = ~160-320 samples)
+        overfitting_stats = monitor.compute_stream_overfitting_indicators(
+            train_loss=train_loss,
+            val_loss=val_loss,
+            train_acc=train_acc,
+            val_acc=val_acc,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            max_batches=20  
+        )
+
+        # Get parameter groups info
+        param_groups = self.optimizer.param_groups
+
+        # Build single-line monitoring output
+        if len(param_groups) >= 3:
+            # RGB stream
+            rgb_lr = param_groups[0]['lr']
+            rgb_wd = param_groups[0]['weight_decay']
+            rgb_train = overfitting_stats['stream1_train_acc'] * 100
+            rgb_val = overfitting_stats['stream1_val_acc'] * 100
+
+            # Depth stream
+            depth_lr = param_groups[1]['lr']
+            depth_wd = param_groups[1]['weight_decay']
+            depth_train = overfitting_stats['stream2_train_acc'] * 100
+            depth_val = overfitting_stats['stream2_val_acc'] * 100
+
+            # Fusion
+            fuse_lr = param_groups[2]['lr']
+            fuse_wd = param_groups[2]['weight_decay']
+
+            # Single line output
+            print(f"Stream1: [LR:{rgb_lr:.6f} WD:{rgb_wd:.4f} T:{rgb_train:5.2f}% V:{rgb_val:5.2f}%] "
+                  f"Stream2: [LR:{depth_lr:.6f} WD:{depth_wd:.4f} T:{depth_train:5.2f}% V:{depth_val:5.2f}%] "
+                  f"Fuse: [LR:{fuse_lr:.6f} WD:{fuse_wd:.4f}]")
 
     @property
     def fusion_strategy(self) -> str:

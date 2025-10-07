@@ -175,10 +175,6 @@ class StreamMonitor:
         """
         Compute overfitting indicators for each stream separately.
 
-        IMPORTANT: For fair comparison, train_loader_no_aug should be provided with
-        the same data as train_loader but WITHOUT augmentation. Otherwise, metrics
-        will be misleading (augmented train data is harder than val data).
-
         Args:
             train_loss: Training loss
             val_loss: Validation loss
