@@ -87,11 +87,11 @@ class ConcatFusion(BaseFusion):
 
 class WeightedFusion(BaseFusion):
     """
-    Learned weighted fusion.
+    Learned weighted fusion with normalized weights.
 
-    Learns scalar weights for each stream to balance their contributions.
-    Weights are applied before concatenation to allow the model to emphasize
-    one stream over another.
+    Learns relative importance weights for each stream using softmax normalization.
+    This ensures weights sum to 1 and prevents scale drift while allowing the model
+    to emphasize one stream over another based on their relative contributions.
     """
 
     def __init__(self, feature_dim: int):
@@ -103,13 +103,13 @@ class WeightedFusion(BaseFusion):
         """
         super().__init__(feature_dim)
 
-        # Learnable weights for each stream (initialized to 1.0)
-        self.stream1_weight = nn.Parameter(torch.ones(1))
-        self.stream2_weight = nn.Parameter(torch.ones(1))
+        # Learnable logits for softmax weighting (initialized to 0 = equal weights)
+        # After softmax: [0.5, 0.5] - both streams contribute equally at start
+        self.logits = nn.Parameter(torch.zeros(2))
 
     def forward(self, stream1_features: torch.Tensor, stream2_features: torch.Tensor) -> torch.Tensor:
         """
-        Apply learned weights and concatenate.
+        Apply learned normalized weights and concatenate.
 
         Args:
             stream1_features: Features from first stream [batch_size, feature_dim]
@@ -118,13 +118,14 @@ class WeightedFusion(BaseFusion):
         Returns:
             Weighted and concatenated features [batch_size, 2 * feature_dim]
         """
-        # Apply sigmoid to weights to keep them in [0, 1]
-        weight1 = torch.sigmoid(self.stream1_weight)
-        weight2 = torch.sigmoid(self.stream2_weight)
+        # Compute normalized weights using softmax (sum to 1)
+        weights = torch.nn.functional.softmax(self.logits, dim=0)
+        weight1, weight2 = weights[0], weights[1]
 
-        # Weight the features
-        weighted_stream1 = stream1_features * weight1
-        weighted_stream2 = stream2_features * weight2
+        # Scale by 2 to preserve feature magnitude
+        # (since weights sum to 1, scaling by 2 keeps average contribution at 1.0)
+        weighted_stream1 = stream1_features * (2 * weight1)
+        weighted_stream2 = stream2_features * (2 * weight2)
 
         # Concatenate weighted features
         return torch.cat([weighted_stream1, weighted_stream2], dim=1)
