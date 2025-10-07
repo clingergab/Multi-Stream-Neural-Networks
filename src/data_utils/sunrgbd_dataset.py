@@ -87,26 +87,21 @@ class SUNRGBDDataset(Dataset):
         # IMPORTANT: RandomHorizontalFlip must be applied BEFORE individual transforms
         # to ensure RGB and Depth are flipped together
         if self.rgb_transform is None:
-            if train:
-                # RGB-specific transforms (applied AFTER shared flip)
-                self.rgb_transform = transforms.Compose([
-                    transforms.Resize(target_size),
-                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                ])
-            else:
-                self.rgb_transform = transforms.Compose([
-                    transforms.Resize(target_size),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                ])
+            # REMOVED ColorJitter - RGB and Depth now have same augmentation difficulty
+            # Only difference is normalization (ImageNet stats for RGB)
+            self.rgb_transform = transforms.Compose([
+                transforms.Resize(target_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
 
         if self.depth_transform is None:
             # Depth-specific transforms (applied AFTER shared flip)
+            # Normalize to same scale as RGB for balanced gradient flow
             self.depth_transform = transforms.Compose([
                 transforms.Resize(target_size),
                 transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5027], std=[0.2197])  # SUN RGB-D dataset stats
             ])
 
         # Store whether we're in training mode (for synchronized flipping)
