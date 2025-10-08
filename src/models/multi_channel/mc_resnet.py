@@ -417,8 +417,13 @@ class MCResNet(BaseModel):
             
             # Step ReduceLROnPlateau scheduler at epoch end if used
             if self.scheduler is not None and isinstance(self.scheduler, ReduceLROnPlateau):
-                # Use val_loss if available, otherwise fall back to train_loss
-                metric = val_loss if val_loader else avg_train_loss
+                # Choose metric based on scheduler mode ('min' for loss, 'max' for accuracy)
+                if self.scheduler.mode == 'max':
+                    # Mode 'max': monitor accuracy (higher is better)
+                    metric = val_acc if val_loader else train_accuracy
+                else:
+                    # Mode 'min': monitor loss (lower is better)
+                    metric = val_loss if val_loader else avg_train_loss
                 self.scheduler.step(metric)
             current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
             
