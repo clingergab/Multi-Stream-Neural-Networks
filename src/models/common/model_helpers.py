@@ -71,8 +71,11 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         factor = scheduler_kwargs.get('factor', 0.5)
         mode = scheduler_kwargs.get('mode', 'min')  # 'min' for loss (default), 'max' for accuracy
         min_lr = scheduler_kwargs.get('min_lr', 1e-7)  # Minimum learning rate
+        threshold = scheduler_kwargs.get('threshold', 1e-4)  # Minimum change to qualify as improvement
+        cooldown = scheduler_kwargs.get('cooldown', 0)  # Cooldown period after LR reduction
+        eps = scheduler_kwargs.get('eps', 1e-8)  # Minimal decay applied to lr
         return ReduceLROnPlateau(
-            optimizer, mode=mode, patience=scheduler_patience, factor=factor, min_lr=min_lr
+            optimizer, mode=mode, patience=scheduler_patience, factor=factor, min_lr=min_lr, threshold=threshold, cooldown=cooldown, eps=eps
         )
     else:
         raise ValueError(f"Unsupported scheduler type: {scheduler_type}")

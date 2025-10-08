@@ -357,13 +357,14 @@ class MCResNet(BaseModel):
         
         # Initialize training history
         history = {
-            'train_loss': [], 
-            'val_loss': [], 
+            'train_loss': [],
+            'val_loss': [],
             'train_accuracy': [],
             'val_accuracy': [],
-            'learning_rates': []
+            'learning_rates': [],
+            'scheduler_kwargs': scheduler_kwargs  # Save scheduler parameters for reproducibility
         }
-        
+
         # Set up scheduler
         self.scheduler = setup_scheduler(self.optimizer, self.scheduler_type, epochs, len(train_loader), **scheduler_kwargs)
 
