@@ -333,7 +333,7 @@ def early_stopping_initiated(model_state_dict: Dict[str, torch.Tensor], early_st
             print(f"⏳ No improvement for {early_stopping_state['patience_counter']}/{early_stopping_state['patience']} epochs (best {monitor}: {early_stopping_state['best_metric']:.4f} at epoch {early_stopping_state['best_epoch'] + 1})")
     
     # Check if we should stop early
-    if early_stopping_state['patience_counter'] >= early_stopping_state['patience']:
+    if early_stopping_state['patience_counter'] > early_stopping_state['patience']:
         # Print early stopping info but don't restore weights here
         if verbose and pbar is None:
             print(f"🛑 Early stopping triggered after {epoch + 1} epochs")
@@ -398,7 +398,7 @@ def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
     
     # Add early stopping info to progress bar
     if early_stopping_state['enabled'] and val_loader is not None:
-        if early_stopping_state['patience_counter'] >= early_stopping_state['patience']:
+        if early_stopping_state['patience_counter'] > early_stopping_state['patience']:
             final_postfix['early_stop'] = 'TRIGGERED'
         elif early_stopping_state['patience_counter'] > 0:
             final_postfix['patience'] = f"{early_stopping_state['patience_counter']}/{early_stopping_state['patience']}"

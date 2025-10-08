@@ -459,7 +459,7 @@ class MCResNet(BaseModel):
         # Final early stopping summary
         if early_stopping_state['enabled'] and val_loader is not None:
             history['early_stopping'] = {
-                'stopped_early': early_stopping_state['patience_counter'] >= early_stopping_state['patience'],
+                'stopped_early': early_stopping_state['patience_counter'] > early_stopping_state['patience'],
                 'best_epoch': early_stopping_state['best_epoch'] + 1,
                 'best_metric': early_stopping_state['best_metric'],
                 'monitor': early_stopping_state['monitor'],
@@ -467,7 +467,7 @@ class MCResNet(BaseModel):
                 'min_delta': early_stopping_state['min_delta']
             }
             
-            if verbose and early_stopping_state['patience_counter'] < early_stopping_state['patience']:
+            if verbose and early_stopping_state['patience_counter'] <= early_stopping_state['patience']:
                 print(f"🏁 Training completed without early stopping. Best {early_stopping_state['monitor']}: {early_stopping_state['best_metric']:.4f} at epoch {early_stopping_state['best_epoch'] + 1}")
         
         return history
