@@ -417,7 +417,9 @@ class MCResNet(BaseModel):
             
             # Step ReduceLROnPlateau scheduler at epoch end if used
             if self.scheduler is not None and isinstance(self.scheduler, ReduceLROnPlateau):
-                self.scheduler.step(val_loss)
+                # Use val_loss if available, otherwise fall back to train_loss
+                metric = val_loss if val_loader else avg_train_loss
+                self.scheduler.step(metric)
             current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
             
             # Update history and finalize progress bar

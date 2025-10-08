@@ -67,10 +67,12 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         return StepLR(optimizer, step_size=step_size, gamma=gamma)
     elif scheduler_type == 'plateau':
         # Use scheduler_patience if provided, otherwise fall back to patience from scheduler_kwargs
-        scheduler_patience = scheduler_kwargs.get('scheduler_patience', scheduler_kwargs.get('patience', 10))
+        scheduler_patience = scheduler_kwargs.get('scheduler_patience', scheduler_kwargs.get('patience', 5))
         factor = scheduler_kwargs.get('factor', 0.5)
+        mode = scheduler_kwargs.get('mode', 'min')  # 'min' for loss (default), 'max' for accuracy
+        min_lr = scheduler_kwargs.get('min_lr', 1e-7)  # Minimum learning rate
         return ReduceLROnPlateau(
-            optimizer, mode='min', patience=scheduler_patience, factor=factor
+            optimizer, mode=mode, patience=scheduler_patience, factor=factor, min_lr=min_lr
         )
     else:
         raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
