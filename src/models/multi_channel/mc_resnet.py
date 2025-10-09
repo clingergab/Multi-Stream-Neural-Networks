@@ -1193,7 +1193,7 @@ class MCResNet(BaseModel):
         if method == 'gradient':
             return self._calculate_gradient_importance(data_loader, stream1_data, stream2_data, targets, batch_size)
         elif method == 'ablation':
-            return self._calculate_ablation_importance(data_loader, stream1_data, stream2_data, targets, batch_size)
+            return self.calculate_stream_contributions(data_loader, stream1_data, stream2_data, targets, batch_size)
         elif method == 'feature_norm':
             return self._calculate_feature_norm_importance(data_loader, stream1_data, stream2_data, targets, batch_size)
         else:
@@ -1203,12 +1203,12 @@ class MCResNet(BaseModel):
         """Calculate importance based on gradient magnitudes."""
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before calculating importance.")
-            
+
         # Handle tensor input
         if data_loader is None:
             if stream1_data is None or stream2_data is None or targets is None:
                 raise ValueError("Either provide data_loader or all input tensors")
-                
+
             # Use a subset for efficiency
             num_samples = min(50, len(stream1_data))
             indices = torch.randperm(len(stream1_data))[:num_samples]
@@ -1216,44 +1216,49 @@ class MCResNet(BaseModel):
                 stream1_data[indices], stream2_data[indices], targets[indices],
                 batch_size=batch_size, num_workers=0
             )
-        
+
+        # Save current training state
+        was_training = self.training
         self.train()  # Enable gradients
-        
+
         color_gradients = []
         brightness_gradients = []
-        
+
         for rgb_batch, brightness_batch, targets_batch in data_loader:
             rgb_batch = rgb_batch.to(self.device, non_blocking=True)
             brightness_batch = brightness_batch.to(self.device, non_blocking=True)
             targets_batch = targets_batch.to(self.device, non_blocking=True)
-            
+
             # Require gradients for inputs
             rgb_batch.requires_grad_(True)
             brightness_batch.requires_grad_(True)
-            
+
             # Forward pass
             outputs = self(rgb_batch, brightness_batch)
             loss = self.criterion(outputs, targets_batch)
-            
+
             # Backward pass
             loss.backward()
-            
+
             # Calculate gradient norms - flatten and then compute norm
             color_grad_norm = torch.norm(rgb_batch.grad.flatten(1), dim=1).mean().item()
             brightness_grad_norm = torch.norm(brightness_batch.grad.flatten(1), dim=1).mean().item()
-            
+
             color_gradients.append(color_grad_norm)
             brightness_gradients.append(brightness_grad_norm)
-            
+
             # Clear gradients
             self.zero_grad()
             rgb_batch.grad = None
             brightness_batch.grad = None
-        
+
+        # Restore original training state
+        self.train(was_training)
+
         avg_color_grad = sum(color_gradients) / len(color_gradients)
         avg_brightness_grad = sum(brightness_gradients) / len(brightness_gradients)
         total_grad = avg_color_grad + avg_brightness_grad
-        
+
         return {
             'method': 'gradient',
             'color_importance': avg_color_grad / total_grad if total_grad > 0 else 0.5,
@@ -1264,8 +1269,13 @@ class MCResNet(BaseModel):
             }
         }
     
-    def _calculate_ablation_importance(self, data_loader, stream1_data, stream2_data, targets, batch_size):
-        """Calculate importance based on performance drop when ablating each pathway."""
+    def calculate_stream_contributions(self, data_loader, stream1_data, stream2_data, targets, batch_size):
+        """
+        Calculate how much each stream contributes to the final predictions.
+
+        Uses ablation analysis: measures performance drop when each stream is removed.
+        This shows how much the fusion layer relies on each stream for final predictions.
+        """
         # Use the analyze_pathways method for ablation analysis
         pathway_analysis = self.analyze_pathways(data_loader, stream1_data, stream2_data, targets, batch_size)
         
