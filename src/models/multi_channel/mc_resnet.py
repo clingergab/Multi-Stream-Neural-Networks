@@ -901,12 +901,8 @@ class MCResNet(BaseModel):
             depth_train = overfitting_stats['stream2_train_acc']
             depth_val = overfitting_stats['stream2_val_acc']
 
-            # Fusion
-            fuse_lr = param_groups[2]['lr']
-            fuse_wd = param_groups[2]['weight_decay']
-
             # Single line output
-            print(f"   Stream1: [T_acc:{rgb_train:.4f}, V_acc:{rgb_val:.4f}, LR:{rgb_lr:.2e}] | "
+            print(f"    Stream1: [T_acc:{rgb_train:.4f}, V_acc:{rgb_val:.4f}, LR:{rgb_lr:.2e}] | "
                   f"Stream2: [T_acc:{depth_train:.4f}, V_acc:{depth_val:.4f}, LR:{depth_lr:.2e}]")
 
             # Return stream stats for history tracking
