@@ -367,7 +367,9 @@ class MCResNet(BaseModel):
             'stream1_train_acc': [],
             'stream1_val_acc': [],
             'stream2_train_acc': [],
-            'stream2_val_acc': []
+            'stream2_val_acc': [],
+            'stream1_lr': [],
+            'stream2_lr': []
         }
 
         # Set up scheduler
@@ -457,6 +459,8 @@ class MCResNet(BaseModel):
                     history['stream1_val_acc'].append(stream_stats['stream1_val_acc'])
                     history['stream2_train_acc'].append(stream_stats['stream2_train_acc'])
                     history['stream2_val_acc'].append(stream_stats['stream2_val_acc'])
+                    history['stream1_lr'].append(stream_stats['stream1_lr'])
+                    history['stream2_lr'].append(stream_stats['stream2_lr'])
 
             # Call callbacks
             for callback in callbacks:
@@ -911,7 +915,11 @@ class MCResNet(BaseModel):
                 'stream1_train_acc': rgb_train,
                 'stream1_val_acc': rgb_val,
                 'stream2_train_acc': depth_train,
-                'stream2_val_acc': depth_val
+                'stream2_val_acc': depth_val,
+                'stream1_lr': rgb_lr,
+                'stream1_wd': rgb_wd,
+                'stream2_lr': depth_lr,
+                'stream2_wd': depth_wd
             }
 
         return {}
