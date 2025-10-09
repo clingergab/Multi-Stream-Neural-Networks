@@ -906,9 +906,8 @@ class MCResNet(BaseModel):
             fuse_wd = param_groups[2]['weight_decay']
 
             # Single line output
-            print(f"  Stream1: [LR:{rgb_lr:.2e}, WD:{rgb_wd:.2e}, T_acc:{rgb_train:.4f}, V_acc:{rgb_val:.4f}] | "
-                  f"Stream2: [LR:{depth_lr:.2e}, WD:{depth_wd:.2e}, T_acc:{depth_train:.4f}, V_acc:{depth_val:.4f}] | "
-                  f"Fuse: [LR:{fuse_lr:.2e}, WD:{fuse_wd:.2e}]")
+            print(f"   Stream1: [T_acc:{rgb_train:.4f}, V_acc:{rgb_val:.4f}, LR:{rgb_lr:.2e}] | "
+                  f"Stream2: [T_acc:{depth_train:.4f}, V_acc:{depth_val:.4f}, LR:{depth_lr:.2e}]")
 
             # Return stream stats for history tracking
             return {
