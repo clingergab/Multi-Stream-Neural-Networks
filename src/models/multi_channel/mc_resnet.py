@@ -362,7 +362,12 @@ class MCResNet(BaseModel):
             'train_accuracy': [],
             'val_accuracy': [],
             'learning_rates': [],
-            'scheduler_kwargs': scheduler_kwargs  # Save scheduler parameters for reproducibility
+            'scheduler_kwargs': scheduler_kwargs,  # Save scheduler parameters for reproducibility
+            # Stream-specific metrics (populated if stream_monitoring=True)
+            'stream1_train_acc': [],
+            'stream1_val_acc': [],
+            'stream2_train_acc': [],
+            'stream2_val_acc': []
         }
 
         # Set up scheduler
@@ -437,7 +442,7 @@ class MCResNet(BaseModel):
 
             # Stream-specific monitoring (print immediately after progress bar, on same line continuation)
             if stream_monitor_instance is not None:
-                self._print_stream_monitoring(
+                stream_stats = self._print_stream_monitoring(
                     train_loader=train_loader,
                     val_loader=val_loader,
                     monitor=stream_monitor_instance,
@@ -446,6 +451,12 @@ class MCResNet(BaseModel):
                     val_loss=val_loss,
                     val_acc=val_acc
                 )
+                # Save stream-specific metrics to history
+                if stream_stats:
+                    history['stream1_train_acc'].append(stream_stats['stream1_train_acc'])
+                    history['stream1_val_acc'].append(stream_stats['stream1_val_acc'])
+                    history['stream2_train_acc'].append(stream_stats['stream2_train_acc'])
+                    history['stream2_val_acc'].append(stream_stats['stream2_val_acc'])
 
             # Call callbacks
             for callback in callbacks:
@@ -757,8 +768,8 @@ class MCResNet(BaseModel):
         train_accuracy = train_correct / train_total
 
         # Optional: Clear CUDA cache at end of epoch (only if experiencing OOM issues)
-        if clear_cache_per_epoch and self.device.type == 'cuda':
-            torch.cuda.empty_cache()
+        # if clear_cache_per_epoch and self.device.type == 'cuda':
+        #     torch.cuda.empty_cache()
 
         return avg_train_loss, train_accuracy
     
@@ -841,7 +852,7 @@ class MCResNet(BaseModel):
 
     def _print_stream_monitoring(self, train_loader: DataLoader, val_loader: DataLoader,
                                  monitor: 'StreamMonitor', train_loss: float, train_acc: float,
-                                 val_loss: float, val_acc: float):
+                                 val_loss: float, val_acc: float) -> dict:
         """
         Print stream-specific monitoring using StreamMonitor.
 
@@ -853,6 +864,9 @@ class MCResNet(BaseModel):
             train_acc: Overall training accuracy (from full epoch)
             val_loss: Overall validation loss (from full epoch)
             val_acc: Overall validation accuracy (from full epoch)
+
+        Returns:
+            Dictionary containing stream-specific metrics
         """
         # Compute stream-specific overfitting indicators (includes train/val acc per stream)
         # Use max_batches to limit evaluation time (5 batches = ~160-320 samples)
@@ -863,7 +877,7 @@ class MCResNet(BaseModel):
             val_acc=val_acc,
             train_loader=train_loader,
             val_loader=val_loader,
-            max_batches=20  
+            max_batches=20
         )
 
         # Get parameter groups info
@@ -891,6 +905,16 @@ class MCResNet(BaseModel):
             print(f"  Stream1: [LR:{rgb_lr:.2e}, WD:{rgb_wd:.2e}, T_acc:{rgb_train:.4f}, V_acc:{rgb_val:.4f}] | "
                   f"Stream2: [LR:{depth_lr:.2e}, WD:{depth_wd:.2e}, T_acc:{depth_train:.4f}, V_acc:{depth_val:.4f}] | "
                   f"Fuse: [LR:{fuse_lr:.2e}, WD:{fuse_wd:.2e}]")
+
+            # Return stream stats for history tracking
+            return {
+                'stream1_train_acc': rgb_train,
+                'stream1_val_acc': rgb_val,
+                'stream2_train_acc': depth_train,
+                'stream2_val_acc': depth_val
+            }
+
+        return {}
 
     @property
     def fusion_strategy(self) -> str:
