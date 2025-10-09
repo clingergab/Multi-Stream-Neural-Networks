@@ -289,8 +289,142 @@ def setup_early_stopping(early_stopping: bool, val_loader, monitor: str,
         'best_weights': None
     }
 
-def early_stopping_initiated(model_state_dict: Dict[str, torch.Tensor], early_stopping_state: Dict[str, Any], 
-                           val_loss: float, val_acc: float, epoch: int, pbar, verbose: bool, 
+def setup_stream_early_stopping(stream_early_stopping: bool, stream1_patience: int,
+                               stream2_patience: int, stream_min_delta: float,
+                               verbose: bool = True) -> Dict[str, Any]:
+    """
+    Set up stream-specific early stopping state.
+
+    Args:
+        stream_early_stopping: Whether to enable stream-specific early stopping
+        stream1_patience: Patience for Stream1 (RGB)
+        stream2_patience: Patience for Stream2 (Depth)
+        stream_min_delta: Minimum improvement to qualify as progress
+        verbose: Whether to print setup messages
+
+    Returns:
+        Dictionary containing stream early stopping state
+    """
+    if not stream_early_stopping:
+        return {'enabled': False}
+
+    if verbose:
+        print(f"❄️  Stream-specific early stopping enabled:")
+        print(f"   Stream1 patience: {stream1_patience}, Stream2 patience: {stream2_patience}")
+        print(f"   Min delta: {stream_min_delta}")
+
+    return {
+        'enabled': True,
+        'stream1': {
+            'best_acc': 0.0,
+            'patience': stream1_patience,
+            'patience_counter': 0,
+            'best_epoch': 0,
+            'frozen': False
+        },
+        'stream2': {
+            'best_acc': 0.0,
+            'patience': stream2_patience,
+            'patience_counter': 0,
+            'best_epoch': 0,
+            'frozen': False
+        },
+        'min_delta': stream_min_delta,
+        'all_frozen': False
+    }
+
+def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
+                                stream_stats: Dict[str, float],
+                                model,
+                                epoch: int,
+                                freeze_on_plateau: bool,
+                                verbose: bool) -> bool:
+    """
+    Check stream-specific early stopping and optionally freeze streams.
+
+    Args:
+        stream_early_stopping_state: Stream early stopping state dictionary
+        stream_stats: Dictionary with stream1_val_acc and stream2_val_acc
+        model: The model (to access stream1 and stream2 parameters)
+        epoch: Current epoch number
+        freeze_on_plateau: Whether to freeze stream parameters when they plateau
+        verbose: Whether to print freeze messages
+
+    Returns:
+        True if all streams are frozen, False otherwise
+    """
+    if not stream_early_stopping_state['enabled']:
+        return False
+
+    min_delta = stream_early_stopping_state['min_delta']
+
+    # Check Stream1
+    if not stream_early_stopping_state['stream1']['frozen']:
+        stream1_val_acc = stream_stats.get('stream1_val_acc', 0.0)
+        stream1_state = stream_early_stopping_state['stream1']
+
+        if stream1_val_acc > (stream1_state['best_acc'] + min_delta):
+            # Improvement detected
+            stream1_state['best_acc'] = stream1_val_acc
+            stream1_state['best_epoch'] = epoch
+            stream1_state['patience_counter'] = 0
+        else:
+            # No improvement
+            stream1_state['patience_counter'] += 1
+
+            if stream1_state['patience_counter'] >= stream1_state['patience']:
+                # Freeze Stream1
+                stream1_state['frozen'] = True
+
+                if freeze_on_plateau:
+                    # Freeze stream1 parameters in all MC layers
+                    for name, param in model.named_parameters():
+                        # Freeze parameters that belong to stream1 pathway
+                        if '.stream1_' in name:
+                            param.requires_grad = False
+
+                if verbose:
+                    print(f"❄️  Stream1 frozen (no improvement for {stream1_state['patience']} epochs, "
+                          f"best: {stream1_state['best_acc']:.4f} at epoch {stream1_state['best_epoch'] + 1})")
+
+    # Check Stream2
+    if not stream_early_stopping_state['stream2']['frozen']:
+        stream2_val_acc = stream_stats.get('stream2_val_acc', 0.0)
+        stream2_state = stream_early_stopping_state['stream2']
+
+        if stream2_val_acc > (stream2_state['best_acc'] + min_delta):
+            # Improvement detected
+            stream2_state['best_acc'] = stream2_val_acc
+            stream2_state['best_epoch'] = epoch
+            stream2_state['patience_counter'] = 0
+        else:
+            # No improvement
+            stream2_state['patience_counter'] += 1
+
+            if stream2_state['patience_counter'] >= stream2_state['patience']:
+                # Freeze Stream2
+                stream2_state['frozen'] = True
+
+                if freeze_on_plateau:
+                    # Freeze stream2 parameters in all MC layers
+                    for name, param in model.named_parameters():
+                        # Freeze parameters that belong to stream2 pathway
+                        if '.stream2_' in name:
+                            param.requires_grad = False
+
+                if verbose:
+                    print(f"❄️  Stream2 frozen (no improvement for {stream2_state['patience']} epochs, "
+                          f"best: {stream2_state['best_acc']:.4f} at epoch {stream2_state['best_epoch'] + 1})")
+
+    # Check if all streams are frozen
+    all_frozen = (stream_early_stopping_state['stream1']['frozen'] and
+                  stream_early_stopping_state['stream2']['frozen'])
+    stream_early_stopping_state['all_frozen'] = all_frozen
+
+    return all_frozen
+
+def early_stopping_initiated(model_state_dict: Dict[str, torch.Tensor], early_stopping_state: Dict[str, Any],
+                           val_loss: float, val_acc: float, epoch: int, pbar, verbose: bool,
                            restore_best_weights: bool) -> bool:
     """
     Handle early stopping logic and return whether training should stop.

@@ -24,6 +24,8 @@ from src.models.common import (
     save_checkpoint,
     setup_early_stopping,
     early_stopping_initiated,
+    setup_stream_early_stopping,
+    check_stream_early_stopping,
     create_progress_bar,
     finalize_progress_bar,
     update_history
@@ -308,6 +310,11 @@ class MCResNet(BaseModel):
         grad_clip_norm: Optional[float] = None,  # Gradient clipping max norm (None = disabled)
         clear_cache_per_epoch: bool = False,  # Clear CUDA cache after each epoch (only if experiencing OOM)
         stream_monitoring: bool = False,  # Enable stream-specific monitoring (LR, WD, acc per stream)
+        stream_early_stopping: bool = False,  # Enable stream-specific early stopping
+        stream1_patience: int = 15,  # Patience for Stream1 (RGB) before freezing
+        stream2_patience: int = 15,  # Patience for Stream2 (Depth) before freezing
+        freeze_on_plateau: bool = True,  # Whether to freeze stream params when they plateau
+        stream_min_delta: float = 0.001,  # Minimum improvement for stream early stopping
         **scheduler_kwargs
     ) -> dict:
         """
@@ -333,6 +340,11 @@ class MCResNet(BaseModel):
             grad_clip_norm: Maximum gradient norm for clipping (None to disable). Standard values: 1.0 or 5.0
             clear_cache_per_epoch: Whether to clear CUDA cache after each epoch (only enable if OOM issues)
             stream_monitoring: Enable stream-specific monitoring. Shows per-stream LR, WD, train/val acc
+            stream_early_stopping: Enable stream-specific early stopping (freezes streams when they plateau)
+            stream1_patience: Number of epochs to wait before freezing Stream1 (RGB) if no improvement
+            stream2_patience: Number of epochs to wait before freezing Stream2 (Depth) if no improvement
+            freeze_on_plateau: Whether to freeze stream parameters when they plateau (True recommended)
+            stream_min_delta: Minimum improvement for stream metrics to count as progress
             **scheduler_kwargs: Additional arguments for the scheduler:
                 - For 'step' scheduler: step_size, gamma
                 - For 'cosine' scheduler: t_max
@@ -348,13 +360,23 @@ class MCResNet(BaseModel):
             raise ValueError("Model not compiled. Call compile() before fit().")
 
         callbacks = callbacks or []
-        
+
         # Early stopping setup
         early_stopping_state = setup_early_stopping(early_stopping, val_loader, monitor, patience, min_delta, verbose)
-        
+
+        # Stream-specific early stopping setup
+        stream_early_stopping_state = setup_stream_early_stopping(
+            stream_early_stopping, stream1_patience, stream2_patience, stream_min_delta, verbose
+        )
+
+        # Warn if stream_early_stopping enabled without stream_monitoring
+        if stream_early_stopping and not stream_monitoring and verbose:
+            print("⚠️  Warning: stream_early_stopping=True requires stream_monitoring=True to work")
+            print("   Stream early stopping will be disabled until stream_monitoring is enabled")
+
         # Legacy best model saving (preserve existing functionality)
         best_val_acc = 0.0
-        
+
         # Initialize training history
         history = {
             'train_loss': [],
@@ -369,7 +391,11 @@ class MCResNet(BaseModel):
             'stream2_train_acc': [],
             'stream2_val_acc': [],
             'stream1_lr': [],
-            'stream2_lr': []
+            'stream2_lr': [],
+            # Stream freezing events (populated if stream_early_stopping=True)
+            'stream1_frozen_epoch': None,
+            'stream2_frozen_epoch': None,
+            'streams_frozen': []  # List of (epoch, stream_name) tuples
         }
 
         # Set up scheduler
@@ -443,6 +469,7 @@ class MCResNet(BaseModel):
             )
 
             # Stream-specific monitoring (print immediately after progress bar, on same line continuation)
+            stream_stats = {}
             if stream_monitor_instance is not None:
                 stream_stats = self._print_stream_monitoring(
                     train_loader=train_loader,
@@ -461,6 +488,37 @@ class MCResNet(BaseModel):
                     history['stream2_val_acc'].append(stream_stats['stream2_val_acc'])
                     history['stream1_lr'].append(stream_stats['stream1_lr'])
                     history['stream2_lr'].append(stream_stats['stream2_lr'])
+
+            # Stream-specific early stopping (freeze streams when they plateau)
+            if stream_early_stopping_state['enabled'] and stream_stats:
+                # Track previous frozen states
+                prev_stream1_frozen = stream_early_stopping_state['stream1']['frozen']
+                prev_stream2_frozen = stream_early_stopping_state['stream2']['frozen']
+
+                # Check for stream early stopping
+                all_streams_frozen = check_stream_early_stopping(
+                    stream_early_stopping_state=stream_early_stopping_state,
+                    stream_stats=stream_stats,
+                    model=self,
+                    epoch=epoch,
+                    freeze_on_plateau=freeze_on_plateau,
+                    verbose=verbose
+                )
+
+                # Record freezing events in history
+                if not prev_stream1_frozen and stream_early_stopping_state['stream1']['frozen']:
+                    history['stream1_frozen_epoch'] = epoch + 1
+                    history['streams_frozen'].append((epoch + 1, 'Stream1'))
+
+                if not prev_stream2_frozen and stream_early_stopping_state['stream2']['frozen']:
+                    history['stream2_frozen_epoch'] = epoch + 1
+                    history['streams_frozen'].append((epoch + 1, 'Stream2'))
+
+                # Stop training if all streams are frozen
+                if all_streams_frozen:
+                    if verbose:
+                        print("🛑 All streams frozen - stopping training")
+                    break
 
             # Call callbacks
             for callback in callbacks:
@@ -484,7 +542,33 @@ class MCResNet(BaseModel):
             
             if verbose and early_stopping_state['patience_counter'] <= early_stopping_state['patience']:
                 print(f"🏁 Training completed without early stopping. Best {early_stopping_state['monitor']}: {early_stopping_state['best_metric']:.4f} at epoch {early_stopping_state['best_epoch'] + 1}")
-        
+
+        # Stream early stopping summary
+        if stream_early_stopping_state['enabled']:
+            history['stream_early_stopping'] = {
+                'stream1_frozen': stream_early_stopping_state['stream1']['frozen'],
+                'stream1_frozen_epoch': history['stream1_frozen_epoch'],
+                'stream1_best_acc': stream_early_stopping_state['stream1']['best_acc'],
+                'stream2_frozen': stream_early_stopping_state['stream2']['frozen'],
+                'stream2_frozen_epoch': history['stream2_frozen_epoch'],
+                'stream2_best_acc': stream_early_stopping_state['stream2']['best_acc'],
+                'all_frozen': stream_early_stopping_state['all_frozen']
+            }
+
+            if verbose:
+                print("\n❄️  Stream Early Stopping Summary:")
+                if stream_early_stopping_state['stream1']['frozen']:
+                    print(f"   Stream1: Frozen at epoch {history['stream1_frozen_epoch']} "
+                          f"(best val_acc: {stream_early_stopping_state['stream1']['best_acc']:.4f})")
+                else:
+                    print(f"   Stream1: Not frozen (final val_acc: {stream_early_stopping_state['stream1']['best_acc']:.4f})")
+
+                if stream_early_stopping_state['stream2']['frozen']:
+                    print(f"   Stream2: Frozen at epoch {history['stream2_frozen_epoch']} "
+                          f"(best val_acc: {stream_early_stopping_state['stream2']['best_acc']:.4f})")
+                else:
+                    print(f"   Stream2: Not frozen (final val_acc: {stream_early_stopping_state['stream2']['best_acc']:.4f})")
+
         return history
 
     def evaluate(self, 
