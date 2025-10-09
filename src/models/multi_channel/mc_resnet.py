@@ -1296,15 +1296,32 @@ class MCResNet(BaseModel):
             }
         }
     
-    def calculate_stream_contributions(self, data_loader, stream1_data, stream2_data, targets, batch_size):
+    def calculate_stream_contributions(self,
+                                       data_loader: Optional[torch.utils.data.DataLoader] = None,
+                                       stream1_data: Optional[torch.Tensor] = None,
+                                       stream2_data: Optional[torch.Tensor] = None,
+                                       targets: Optional[torch.Tensor] = None,
+                                       batch_size: int = 32,
+                                       num_samples: int = 100):
         """
         Calculate how much each stream contributes to the final predictions.
 
         Uses ablation analysis: measures performance drop when each stream is removed.
         This shows how much the fusion layer relies on each stream for final predictions.
+
+        Args:
+            data_loader: DataLoader containing dual-channel input data
+            stream1_data: Color/RGB input data (if not using data_loader)
+            stream2_data: Brightness input data (if not using data_loader)
+            targets: Target tensor (required if not using data_loader)
+            batch_size: Batch size for analysis
+            num_samples: Number of samples to analyze (for efficiency)
+
+        Returns:
+            Dictionary containing stream contribution analysis
         """
         # Use the analyze_pathways method for ablation analysis
-        pathway_analysis = self.analyze_pathways(data_loader, stream1_data, stream2_data, targets, batch_size)
+        pathway_analysis = self.analyze_pathways(data_loader, stream1_data, stream2_data, targets, batch_size, num_samples)
         
         full_accuracy = pathway_analysis['accuracy']['full_model']
         color_accuracy = pathway_analysis['accuracy']['color_only']
