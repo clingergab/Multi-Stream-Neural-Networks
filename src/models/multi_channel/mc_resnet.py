@@ -777,11 +777,11 @@ class MCResNet(BaseModel):
                     if self.scheduler is not None:
                         if isinstance(self.scheduler, OneCycleLR):
                             self.scheduler.step()
-                            history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
+                            history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
                         elif not isinstance(self.scheduler, ReduceLROnPlateau):
                             # Other schedulers (Cosine, Step, etc.) step per optimizer update
                             self.scheduler.step()
-                            history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
+                            history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
             else:
                 # Standard precision training
                 outputs = self(rgb_batch, brightness_batch)
@@ -805,12 +805,12 @@ class MCResNet(BaseModel):
                         if isinstance(self.scheduler, OneCycleLR):
                             # OneCycleLR steps every optimizer update
                             self.scheduler.step()
-                            history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
+                            history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
                         elif not isinstance(self.scheduler, ReduceLROnPlateau):
                             # Other schedulers (Cosine, Step, etc.) step per optimizer update
                             self.scheduler.step()
-                            history['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
-            
+                            history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
+
             # Calculate training metrics (use original loss for metrics, not scaled)
             original_loss = loss.item() * gradient_accumulation_steps if gradient_accumulation_steps > 1 else loss.item()
             train_loss += original_loss

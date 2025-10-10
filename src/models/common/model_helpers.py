@@ -45,15 +45,18 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
     elif scheduler_type == 'onecycle':
         # For OneCycleLR, we need total number of steps (epochs * steps_per_epoch)
         steps_per_epoch = scheduler_kwargs.get('steps_per_epoch', train_loader_len)
-        max_lr = scheduler_kwargs.get('max_lr', optimizer.param_groups[0]['lr'] * 10)
+        # Handle both single scalar max_lr and per-group max_lr for multi-stream models
+        # Default: 10x the initial LR for each parameter group
+        default_max_lr = [pg['lr'] * 10 for pg in optimizer.param_groups]
+        max_lr = scheduler_kwargs.get('max_lr', default_max_lr)
         pct_start = scheduler_kwargs.get('pct_start', 0.3)
         anneal_strategy = scheduler_kwargs.get('anneal_strategy', 'cos')
         div_factor = scheduler_kwargs.get('div_factor', 25.0)
         final_div_factor = scheduler_kwargs.get('final_div_factor', 1e4)
-        
+
         # Create the OneCycleLR scheduler with calculated total_steps
         return OneCycleLR(
-            optimizer, 
+            optimizer,
             max_lr=max_lr,
             total_steps=epochs * steps_per_epoch,
             pct_start=pct_start,
