@@ -11,9 +11,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import (
-    CosineAnnealingLR, 
-    OneCycleLR, 
-    StepLR, 
+    CosineAnnealingLR,
+    CosineAnnealingWarmRestarts,
+    OneCycleLR,
+    StepLR,
     ReduceLROnPlateau
 )
 from tqdm import tqdm
@@ -23,14 +24,20 @@ from typing import Optional, Union, Dict, Any, Callable
 def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_len: int, **scheduler_kwargs):
     """
     Set up and return the learning rate scheduler based on the scheduler type.
-    
+
     Args:
         optimizer: The optimizer instance
-        scheduler_type: Type of scheduler ('cosine', 'onecycle', 'step', 'plateau', or None)
+        scheduler_type: Type of scheduler ('cosine', 'cosine_restarts', 'onecycle', 'step', 'plateau', or None)
         epochs: Number of training epochs
         train_loader_len: Length of the training data loader
         **scheduler_kwargs: Additional arguments for the scheduler
-        
+            - For 'cosine': t_max (epochs), eta_min (min LR)
+            - For 'cosine_restarts': t_0 (cycle length in epochs), t_mult (cycle multiplier),
+              eta_min (min LR), step_per_batch (bool, default=False - whether to step per batch instead of per epoch)
+            - For 'onecycle': max_lr, pct_start, anneal_strategy, div_factor, final_div_factor
+            - For 'step': step_size (in epochs), gamma
+            - For 'plateau': patience (epochs), factor, mode, min_lr, threshold, cooldown, eps
+
     Returns:
         Scheduler instance or None if no scheduler requested
     """
@@ -38,10 +45,30 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         return None
         
     if scheduler_type == 'cosine':
-        # T_max should be total number of steps (epochs * batches_per_epoch)
-        # since scheduler.step() is called per batch
-        t_max = scheduler_kwargs.get('t_max', epochs * train_loader_len)
-        return CosineAnnealingLR(optimizer, T_max=t_max)
+        # T_max is in epochs (scheduler steps per epoch, not per batch)
+        t_max = scheduler_kwargs.get('t_max', epochs)
+        eta_min = scheduler_kwargs.get('eta_min', 0)
+        return CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
+    elif scheduler_type == 'cosine_restarts':
+        # CosineAnnealingWarmRestarts - multiple cycles with warm restarts
+        # User always specifies t_0 in EPOCHS (intuitive)
+        t_0_epochs = scheduler_kwargs.get('t_0', 20)  # First cycle length in epochs (user-facing)
+        t_mult = scheduler_kwargs.get('t_mult', 1)  # Cycle length multiplier (1 = equal cycles)
+        eta_min = scheduler_kwargs.get('eta_min', 1e-7)  # Minimum learning rate
+        step_per_batch = scheduler_kwargs.get('step_per_batch', False)  # Step per batch or per epoch
+
+        if step_per_batch:
+            # Convert epochs to batches for per-batch stepping
+            # Example: t_0=20 epochs × 40 batches/epoch = 800 batches per cycle
+            t_0 = t_0_epochs * train_loader_len
+        else:
+            # Keep in epochs for per-epoch stepping (default)
+            t_0 = t_0_epochs
+
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=t_0, T_mult=t_mult, eta_min=eta_min)
+        # Add metadata so mc_resnet.py knows whether to step per batch or per epoch
+        scheduler._step_per_batch = step_per_batch
+        return scheduler
     elif scheduler_type == 'onecycle':
         # For OneCycleLR, we need total number of steps (epochs * steps_per_epoch)
         steps_per_epoch = scheduler_kwargs.get('steps_per_epoch', train_loader_len)
@@ -86,7 +113,7 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
 def update_scheduler(scheduler, val_loss: float) -> None:
     """
     Update the learning rate scheduler.
-    
+
     Args:
         scheduler: The scheduler instance
         val_loss: Validation loss for plateau scheduler
@@ -96,6 +123,7 @@ def update_scheduler(scheduler, val_loss: float) -> None:
         if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step(val_loss)
         elif not isinstance(scheduler, OneCycleLR):
+            # CosineAnnealingWarmRestarts and other schedulers step per epoch
             scheduler.step()
 
 def print_epoch_progress(epoch: int, epochs: int, epoch_time: float, 

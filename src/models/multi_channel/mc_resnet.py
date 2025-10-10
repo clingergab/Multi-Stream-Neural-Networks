@@ -16,7 +16,7 @@ from torch import Tensor
 from torch.amp import autocast
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts
 from src.data_utils.dual_channel_dataset import DualChannelDataset, create_dual_channel_dataloaders, create_dual_channel_dataloader
 from src.models.common import (
     setup_scheduler,
@@ -347,10 +347,12 @@ class MCResNet(BaseModel):
             stream_min_delta: Minimum improvement for stream metrics to count as progress
             **scheduler_kwargs: Additional arguments for the scheduler:
                 - For 'step' scheduler: step_size, gamma
-                - For 'cosine' scheduler: t_max
+                - For 'cosine' scheduler: t_max, eta_min
+                - For 'cosine_restarts' scheduler: t_0 (cycle length in epochs), t_mult (cycle multiplier),
+                  eta_min (min LR), step_per_batch (bool, default=False - step per batch instead of per epoch)
                 - For 'plateau' scheduler: scheduler_patience (or patience), factor
                   Note: Use 'scheduler_patience' to avoid conflict with early stopping patience
-                - For 'onecycle' scheduler: steps_per_epoch (required), max_lr, pct_start, 
+                - For 'onecycle' scheduler: steps_per_epoch (required), max_lr, pct_start,
                   anneal_strategy, div_factor, final_div_factor
             
         Returns:
@@ -449,16 +451,25 @@ class MCResNet(BaseModel):
                             print("🔄 Restored best model weights")
                     break
             
-            # Step ReduceLROnPlateau scheduler at epoch end if used
-            if self.scheduler is not None and isinstance(self.scheduler, ReduceLROnPlateau):
-                # Choose metric based on scheduler mode ('min' for loss, 'max' for accuracy)
-                if self.scheduler.mode == 'max':
-                    # Mode 'max': monitor accuracy (higher is better)
-                    metric = val_acc if val_loader else train_accuracy
-                else:
-                    # Mode 'min': monitor loss (lower is better)
-                    metric = val_loss if val_loader else avg_train_loss
-                self.scheduler.step(metric)
+            # Step epoch-based schedulers at epoch end
+            # Skip OneCycleLR (steps per batch) and schedulers with _step_per_batch=True
+            if self.scheduler is not None:
+                is_batch_scheduler = (isinstance(self.scheduler, OneCycleLR) or
+                                     getattr(self.scheduler, '_step_per_batch', False))
+                if not is_batch_scheduler:
+                    if isinstance(self.scheduler, ReduceLROnPlateau):
+                        # ReduceLROnPlateau needs a metric to step
+                        if self.scheduler.mode == 'max':
+                            # Mode 'max': monitor accuracy (higher is better)
+                            metric = val_acc if val_loader else train_accuracy
+                        else:
+                            # Mode 'min': monitor loss (lower is better)
+                            metric = val_loss if val_loader else avg_train_loss
+                        self.scheduler.step(metric)
+                    else:
+                        # All other epoch-based schedulers (CosineAnnealingLR, CosineAnnealingWarmRestarts, StepLR, etc.)
+                        # step per epoch without arguments
+                        self.scheduler.step()
             current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
             
             # Update history and finalize progress bar
@@ -774,12 +785,12 @@ class MCResNet(BaseModel):
                     self.scaler.update()
 
                     # Step scheduler after optimizer update
+                    # OneCycleLR always steps per batch
+                    # CosineAnnealingWarmRestarts can optionally step per batch if step_per_batch=True
                     if self.scheduler is not None:
-                        if isinstance(self.scheduler, OneCycleLR):
-                            self.scheduler.step()
-                            history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
-                        elif not isinstance(self.scheduler, ReduceLROnPlateau):
-                            # Other schedulers (Cosine, Step, etc.) step per optimizer update
+                        should_step = (isinstance(self.scheduler, OneCycleLR) or
+                                      getattr(self.scheduler, '_step_per_batch', False))
+                        if should_step:
                             self.scheduler.step()
                             history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
             else:
@@ -801,13 +812,12 @@ class MCResNet(BaseModel):
                     self.optimizer.step()
 
                     # Unified scheduler stepping logic
+                    # OneCycleLR always steps per batch
+                    # CosineAnnealingWarmRestarts can optionally step per batch if step_per_batch=True
                     if self.scheduler is not None:
-                        if isinstance(self.scheduler, OneCycleLR):
-                            # OneCycleLR steps every optimizer update
-                            self.scheduler.step()
-                            history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
-                        elif not isinstance(self.scheduler, ReduceLROnPlateau):
-                            # Other schedulers (Cosine, Step, etc.) step per optimizer update
+                        should_step = (isinstance(self.scheduler, OneCycleLR) or
+                                      getattr(self.scheduler, '_step_per_batch', False))
+                        if should_step:
                             self.scheduler.step()
                             history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
 
