@@ -1,5 +1,7 @@
 """
-Multi-Channel ResNet implementations.
+Linear Integration ResNet (LINet) implementations.
+
+Extends MCResNet from 2 streams to 3 streams with integrated pathway.
 """
 
 from typing import Any, Callable, Optional, Union, TYPE_CHECKING
@@ -30,7 +32,7 @@ from src.models.common import (
     finalize_progress_bar,
     update_history
 )
-from src.models.utils.stream_monitor import StreamMonitor
+from src.models.linear_integration.stream_monitor import StreamMonitor
 
 # Smart tqdm import - detect environment
 try:
@@ -48,25 +50,30 @@ try:
 except:
     from tqdm import tqdm
 
-# Import the multi-channel components
-from src.models.multi_channel.conv import MCConv2d, MCBatchNorm2d
-from src.models.multi_channel.blocks import MCBasicBlock, MCBottleneck
-from src.models.multi_channel.container import MCSequential, MCReLU
-from src.models.multi_channel.pooling import MCMaxPool2d, MCAdaptiveAvgPool2d
-from src.models.multi_channel.fusion import create_fusion
+# Import the linear integration components
+from src.models.linear_integration.conv import LIConv2d, LIBatchNorm2d
+from src.models.linear_integration.blocks import LIBasicBlock, LIBottleneck
+from src.models.linear_integration.container import LISequential, LIReLU
+from src.models.linear_integration.pooling import LIMaxPool2d, LIAdaptiveAvgPool2d
+# Note: LINet doesn't use fusion - it uses the integrated stream directly
 
 
-class MCResNet(BaseModel):
+class LINet(BaseModel):
     """
-    Multi-Channel ResNet implementation.
-    
-    This model processes stream1 and stream2 information through separate pathways
-    while maintaining the ResNet architecture's residual connections.
+    Linear Integration ResNet (LINet) implementation.
+
+    Extends MCResNet from 2 streams to 3 streams:
+    - Stream1: RGB/Color pathway (independent processing)
+    - Stream2: Depth/Brightness pathway (independent processing)
+    - Integrated: Learned fusion pathway (combines stream outputs during convolution)
+
+    Uses unified LIConv2d neurons where integration happens INSIDE the neuron.
+    Final predictions come from the integrated stream (no separate fusion layer needed).
     """
-    
+
     def __init__(
         self,
-        block: type[Union[MCBasicBlock, MCBottleneck]],
+        block: type[Union[LIBasicBlock, LIBottleneck]],
         layers: list[int],
         num_classes: int,
         zero_init_residual: bool = False,
@@ -76,24 +83,22 @@ class MCResNet(BaseModel):
         norm_layer: Optional[Callable[..., nn.Module]] = None,
         device: Optional[str] = None,
         use_amp: bool = False,
-        # MCResNet-specific parameters come AFTER all ResNet parameters
+        # LINet-specific parameters come AFTER all ResNet parameters
         stream1_input_channels: int = 3,
         stream2_input_channels: int = 1,
         dropout_p: float = 0.0,  # Dropout probability (0.0 = no dropout, 0.5 = 50% dropout)
-        fusion_type: str = 'concat',  # Type of fusion ('concat', 'weighted', 'gated')
         **kwargs
     ) -> None:
-        # Store MCResNet-specific parameters BEFORE calling super().__init__
+        # Store LINet-specific parameters BEFORE calling super().__init__
         # because _build_network() (called by super()) needs these attributes
         self.stream1_input_channels = stream1_input_channels
         self.stream2_input_channels = stream2_input_channels
         self.dropout_p = dropout_p
-        self.fusion_type = fusion_type
-        
-        # Set MCResNet default norm layer if not specified
+
+        # Set LINet default norm layer if not specified
         if norm_layer is None:
-            norm_layer = MCBatchNorm2d
-        
+            norm_layer = LIBatchNorm2d
+
         # Initialize BaseModel with all ResNet-compatible parameters in exact order
         # BaseModel will handle all the standard ResNet setup (device, inplanes, dilation, etc.)
         super().__init__(
@@ -111,78 +116,82 @@ class MCResNet(BaseModel):
     
     def _build_network(
         self,
-        block: type[Union[MCBasicBlock, MCBottleneck]],
+        block: type[Union[LIBasicBlock, LIBottleneck]],
         layers: list[int],
         replace_stride_with_dilation: list[bool]
     ):
-        """Build the Multi-Channel ResNet network architecture."""
+        """Build the Linear Integration ResNet network architecture."""
         # BaseModel already initialized self.stream1_inplanes and self.stream2_inplanes to 64
-        # for equal scaling, so we can use them directly
-        
-        # Network architecture - exactly like ResNet but with multi-channel components
-        self.conv1 = MCConv2d(
-            self.stream1_input_channels, self.stream2_input_channels, 
-            self.stream1_inplanes, self.stream2_inplanes,
+        # Now add integrated_inplanes tracking for 3rd stream
+        self.integrated_inplanes = 64
+
+        # Network architecture - exactly like ResNet but with 3-stream LI components
+        # First conv: no integrated input yet (integrated starts after first block)
+        self.conv1 = LIConv2d(
+            self.stream1_input_channels, self.stream2_input_channels, 0,  # 0 for integrated_in (doesn't exist yet)
+            self.stream1_inplanes, self.stream2_inplanes, self.integrated_inplanes,
             kernel_size=7, stride=2, padding=3, bias=False
         )
-        self.bn1 = self._norm_layer(self.stream1_inplanes, self.stream2_inplanes)
-        self.relu = MCReLU(inplace=True)
-        self.maxpool = MCMaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, 64, layers[0])       # Equal scaling: 64, 64
-        self.layer2 = self._make_layer(block, 128, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])  # Equal scaling: 128, 128
-        self.layer3 = self._make_layer(block, 256, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])  # Equal scaling: 256, 256
-        self.layer4 = self._make_layer(block, 512, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])  # Equal scaling: 512, 512
-        self.avgpool = MCAdaptiveAvgPool2d((1, 1))
+        self.bn1 = self._norm_layer(self.stream1_inplanes, self.stream2_inplanes, self.integrated_inplanes)
+        self.relu = LIReLU(inplace=True)
+        self.maxpool = LIMaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        # Create fusion module
-        feature_dim = 512 * block.expansion
-        self.fusion = create_fusion(self.fusion_type, feature_dim)
+        # ResNet layers - equal scaling for all 3 streams
+        self.layer1 = self._make_layer(block, 64, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
+        self.layer3 = self._make_layer(block, 256, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
+        self.layer4 = self._make_layer(block, 512, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+
+        # Adaptive average pooling for integrated stream only
+        # (Stream1/Stream2 pooling happens in LIMaxPool2d layers)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
         # Add dropout for regularization (configurable, critical for small datasets)
         self.dropout = nn.Dropout(p=self.dropout_p) if self.dropout_p > 0.0 else nn.Identity()
 
-        # Single classifier for integrated features
-        self.fc = nn.Linear(self.fusion.output_dim, self.num_classes)
+        # Single classifier for integrated stream features
+        # No fusion needed - integrated stream is the final representation!
+        feature_dim = 512 * block.expansion
+        self.fc = nn.Linear(feature_dim, self.num_classes)
     
     def _initialize_weights(self, zero_init_residual: bool):
-        """Initialize network weights - exactly like ResNet."""
-        # Weight initialization - exactly like ResNet
+        """Initialize network weights for 3-stream architecture."""
+        # Weight initialization for LIConv2d (already handled in LIConv2d.reset_parameters())
+        # But we can double-check or add custom initialization here if needed
         for m in self.modules():
-            if isinstance(m, MCConv2d):
-                # Handle MCConv2d - initialize both pathways
-                nn.init.kaiming_normal_(m.stream1_weight, mode="fan_out", nonlinearity="relu")
-                nn.init.kaiming_normal_(m.stream2_weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, MCBatchNorm2d):
-                # Handle MCBatchNorm2d - initialize both pathways
-                nn.init.constant_(m.stream1_weight, 1)
-                nn.init.constant_(m.stream1_bias, 0)
-                nn.init.constant_(m.stream2_weight, 1)
-                nn.init.constant_(m.stream2_bias, 0)
+            if isinstance(m, LIConv2d):
+                # LIConv2d.reset_parameters() already initializes all 5 weight matrices
+                # using Kaiming initialization, so no need to do anything here
+                pass
+            elif isinstance(m, LIBatchNorm2d):
+                # LIBatchNorm2d uses standard nn.BatchNorm2d internally,
+                # which initializes itself, so no need to do anything here
+                pass
 
         # Zero-initialize the last BN in each residual branch,
         # so that the residual branch starts with zeros, and each residual block behaves like an identity.
         # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
         if zero_init_residual:
             for m in self.modules():
-                if isinstance(m, MCBottleneck) and m.bn3.affine:
-                    nn.init.constant_(m.bn3.stream1_weight, 0)
-                    nn.init.constant_(m.bn3.stream2_weight, 0)
-                elif isinstance(m, MCBasicBlock) and m.bn2.affine:
-                    nn.init.constant_(m.bn2.stream1_weight, 0)
-                    nn.init.constant_(m.bn2.stream2_weight, 0)
+                if isinstance(m, LIBottleneck) and hasattr(m.bn3, 'integrated_bn'):
+                    # Zero-init integrated stream's last BN weight
+                    nn.init.constant_(m.bn3.integrated_bn.weight, 0)
+                elif isinstance(m, LIBasicBlock) and hasattr(m.bn2, 'integrated_bn'):
+                    # Zero-init integrated stream's last BN weight
+                    nn.init.constant_(m.bn2.integrated_bn.weight, 0)
 
     def _make_layer(
         self,
-        block: type[Union[MCBasicBlock, MCBottleneck]],
+        block: type[Union[LIBasicBlock, LIBottleneck]],
         stream1_planes: int,
         stream2_planes: int,
         blocks: int,
         stride: int = 1,
         dilate: bool = False,
-    ) -> MCSequential:
+    ) -> LISequential:
         """
-        Create a layer composed of multiple residual blocks.
-        Fully compliant with ResNet implementation but using multi-channel blocks with separate channel tracking.
+        Create a layer composed of multiple residual blocks with 3-stream support.
+        Fully compliant with ResNet implementation but using LI blocks with 3-stream channel tracking.
         """
         norm_layer = self._norm_layer
         downsample = None
@@ -190,49 +199,54 @@ class MCResNet(BaseModel):
         if dilate:
             self.dilation *= stride
             stride = 1
-        
-        # Check if downsampling is needed for either pathway
-        need_downsample = (stride != 1 or 
+
+        # Check if downsampling is needed for any stream
+        need_downsample = (stride != 1 or
                           self.stream1_inplanes != stream1_planes * block.expansion or
-                          self.stream2_inplanes != stream2_planes * block.expansion)
-        
+                          self.stream2_inplanes != stream2_planes * block.expansion or
+                          self.integrated_inplanes != stream1_planes * block.expansion)
+
         if need_downsample:
-            downsample = MCSequential(
-                MCConv2d(
-                    self.stream1_inplanes, self.stream2_inplanes, 
-                    stream1_planes * block.expansion, stream2_planes * block.expansion,
+            # Downsample all 3 streams together using unified LI neurons
+            downsample = LISequential(
+                LIConv2d(
+                    self.stream1_inplanes, self.stream2_inplanes, self.integrated_inplanes,
+                    stream1_planes * block.expansion, stream2_planes * block.expansion, stream1_planes * block.expansion,
                     kernel_size=1, stride=stride, bias=False
                 ),
-                norm_layer(stream1_planes * block.expansion, stream2_planes * block.expansion)
+                norm_layer(stream1_planes * block.expansion, stream2_planes * block.expansion, stream1_planes * block.expansion)
             )
 
         layers = []
-        # First block with potential downsampling - pass parameters exactly like ResNet
+        # First block with potential downsampling
         layers.append(
             block(
-                self.stream1_inplanes, 
-                self.stream2_inplanes, 
+                self.stream1_inplanes,
+                self.stream2_inplanes,
+                self.integrated_inplanes,
                 stream1_planes,
                 stream2_planes,
-                stride, 
-                downsample, 
+                stride,
+                downsample,
                 self.groups,
-                self.base_width, 
-                previous_dilation, 
+                self.base_width,
+                previous_dilation,
                 norm_layer
             )
         )
-        
-        # Update channel tracking
+
+        # Update channel tracking for all 3 streams
         self.stream1_inplanes = stream1_planes * block.expansion
         self.stream2_inplanes = stream2_planes * block.expansion
-        
+        self.integrated_inplanes = stream1_planes * block.expansion
+
         # Remaining blocks
         for _ in range(1, blocks):
             layers.append(
                 block(
                     self.stream1_inplanes,
                     self.stream2_inplanes,
+                    self.integrated_inplanes,
                     stream1_planes,
                     stream2_planes,
                     groups=self.groups,
@@ -242,62 +256,53 @@ class MCResNet(BaseModel):
                 )
             )
 
-        return MCSequential(*layers)
+        return LISequential(*layers)
     
     def forward(self, stream1_input: Tensor, stream2_input: Tensor) -> Tensor:
         """
-        Forward pass through the multi-channel ResNet.
-        
-        Args:
-            stream1_input: Color input tensor [batch_size, color_channels, height, width]
-            stream2_input: Brightness input tensor [batch_size, brightness_channels, height, width]
-            
-        Returns:
-            Classification logits [batch_size, num_classes]
-        """
-        # Initial convolution
-        color_x, brightness_x = self.conv1(stream1_input, stream2_input)
-        color_x, brightness_x = self.bn1(color_x, brightness_x)
-        color_x, brightness_x = self.relu(color_x, brightness_x)
-        
-        # Max pooling
-        color_x, brightness_x = self.maxpool(color_x, brightness_x)
-        
-        # ResNet layers
-        color_x, brightness_x = self.layer1(color_x, brightness_x)
-        color_x, brightness_x = self.layer2(color_x, brightness_x)
-        color_x, brightness_x = self.layer3(color_x, brightness_x)
-        color_x, brightness_x = self.layer4(color_x, brightness_x)
-        
-        # Global average pooling
-        color_x, brightness_x = self.avgpool(color_x, brightness_x)
-        
-        # Flatten
-        stream1_features = torch.flatten(color_x, 1)
-        stream2_features = torch.flatten(brightness_x, 1)
+        Forward pass through the Linear Integration ResNet.
 
-        # Fuse features using configured fusion strategy
-        fused_features = self.fusion(stream1_features, stream2_features)
+        Args:
+            stream1_input: RGB input tensor [batch_size, channels, height, width]
+            stream2_input: Depth input tensor [batch_size, channels, height, width]
+
+        Returns:
+            Classification logits [batch_size, num_classes] from integrated stream
+        """
+        # Initial convolution (creates integrated stream from stream1 + stream2)
+        s1, s2, ic = self.conv1(stream1_input, stream2_input, None)  # integrated_input=None for first layer
+        s1, s2, ic = self.bn1(s1, s2, ic)
+        s1, s2, ic = self.relu(s1, s2, ic)
+
+        # Max pooling (all 3 streams)
+        s1, s2, ic = self.maxpool(s1, s2, ic)
+
+        # ResNet layers (all 3 streams, integration happens inside LIConv2d neurons!)
+        s1, s2, ic = self.layer1(s1, s2, ic)
+        s1, s2, ic = self.layer2(s1, s2, ic)
+        s1, s2, ic = self.layer3(s1, s2, ic)
+        s1, s2, ic = self.layer4(s1, s2, ic)
+
+        # Global average pooling for integrated stream only
+        # (We only use integrated stream for final prediction)
+        integrated_pooled = self.avgpool(ic)
+
+        # Flatten integrated features
+        integrated_features = torch.flatten(integrated_pooled, 1)
 
         # Apply dropout (only active during training if dropout_p > 0)
-        fused_features = self.dropout(fused_features)
+        integrated_features = self.dropout(integrated_features)
 
-        # Classify
-        logits = self.fc(fused_features)
+        # Classify using integrated stream features
+        # No fusion needed - integrated stream IS the fused representation!
+        logits = self.fc(integrated_features)
         return logits
 
     def fit(
         self,
-        train_loader: Optional[torch.utils.data.DataLoader] = None,
+        train_loader: torch.utils.data.DataLoader,
         val_loader: Optional[torch.utils.data.DataLoader] = None,
-        train_stream1_data: Optional[torch.Tensor] = None,
-        train_stream2_data: Optional[torch.Tensor] = None,
-        train_targets: Optional[torch.Tensor] = None,
-        val_stream1_data: Optional[torch.Tensor] = None,
-        val_stream2_data: Optional[torch.Tensor] = None,
-        val_targets: Optional[torch.Tensor] = None,
         epochs: int = 10,
-        batch_size: int = 32,
         callbacks: Optional[list] = None,
         verbose: bool = True,
         save_path: Optional[str] = None,
@@ -311,21 +316,18 @@ class MCResNet(BaseModel):
         clear_cache_per_epoch: bool = False,  # Clear CUDA cache after each epoch (only if experiencing OOM)
         stream_monitoring: bool = False,  # Enable stream-specific monitoring (LR, WD, acc per stream)
         stream_early_stopping: bool = False,  # Enable stream-specific early stopping (freezes streams when they plateau)
-        stream1_patience: int = 15,  # Patience for Stream1 (RGB) before freezing
-        stream2_patience: int = 15,  # Patience for Stream2 (Depth) before freezing
+        stream1_patience: int = 10,  # Patience for Stream1 (RGB) before freezing
+        stream2_patience: int = 10,  # Patience for Stream2 (Depth) before freezing
         stream_min_delta: float = 0.001,  # Minimum improvement for stream early stopping
         **scheduler_kwargs
     ) -> dict:
         """
         Train the model with optional early stopping.
-        
+
         Args:
-            train_loader: DataLoader for training data OR tensor of training inputs
-            val_loader: DataLoader for validation data OR tensor of validation inputs (optional)
-            train_targets: Training targets (required if train_loader is a tensor)
-            val_targets: Validation targets (required if val_loader is a tensor)
+            train_loader: DataLoader for training data
+            val_loader: DataLoader for validation data (optional)
             epochs: Number of epochs to train
-            batch_size: Batch size (used when creating DataLoaders from tensors)
             callbacks: List of callbacks to apply during training
             verbose: Whether to print progress
             save_path: Path to save best model checkpoint
@@ -340,7 +342,7 @@ class MCResNet(BaseModel):
             clear_cache_per_epoch: Whether to clear CUDA cache after each epoch (only enable if OOM issues)
             stream_monitoring: Enable stream-specific monitoring. Shows per-stream LR, WD, train/val acc
             stream_early_stopping: Enable stream-specific early stopping. When a stream plateaus, its
-                                 parameters (.stream1_weight/.stream2_weight) are frozen while fusion
+                                 parameters (.stream1_weight/.stream2_weight) are frozen while integration
                                  weights remain trainable, allowing the model to continue learning from the
                                  other stream. Training stops when both streams are frozen.
             stream1_patience: Number of epochs to wait before freezing Stream1 (RGB) if no improvement
@@ -355,7 +357,7 @@ class MCResNet(BaseModel):
                   Note: Use 'scheduler_patience' to avoid conflict with early stopping patience
                 - For 'onecycle' scheduler: steps_per_epoch (required), max_lr, pct_start,
                   anneal_strategy, div_factor, final_div_factor
-            
+
         Returns:
             Training history dictionary
         """
@@ -393,6 +395,8 @@ class MCResNet(BaseModel):
             'stream1_val_acc': [],
             'stream2_train_acc': [],
             'stream2_val_acc': [],
+            'integrated_train_acc': [],
+            'integrated_val_acc': [],
             'stream1_lr': [],
             'stream2_lr': [],
             # Stream freezing events (populated if stream_early_stopping=True)
@@ -498,6 +502,8 @@ class MCResNet(BaseModel):
                     history['stream1_val_acc'].append(stream_stats['stream1_val_acc'])
                     history['stream2_train_acc'].append(stream_stats['stream2_train_acc'])
                     history['stream2_val_acc'].append(stream_stats['stream2_val_acc'])
+                    history['integrated_train_acc'].append(stream_stats['integrated_train_acc'])
+                    history['integrated_val_acc'].append(stream_stats['integrated_val_acc'])
                     history['stream1_lr'].append(stream_stats['stream1_lr'])
                     history['stream2_lr'].append(stream_stats['stream2_lr'])
 
@@ -582,144 +588,82 @@ class MCResNet(BaseModel):
 
         return history
 
-    def evaluate(self, 
-                data_loader: Optional[torch.utils.data.DataLoader] = None, 
-                stream1_data: Optional[torch.Tensor] = None,
-                stream2_data: Optional[torch.Tensor] = None, 
-                targets: Optional[torch.Tensor] = None,
-                batch_size: int = 32) -> dict:
+    def evaluate(self, data_loader: torch.utils.data.DataLoader) -> dict:
         """
         Evaluate the model on the given data.
-        
+
         Args:
-            data_loader: DataLoader containing dual-channel input data and targets (alternative to direct arrays)
-            stream1_data: Color/RGB input data (if not using data_loader)
-            stream2_data: Brightness input data (if not using data_loader)
-            targets: Target tensor (required if not using data_loader)
-            batch_size: Batch size (used when creating DataLoader from tensors)
-            
+            data_loader: DataLoader containing dual-channel input data and targets
+
         Returns:
             Dictionary containing evaluation metrics
         """
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before evaluate().")
-        
-        # Handle tensor input by converting to DataLoader
-        if data_loader is None:
-            if stream1_data is None or stream2_data is None or targets is None:
-                raise ValueError("Either provide data_loader or all of stream1_data, stream2_data, and targets")
-            
-            # Create DataLoader for evaluation
-            data_loader = create_dual_channel_dataloader(
-                stream1_data, stream2_data, targets,
-                batch_size=batch_size, num_workers=0
-            )
-        
+
         loss, accuracy = self._validate(data_loader)
-        
+
         return {
             'loss': loss,
             'accuracy': accuracy
         }
-    def predict(self, 
-                data_loader: Optional[torch.utils.data.DataLoader] = None,
-                stream1_data: Optional[torch.Tensor] = None,
-                stream2_data: Optional[torch.Tensor] = None, 
-                targets: Optional[torch.Tensor] = None,
-                batch_size: int = 32) -> torch.Tensor:
+    def predict(self, data_loader: torch.utils.data.DataLoader) -> torch.Tensor:
         """
         Generate predictions for the input data.
-        
+
         Args:
-            data_loader: DataLoader containing dual-channel input data (alternative to direct arrays)
-            stream1_data: Color/RGB input data (if not using data_loader)
-            stream2_data: Brightness input data (if not using data_loader) 
-            targets: Target tensor for creating dataset (dummy targets if None for prediction)
-            batch_size: Batch size (used when creating DataLoader from tensors)
-            
+            data_loader: DataLoader containing dual-channel input data
+
         Returns:
             Tensor of predicted classes
         """
         if self.device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.to(self.device)
-        
-        # Handle tensor input by converting to DataLoader
-        if data_loader is None:
-            if stream1_data is None or stream2_data is None:
-                raise ValueError("Either provide data_loader or both stream1_data and stream2_data")
-            
-            # Create DataLoader for prediction
-            data_loader = create_dual_channel_dataloader(
-                stream1_data, stream2_data, 
-                targets if targets is not None else torch.zeros(len(stream1_data)),
-                batch_size=batch_size, num_workers=0
-            )
-        
+
         self.eval()
         all_predictions = []
-        
+
         with torch.no_grad():
-            for rgb_batch, brightness_batch, targets in data_loader:
+            for stream1_batch, stream2_batch, targets in data_loader:
                 # GPU optimization: non-blocking transfer for dual-channel data
-                rgb_batch = rgb_batch.to(self.device, non_blocking=True)
-                brightness_batch = brightness_batch.to(self.device, non_blocking=True)
-                
-                outputs = self(rgb_batch, brightness_batch)
+                stream1_batch = stream1_batch.to(self.device, non_blocking=True)
+                stream2_batch = stream2_batch.to(self.device, non_blocking=True)
+
+                outputs = self(stream1_batch, stream2_batch)
                 _, predictions = torch.max(outputs, 1)
                 all_predictions.append(predictions.cpu())
-        
+
         return torch.cat(all_predictions, dim=0)
     
-    def predict_proba(self, 
-                     data_loader: Optional[torch.utils.data.DataLoader] = None,
-                     stream1_data: Optional[torch.Tensor] = None,
-                     stream2_data: Optional[torch.Tensor] = None, 
-                     targets: Optional[torch.Tensor] = None,
-                     batch_size: int = 32) -> np.ndarray:
+    def predict_proba(self, data_loader: torch.utils.data.DataLoader) -> np.ndarray:
         """
         Generate probability predictions for the input data.
-        
+
         Args:
-            data_loader: DataLoader containing dual-channel input data (alternative to direct arrays)
-            stream1_data: Color/RGB input data (if not using data_loader)
-            stream2_data: Brightness input data (if not using data_loader)
-            targets: Target tensor for creating dataset (dummy targets if None for prediction)
-            batch_size: Batch size (used when creating DataLoader from tensors)
-            
+            data_loader: DataLoader containing dual-channel input data
+
         Returns:
             Numpy array of predicted probabilities with shape (n_samples, n_classes)
         """
         if self.device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.to(self.device)
-        
-        # Handle tensor input by converting to DataLoader
-        if data_loader is None:
-            if stream1_data is None or stream2_data is None:
-                raise ValueError("Either provide data_loader or both stream1_data and stream2_data")
-            
-            # Create DataLoader for prediction
-            data_loader = create_dual_channel_dataloader(
-                stream1_data, stream2_data, 
-                targets if targets is not None else torch.zeros(len(stream1_data)),
-                batch_size=batch_size, num_workers=0
-            )
-        
+
         self.eval()
         all_probabilities = []
-        
+
         with torch.no_grad():
-            for rgb_batch, brightness_batch, targets in data_loader:
+            for stream1_batch, stream2_batch, targets in data_loader:
                 # GPU optimization: non-blocking transfer for dual-channel data
-                rgb_batch = rgb_batch.to(self.device, non_blocking=True)
-                brightness_batch = brightness_batch.to(self.device, non_blocking=True)
-                
-                outputs = self(rgb_batch, brightness_batch)
+                stream1_batch = stream1_batch.to(self.device, non_blocking=True)
+                stream2_batch = stream2_batch.to(self.device, non_blocking=True)
+
+                outputs = self(stream1_batch, stream2_batch)
                 # Apply softmax to get probabilities
                 probabilities = torch.softmax(outputs, dim=1)
                 all_probabilities.append(probabilities.cpu().numpy())
-        
+
         return np.concatenate(all_probabilities, axis=0)
     
     
@@ -752,10 +696,10 @@ class MCResNet(BaseModel):
         # OPTIMIZATION 1: Progress bar update frequency - major performance improvement
         update_frequency = max(1, len(train_loader) // 50)  # Update only 50 times per epoch
         
-        for batch_idx, (rgb_batch, brightness_batch, targets) in enumerate(train_loader):
+        for batch_idx, (stream1_batch, stream2_batch, targets) in enumerate(train_loader):
             # GPU optimization: non-blocking transfer for dual-channel data
-            rgb_batch = rgb_batch.to(self.device, non_blocking=True)
-            brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+            stream1_batch = stream1_batch.to(self.device, non_blocking=True)
+            stream2_batch = stream2_batch.to(self.device, non_blocking=True)
             targets = targets.to(self.device, non_blocking=True)
             
             # OPTIMIZATION 5: Gradient accumulation - zero gradients only when starting accumulation
@@ -765,7 +709,7 @@ class MCResNet(BaseModel):
             if self.use_amp:
                 # Use automatic mixed precision
                 with autocast(device_type=self.device.type):
-                    outputs = self(rgb_batch, brightness_batch)
+                    outputs = self(stream1_batch, stream2_batch)
                     loss = self.criterion(outputs, targets)
                     # Scale loss for gradient accumulation
                     if gradient_accumulation_steps > 1:
@@ -795,7 +739,7 @@ class MCResNet(BaseModel):
                             history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
             else:
                 # Standard precision training
-                outputs = self(rgb_batch, brightness_batch)
+                outputs = self(stream1_batch, stream2_batch)
                 loss = self.criterion(outputs, targets)
                 # Scale loss for gradient accumulation
                 if gradient_accumulation_steps > 1:
@@ -893,19 +837,19 @@ class MCResNet(BaseModel):
         update_frequency = max(1, len(data_loader) // 25)  # Update only 25 times during validation
         
         with torch.no_grad():
-            for batch_idx, (rgb_batch, brightness_batch, targets) in enumerate(data_loader):
+            for batch_idx, (stream1_batch, stream2_batch, targets) in enumerate(data_loader):
                 # GPU optimization: non-blocking transfer for dual-channel data
-                rgb_batch = rgb_batch.to(self.device, non_blocking=True)
-                brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+                stream1_batch = stream1_batch.to(self.device, non_blocking=True)
+                stream2_batch = stream2_batch.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
                 
                 # Use AMP for validation if enabled
                 if self.use_amp:
                     with autocast(device_type=self.device.type):
-                        outputs = self(rgb_batch, brightness_batch)
+                        outputs = self(stream1_batch, stream2_batch)
                         loss = self.criterion(outputs, targets)
                 else:
-                    outputs = self(rgb_batch, brightness_batch)
+                    outputs = self(stream1_batch, stream2_batch)
                     loss = self.criterion(outputs, targets)
                 
                 total_loss += loss.item()
@@ -952,7 +896,7 @@ class MCResNet(BaseModel):
                                  monitor: 'StreamMonitor', train_loss: float, train_acc: float,
                                  val_loss: float, val_acc: float) -> dict:
         """
-        Print stream-specific monitoring using StreamMonitor.
+        Print stream-specific monitoring using StreamMonitor for all 3 streams.
 
         Args:
             train_loader: Training data loader
@@ -964,10 +908,10 @@ class MCResNet(BaseModel):
             val_acc: Overall validation accuracy (from full epoch)
 
         Returns:
-            Dictionary containing stream-specific metrics
+            Dictionary containing stream-specific metrics (including integrated stream)
         """
         # Compute stream-specific overfitting indicators (includes train/val acc per stream)
-        # Use max_batches to limit evaluation time (5 batches = ~160-320 samples)
+        # Use max_batches to limit evaluation time (20 batches = ~640 samples)
         overfitting_stats = monitor.compute_stream_overfitting_indicators(
             train_loss=train_loss,
             val_loss=val_loss,
@@ -981,34 +925,41 @@ class MCResNet(BaseModel):
         # Get parameter groups info
         param_groups = self.optimizer.param_groups
 
-        # Build single-line monitoring output
+        # Build single-line monitoring output for all 3 streams
         if len(param_groups) >= 3:
-            # RGB stream
-            rgb_lr = param_groups[0]['lr']
-            rgb_wd = param_groups[0]['weight_decay']
-            rgb_train = overfitting_stats['stream1_train_acc']
-            rgb_val = overfitting_stats['stream1_val_acc']
+            # Stream1 (RGB)
+            stream1_lr = param_groups[0]['lr']
+            stream1_wd = param_groups[0]['weight_decay']
+            stream1_train = overfitting_stats['stream1_train_acc']
+            stream1_val = overfitting_stats['stream1_val_acc']
 
-            # Depth stream
-            depth_lr = param_groups[1]['lr']
-            depth_wd = param_groups[1]['weight_decay']
-            depth_train = overfitting_stats['stream2_train_acc']
-            depth_val = overfitting_stats['stream2_val_acc']
+            # Stream2 (Depth)
+            stream2_lr = param_groups[1]['lr']
+            stream2_wd = param_groups[1]['weight_decay']
+            stream2_train = overfitting_stats['stream2_train_acc']
+            stream2_val = overfitting_stats['stream2_val_acc']
 
-            # Single line output
-            print(f"    Stream1: [T_acc:{rgb_train:.4f}, V_acc:{rgb_val:.4f}, LR:{rgb_lr:.2e}] | "
-                  f"Stream2: [T_acc:{depth_train:.4f}, V_acc:{depth_val:.4f}, LR:{depth_lr:.2e}]")
+            # Integrated stream
+            integrated_train = overfitting_stats['integrated_train_acc']
+            integrated_val = overfitting_stats['integrated_val_acc']
+
+            # Two-line output to show all 3 streams
+            print(f"    Stream1: [T_acc:{stream1_train:.4f}, V_acc:{stream1_val:.4f}, LR:{stream1_lr:.2e}] | "
+                  f"Stream2: [T_acc:{stream2_train:.4f}, V_acc:{stream2_val:.4f}, LR:{stream2_lr:.2e}]")
+            print(f"    Integrated: [T_acc:{integrated_train:.4f}, V_acc:{integrated_val:.4f}]")
 
             # Return stream stats for history tracking
             return {
-                'stream1_train_acc': rgb_train,
-                'stream1_val_acc': rgb_val,
-                'stream2_train_acc': depth_train,
-                'stream2_val_acc': depth_val,
-                'stream1_lr': rgb_lr,
-                'stream1_wd': rgb_wd,
-                'stream2_lr': depth_lr,
-                'stream2_wd': depth_wd
+                'stream1_train_acc': stream1_train,
+                'stream1_val_acc': stream1_val,
+                'stream2_train_acc': stream2_train,
+                'stream2_val_acc': stream2_val,
+                'integrated_train_acc': integrated_train,
+                'integrated_val_acc': integrated_val,
+                'stream1_lr': stream1_lr,
+                'stream1_wd': stream1_wd,
+                'stream2_lr': stream2_lr,
+                'stream2_wd': stream2_wd
             }
 
         return {}
@@ -1018,494 +969,546 @@ class MCResNet(BaseModel):
         """
         The type of fusion used in the model.
 
+        For LINet, integration happens inside LIConv2d neurons (not separate fusion layer).
+
         Returns:
             A string representing the fusion type.
         """
-        return self.fusion_type
+        return "linear_integration"
     
     def _forward_stream1_pathway(self, stream1_input: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the stream1 pathway only.
-        
+
         Args:
             stream1_input: The stream1 input tensor.
-            
+
         Returns:
             The stream1 pathway output tensor (flattened features).
         """
         # Process through stream1 pathway of multi-channel layers
-        color_x = stream1_input
-        
+        stream1_x = stream1_input
+
         # Initial convolution (stream1 pathway only)
-        color_x = self.conv1.forward_stream1(color_x)
-        color_x = self.bn1.forward_stream1(color_x)
-        color_x = self.relu.forward_stream1(color_x)
-        
+        stream1_x = self.conv1.forward_stream1(stream1_x)
+        stream1_x = self.bn1.forward_stream1(stream1_x)
+        stream1_x = self.relu.forward_stream1(stream1_x)
+
         # Max pooling (stream1 pathway only)
-        color_x = self.maxpool.forward_stream1(color_x)
-        
+        stream1_x = self.maxpool.forward_stream1(stream1_x)
+
         # ResNet layers (stream1 pathway only)
-        color_x = self.layer1.forward_stream1(color_x)
-        color_x = self.layer2.forward_stream1(color_x)
-        color_x = self.layer3.forward_stream1(color_x)
-        color_x = self.layer4.forward_stream1(color_x)
-        
+        stream1_x = self.layer1.forward_stream1(stream1_x)
+        stream1_x = self.layer2.forward_stream1(stream1_x)
+        stream1_x = self.layer3.forward_stream1(stream1_x)
+        stream1_x = self.layer4.forward_stream1(stream1_x)
+
         # Global average pooling (stream1 pathway only)
-        color_x = self.avgpool.forward_stream1(color_x)
-        
+        # Note: avgpool is standard nn.AdaptiveAvgPool2d, just call it directly
+        stream1_x = self.avgpool(stream1_x)
+
         # Flatten
-        color_x = torch.flatten(color_x, 1)
-        
-        return color_x
+        stream1_x = torch.flatten(stream1_x, 1)
+
+        return stream1_x
     
     def _forward_stream2_pathway(self, stream2_input: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the stream2 pathway only.
-        
+
         Args:
             stream2_input: The stream2 input tensor.
-            
+
         Returns:
             The stream2 pathway output tensor (flattened features).
         """
         # Process through stream2 pathway of multi-channel layers
-        brightness_x = stream2_input
-        
-        # Initial convolution (stream2 pathway only)
-        brightness_x = self.conv1.forward_stream2(brightness_x)
-        brightness_x = self.bn1.forward_stream2(brightness_x)
-        brightness_x = self.relu.forward_stream2(brightness_x)
-        
-        # Max pooling (stream2 pathway only)
-        brightness_x = self.maxpool.forward_stream2(brightness_x)
-        
-        # ResNet layers (stream2 pathway only)
-        brightness_x = self.layer1.forward_stream2(brightness_x)
-        brightness_x = self.layer2.forward_stream2(brightness_x)
-        brightness_x = self.layer3.forward_stream2(brightness_x)
-        brightness_x = self.layer4.forward_stream2(brightness_x)
-        
-        # Global average pooling (stream2 pathway only)
-        brightness_x = self.avgpool.forward_stream2(brightness_x)
-        
-        # Flatten
-        brightness_x = torch.flatten(brightness_x, 1)
-        
-        return brightness_x
+        stream2_x = stream2_input
 
-    def analyze_pathways(self, 
-                        data_loader: Optional[torch.utils.data.DataLoader] = None,
-                        stream1_data: Optional[torch.Tensor] = None,
-                        stream2_data: Optional[torch.Tensor] = None,
-                        targets: Optional[torch.Tensor] = None,
-                        batch_size: int = 32,
-                        num_samples: int = 100) -> dict:
+        # Initial convolution (stream2 pathway only)
+        stream2_x = self.conv1.forward_stream2(stream2_x)
+        stream2_x = self.bn1.forward_stream2(stream2_x)
+        stream2_x = self.relu.forward_stream2(stream2_x)
+
+        # Max pooling (stream2 pathway only)
+        stream2_x = self.maxpool.forward_stream2(stream2_x)
+
+        # ResNet layers (stream2 pathway only)
+        stream2_x = self.layer1.forward_stream2(stream2_x)
+        stream2_x = self.layer2.forward_stream2(stream2_x)
+        stream2_x = self.layer3.forward_stream2(stream2_x)
+        stream2_x = self.layer4.forward_stream2(stream2_x)
+
+        # Global average pooling (stream2 pathway only)
+        # Note: avgpool is standard nn.AdaptiveAvgPool2d, just call it directly
+        stream2_x = self.avgpool(stream2_x)
+
+        # Flatten
+        stream2_x = torch.flatten(stream2_x, 1)
+
+        return stream2_x
+
+    def _forward_integrated_pathway(self, stream1_input: torch.Tensor, stream2_input: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the integrated pathway only (without stream1/stream2).
+
+        This extracts only the integrated stream features by running the full forward pass
+        and returning only the integrated stream output.
+
+        Args:
+            stream1_input: The stream1 input tensor (needed for integration).
+            stream2_input: The stream2 input tensor (needed for integration).
+
+        Returns:
+            The integrated pathway output tensor (flattened features).
+        """
+        # Initial convolution (creates integrated stream from stream1 + stream2)
+        s1, s2, ic = self.conv1(stream1_input, stream2_input, None)
+        s1, s2, ic = self.bn1(s1, s2, ic)
+        s1, s2, ic = self.relu(s1, s2, ic)
+
+        # Max pooling (all 3 streams)
+        s1, s2, ic = self.maxpool(s1, s2, ic)
+
+        # ResNet layers (integration happens inside LIConv2d neurons)
+        s1, s2, ic = self.layer1(s1, s2, ic)
+        s1, s2, ic = self.layer2(s1, s2, ic)
+        s1, s2, ic = self.layer3(s1, s2, ic)
+        s1, s2, ic = self.layer4(s1, s2, ic)
+
+        # Global average pooling for integrated stream
+        integrated_pooled = self.avgpool(ic)
+
+        # Flatten integrated features
+        integrated_features = torch.flatten(integrated_pooled, 1)
+
+        return integrated_features
+
+    def analyze_pathways(self, data_loader: torch.utils.data.DataLoader) -> dict:
         """
         Analyze the contribution and performance of individual pathways.
-        
+
         Args:
             data_loader: DataLoader containing dual-channel input data
-            stream1_data: Color/RGB input data (if not using data_loader)
-            stream2_data: Brightness input data (if not using data_loader)
-            targets: Target tensor (required if not using data_loader)
-            batch_size: Batch size for analysis
-            num_samples: Number of samples to analyze (for efficiency)
-            
+
         Returns:
-            Dictionary containing pathway analysis results
+            Dictionary containing pathway analysis results for all 3 streams
         """
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before analyze_pathways().")
-            
-        # Handle tensor input by converting to DataLoader
-        if data_loader is None:
-            if stream1_data is None or stream2_data is None or targets is None:
-                raise ValueError("Either provide data_loader or all of stream1_data, stream2_data, and targets")
-            
-            # Limit samples for efficiency
-            if len(stream1_data) > num_samples:
-                indices = torch.randperm(len(stream1_data))[:num_samples]
-                stream1_data = stream1_data[indices]
-                stream2_data = stream2_data[indices]
-                targets = targets[indices]
-            
-            data_loader = create_dual_channel_dataloader(
-                stream1_data, stream2_data, targets,
-                batch_size=batch_size, num_workers=0
-            )
-        
+
         self.eval()
-        
-        # Initialize metrics
+
+        # Initialize metrics for all 3 streams + full model
         full_model_correct = 0
-        color_only_correct = 0
-        brightness_only_correct = 0
+        stream1_only_correct = 0
+        stream2_only_correct = 0
+        integrated_only_correct = 0
         total_samples = 0
-        
+
         full_model_loss = 0.0
-        color_only_loss = 0.0
-        brightness_only_loss = 0.0
-        
-        color_feature_norms = []
-        brightness_feature_norms = []
-        
+        stream1_only_loss = 0.0
+        stream2_only_loss = 0.0
+        integrated_only_loss = 0.0
+
+        stream1_feature_norms = []
+        stream2_feature_norms = []
+        integrated_feature_norms = []
+
         with torch.no_grad():
-            for rgb_batch, brightness_batch, targets_batch in data_loader:
+            for stream1_batch, stream2_batch, targets_batch in data_loader:
                 # Move to device
-                rgb_batch = rgb_batch.to(self.device, non_blocking=True)
-                brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+                stream1_batch = stream1_batch.to(self.device, non_blocking=True)
+                stream2_batch = stream2_batch.to(self.device, non_blocking=True)
                 targets_batch = targets_batch.to(self.device, non_blocking=True)
-                
-                batch_size_actual = rgb_batch.size(0)
+
+                batch_size_actual = stream1_batch.size(0)
                 total_samples += batch_size_actual
-                
-                # Full model prediction
-                full_outputs = self(rgb_batch, brightness_batch)
+
+                # Full model prediction (uses integrated stream)
+                full_outputs = self(stream1_batch, stream2_batch)
                 full_loss = self.criterion(full_outputs, targets_batch)
                 full_model_loss += full_loss.item() * batch_size_actual
-                
+
                 _, full_predicted = torch.max(full_outputs, 1)
                 full_model_correct += (full_predicted == targets_batch).sum().item()
-                
+
                 # Stream1 pathway only
-                color_features = self._forward_stream1_pathway(rgb_batch)
-                color_feature_norms.append(torch.norm(color_features, dim=1).cpu())
-                
-                # Create dummy brightness features with same shape for FC layer
-                brightness_dummy = torch.zeros_like(color_features)
-                color_fused = torch.cat([color_features, brightness_dummy], dim=1)
-                stream1_outputs = self.fc(color_fused)
-                color_loss = self.criterion(stream1_outputs, targets_batch)
-                color_only_loss += color_loss.item() * batch_size_actual
-                
-                _, color_predicted = torch.max(stream1_outputs, 1)
-                color_only_correct += (color_predicted == targets_batch).sum().item()
-                
+                stream1_features = self._forward_stream1_pathway(stream1_batch)
+                stream1_feature_norms.append(torch.norm(stream1_features, dim=1).cpu())
+                stream1_outputs = self.fc(stream1_features)
+                stream1_loss = self.criterion(stream1_outputs, targets_batch)
+                stream1_only_loss += stream1_loss.item() * batch_size_actual
+
+                _, stream1_predicted = torch.max(stream1_outputs, 1)
+                stream1_only_correct += (stream1_predicted == targets_batch).sum().item()
+
                 # Stream2 pathway only
-                brightness_features = self._forward_stream2_pathway(brightness_batch)
-                brightness_feature_norms.append(torch.norm(brightness_features, dim=1).cpu())
-                
-                # Create dummy color features with same shape for FC layer
-                color_dummy = torch.zeros_like(brightness_features)
-                brightness_fused = torch.cat([color_dummy, brightness_features], dim=1)
-                stream2_outputs = self.fc(brightness_fused)
-                brightness_loss = self.criterion(stream2_outputs, targets_batch)
-                brightness_only_loss += brightness_loss.item() * batch_size_actual
-                
-                _, brightness_predicted = torch.max(stream2_outputs, 1)
-                brightness_only_correct += (brightness_predicted == targets_batch).sum().item()
-        
+                stream2_features = self._forward_stream2_pathway(stream2_batch)
+                stream2_feature_norms.append(torch.norm(stream2_features, dim=1).cpu())
+                stream2_outputs = self.fc(stream2_features)
+                stream2_loss = self.criterion(stream2_outputs, targets_batch)
+                stream2_only_loss += stream2_loss.item() * batch_size_actual
+
+                _, stream2_predicted = torch.max(stream2_outputs, 1)
+                stream2_only_correct += (stream2_predicted == targets_batch).sum().item()
+
+                # Integrated pathway only (runs full forward but uses only integrated features)
+                integrated_features = self._forward_integrated_pathway(stream1_batch, stream2_batch)
+                integrated_feature_norms.append(torch.norm(integrated_features, dim=1).cpu())
+                integrated_outputs = self.fc(integrated_features)
+                integrated_loss = self.criterion(integrated_outputs, targets_batch)
+                integrated_only_loss += integrated_loss.item() * batch_size_actual
+
+                _, integrated_predicted = torch.max(integrated_outputs, 1)
+                integrated_only_correct += (integrated_predicted == targets_batch).sum().item()
+
         # Calculate metrics
         full_accuracy = full_model_correct / total_samples
-        color_accuracy = color_only_correct / total_samples
-        brightness_accuracy = brightness_only_correct / total_samples
-        
+        stream1_accuracy = stream1_only_correct / total_samples
+        stream2_accuracy = stream2_only_correct / total_samples
+        integrated_accuracy = integrated_only_correct / total_samples
+
         avg_full_loss = full_model_loss / total_samples
-        avg_color_loss = color_only_loss / total_samples
-        avg_brightness_loss = brightness_only_loss / total_samples
-        
+        avg_stream1_loss = stream1_only_loss / total_samples
+        avg_stream2_loss = stream2_only_loss / total_samples
+        avg_integrated_loss = integrated_only_loss / total_samples
+
         # Feature analysis
-        color_norms = torch.cat(color_feature_norms, dim=0)
-        brightness_norms = torch.cat(brightness_feature_norms, dim=0)
-        
+        stream1_norms = torch.cat(stream1_feature_norms, dim=0)
+        stream2_norms = torch.cat(stream2_feature_norms, dim=0)
+        integrated_norms = torch.cat(integrated_feature_norms, dim=0)
+
         return {
             'accuracy': {
                 'full_model': full_accuracy,
-                'color_only': color_accuracy,
-                'brightness_only': brightness_accuracy,
-                'color_contribution': color_accuracy / full_accuracy if full_accuracy > 0 else 0,
-                'brightness_contribution': brightness_accuracy / full_accuracy if full_accuracy > 0 else 0
+                'stream1_only': stream1_accuracy,
+                'stream2_only': stream2_accuracy,
+                'integrated_only': integrated_accuracy,
+                'stream1_contribution': stream1_accuracy / full_accuracy if full_accuracy > 0 else 0,
+                'stream2_contribution': stream2_accuracy / full_accuracy if full_accuracy > 0 else 0,
+                'integrated_contribution': integrated_accuracy / full_accuracy if full_accuracy > 0 else 0
             },
             'loss': {
                 'full_model': avg_full_loss,
-                'color_only': avg_color_loss,
-                'brightness_only': avg_brightness_loss
+                'stream1_only': avg_stream1_loss,
+                'stream2_only': avg_stream2_loss,
+                'integrated_only': avg_integrated_loss
             },
             'feature_norms': {
-                'color_mean': color_norms.mean().item(),
-                'color_std': color_norms.std().item(),
-                'brightness_mean': brightness_norms.mean().item(),
-                'brightness_std': brightness_norms.std().item(),
-                'color_to_brightness_ratio': (color_norms.mean() / brightness_norms.mean()).item()
+                'stream1_mean': stream1_norms.mean().item(),
+                'stream1_std': stream1_norms.std().item(),
+                'stream2_mean': stream2_norms.mean().item(),
+                'stream2_std': stream2_norms.std().item(),
+                'integrated_mean': integrated_norms.mean().item(),
+                'integrated_std': integrated_norms.std().item(),
+                'stream1_to_stream2_ratio': (stream1_norms.mean() / stream2_norms.mean()).item() if stream2_norms.mean() > 0 else float('inf'),
+                'integrated_to_stream1_ratio': (integrated_norms.mean() / stream1_norms.mean()).item() if stream1_norms.mean() > 0 else float('inf')
             },
             'samples_analyzed': total_samples
         }
     
     def analyze_pathway_weights(self) -> dict:
         """
-        Analyze the weight distributions and magnitudes across pathways.
-        
+        Analyze the weight distributions and magnitudes across all 3 pathways.
+
         Returns:
-            Dictionary containing weight analysis for color and stream2 pathways
+            Dictionary containing weight analysis for stream1, stream2, and integrated pathways
         """
         stream1_weights = {}
         stream2_weights = {}
-        
-        # Analyze multi-channel layers - look for modules with stream1_weight and stream2_weight
+        integrated_weights = {}
+        integration_weights = {}
+
+        # Analyze LI layers - look for modules with stream1_weight, stream2_weight, and integrated_weight
         for name, module in self.named_modules():
-            if hasattr(module, 'stream1_weight') and hasattr(module, 'stream2_weight'):
-                # MCConv2d and MCBatchNorm2d modules
+            if hasattr(module, 'stream1_weight') and hasattr(module, 'stream2_weight') and hasattr(module, 'integrated_weight'):
+                # LIConv2d modules
                 stream1_weight = module.stream1_weight
                 stream2_weight = module.stream2_weight
-                
+                integrated_weight = module.integrated_weight
+
                 stream1_weights[name] = {
                     'mean': stream1_weight.mean().item(),
                     'std': stream1_weight.std().item(),
                     'norm': torch.norm(stream1_weight).item(),
                     'shape': list(stream1_weight.shape)
                 }
-                
+
                 stream2_weights[name] = {
                     'mean': stream2_weight.mean().item(),
                     'std': stream2_weight.std().item(),
                     'norm': torch.norm(stream2_weight).item(),
                     'shape': list(stream2_weight.shape)
                 }
-        
+
+                integrated_weights[name] = {
+                    'mean': integrated_weight.mean().item(),
+                    'std': integrated_weight.std().item(),
+                    'norm': torch.norm(integrated_weight).item(),
+                    'shape': list(integrated_weight.shape)
+                }
+
+                # Integration weights (from stream1 and stream2 to integrated)
+                if hasattr(module, 'integration_from_stream1') and hasattr(module, 'integration_from_stream2'):
+                    int_from_s1 = module.integration_from_stream1
+                    int_from_s2 = module.integration_from_stream2
+
+                    integration_weights[name] = {
+                        'from_stream1': {
+                            'mean': int_from_s1.mean().item(),
+                            'std': int_from_s1.std().item(),
+                            'norm': torch.norm(int_from_s1).item(),
+                            'shape': list(int_from_s1.shape)
+                        },
+                        'from_stream2': {
+                            'mean': int_from_s2.mean().item(),
+                            'std': int_from_s2.std().item(),
+                            'norm': torch.norm(int_from_s2).item(),
+                            'shape': list(int_from_s2.shape)
+                        }
+                    }
+
         # Calculate overall statistics
-        color_norms = [w['norm'] for w in stream1_weights.values()]
-        brightness_norms = [w['norm'] for w in stream2_weights.values()]
-        
+        stream1_norms = [w['norm'] for w in stream1_weights.values()]
+        stream2_norms = [w['norm'] for w in stream2_weights.values()]
+        integrated_norms = [w['norm'] for w in integrated_weights.values()]
+
         return {
             'stream1_pathway': {
                 'layer_weights': stream1_weights,
-                'total_norm': sum(color_norms),
-                'mean_norm': sum(color_norms) / len(color_norms) if color_norms else 0,
+                'total_norm': sum(stream1_norms),
+                'mean_norm': sum(stream1_norms) / len(stream1_norms) if stream1_norms else 0,
                 'num_layers': len(stream1_weights)
             },
             'stream2_pathway': {
                 'layer_weights': stream2_weights,
-                'total_norm': sum(brightness_norms),
-                'mean_norm': sum(brightness_norms) / len(brightness_norms) if brightness_norms else 0,
+                'total_norm': sum(stream2_norms),
+                'mean_norm': sum(stream2_norms) / len(stream2_norms) if stream2_norms else 0,
                 'num_layers': len(stream2_weights)
             },
+            'integrated_pathway': {
+                'layer_weights': integrated_weights,
+                'total_norm': sum(integrated_norms),
+                'mean_norm': sum(integrated_norms) / len(integrated_norms) if integrated_norms else 0,
+                'num_layers': len(integrated_weights)
+            },
+            'integration_weights': integration_weights,
             'ratio_analysis': {
-                'color_to_brightness_norm_ratio': (sum(color_norms) / sum(brightness_norms)) if brightness_norms else float('inf'),
+                'stream1_to_stream2_norm_ratio': (sum(stream1_norms) / sum(stream2_norms)) if stream2_norms else float('inf'),
+                'integrated_to_stream1_norm_ratio': (sum(integrated_norms) / sum(stream1_norms)) if stream1_norms else float('inf'),
                 'layer_ratios': {
-                    name: stream1_weights[name]['norm'] / stream2_weights[name]['norm'] 
-                    if name in stream2_weights and stream2_weights[name]['norm'] > 0 else float('inf')
+                    name: {
+                        's1_to_s2': stream1_weights[name]['norm'] / stream2_weights[name]['norm']
+                        if name in stream2_weights and stream2_weights[name]['norm'] > 0 else float('inf'),
+                        'int_to_s1': integrated_weights[name]['norm'] / stream1_weights[name]['norm']
+                        if stream1_weights[name]['norm'] > 0 else float('inf')
+                    }
                     for name in stream1_weights.keys()
-                    if name in stream2_weights
+                    if name in stream2_weights and name in integrated_weights
                 }
             }
         }
     
-    def get_pathway_importance(self, 
-                              data_loader: Optional[torch.utils.data.DataLoader] = None,
-                              stream1_data: Optional[torch.Tensor] = None,
-                              stream2_data: Optional[torch.Tensor] = None,
-                              targets: Optional[torch.Tensor] = None,
-                              batch_size: int = 32,
+    def get_pathway_importance(self,
+                              data_loader: torch.utils.data.DataLoader,
                               method: str = 'gradient') -> dict:
         """
         Calculate pathway importance using different methods.
-        
+
         Args:
             data_loader: DataLoader containing dual-channel input data
-            stream1_data: Color/RGB input data (if not using data_loader)
-            stream2_data: Brightness input data (if not using data_loader)
-            targets: Target tensor (required if not using data_loader)
-            batch_size: Batch size for analysis
             method: Method for importance calculation ('gradient', 'ablation', 'feature_norm')
-            
+
         Returns:
             Dictionary containing pathway importance scores
         """
         if method == 'gradient':
-            return self._calculate_gradient_importance(data_loader, stream1_data, stream2_data, targets, batch_size)
+            return self._calculate_gradient_importance(data_loader)
         elif method == 'ablation':
-            return self.calculate_stream_contributions(data_loader, stream1_data, stream2_data, targets, batch_size)
+            return self.calculate_stream_contributions(data_loader)
         elif method == 'feature_norm':
-            return self._calculate_feature_norm_importance(data_loader, stream1_data, stream2_data, targets, batch_size)
+            return self._calculate_feature_norm_importance(data_loader)
         else:
             raise ValueError(f"Unknown importance method: {method}. Choose from 'gradient', 'ablation', 'feature_norm'")
     
-    def _calculate_gradient_importance(self, data_loader, stream1_data, stream2_data, targets, batch_size):
-        """Calculate importance based on gradient magnitudes."""
+    def _calculate_gradient_importance(self, data_loader):
+        """
+        Calculate importance based on gradient magnitudes.
+
+        Note: For LINet, the integrated stream is created FROM stream1 and stream2,
+        so we measure input gradients for stream1 and stream2 only.
+        The integrated stream's importance is implicit in how gradients flow back
+        through the integration weights to the input streams.
+        """
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before calculating importance.")
-
-        # Handle tensor input
-        if data_loader is None:
-            if stream1_data is None or stream2_data is None or targets is None:
-                raise ValueError("Either provide data_loader or all input tensors")
-
-            # Use a subset for efficiency
-            num_samples = min(50, len(stream1_data))
-            indices = torch.randperm(len(stream1_data))[:num_samples]
-            data_loader = create_dual_channel_dataloader(
-                stream1_data[indices], stream2_data[indices], targets[indices],
-                batch_size=batch_size, num_workers=0
-            )
 
         # Save current training state
         was_training = self.training
         self.train()  # Enable gradients
 
-        color_gradients = []
-        brightness_gradients = []
+        stream1_gradients = []
+        stream2_gradients = []
 
-        for rgb_batch, brightness_batch, targets_batch in data_loader:
-            rgb_batch = rgb_batch.to(self.device, non_blocking=True)
-            brightness_batch = brightness_batch.to(self.device, non_blocking=True)
+        for stream1_batch, stream2_batch, targets_batch in data_loader:
+            stream1_batch = stream1_batch.to(self.device, non_blocking=True)
+            stream2_batch = stream2_batch.to(self.device, non_blocking=True)
             targets_batch = targets_batch.to(self.device, non_blocking=True)
 
             # Require gradients for inputs
-            rgb_batch.requires_grad_(True)
-            brightness_batch.requires_grad_(True)
+            stream1_batch.requires_grad_(True)
+            stream2_batch.requires_grad_(True)
 
-            # Forward pass
-            outputs = self(rgb_batch, brightness_batch)
+            # Forward pass (creates integrated stream internally)
+            outputs = self(stream1_batch, stream2_batch)
             loss = self.criterion(outputs, targets_batch)
 
             # Backward pass
             loss.backward()
 
             # Calculate gradient norms - flatten and then compute norm
-            color_grad_norm = torch.norm(rgb_batch.grad.flatten(1), dim=1).mean().item()
-            brightness_grad_norm = torch.norm(brightness_batch.grad.flatten(1), dim=1).mean().item()
+            stream1_grad_norm = torch.norm(stream1_batch.grad.flatten(1), dim=1).mean().item()
+            stream2_grad_norm = torch.norm(stream2_batch.grad.flatten(1), dim=1).mean().item()
 
-            color_gradients.append(color_grad_norm)
-            brightness_gradients.append(brightness_grad_norm)
+            stream1_gradients.append(stream1_grad_norm)
+            stream2_gradients.append(stream2_grad_norm)
 
             # Clear gradients
             self.zero_grad()
-            rgb_batch.grad = None
-            brightness_batch.grad = None
+            stream1_batch.grad = None
+            stream2_batch.grad = None
 
         # Restore original training state
         self.train(was_training)
 
-        avg_color_grad = sum(color_gradients) / len(color_gradients)
-        avg_brightness_grad = sum(brightness_gradients) / len(brightness_gradients)
-        total_grad = avg_color_grad + avg_brightness_grad
+        avg_stream1_grad = sum(stream1_gradients) / len(stream1_gradients)
+        avg_stream2_grad = sum(stream2_gradients) / len(stream2_gradients)
+        total_grad = avg_stream1_grad + avg_stream2_grad
 
         return {
             'method': 'gradient',
-            'color_importance': avg_color_grad / total_grad if total_grad > 0 else 0.5,
-            'brightness_importance': avg_brightness_grad / total_grad if total_grad > 0 else 0.5,
+            'stream1_importance': avg_stream1_grad / total_grad if total_grad > 0 else 0.5,
+            'stream2_importance': avg_stream2_grad / total_grad if total_grad > 0 else 0.5,
             'raw_gradients': {
-                'color_avg': avg_color_grad,
-                'brightness_avg': avg_brightness_grad
-            }
+                'stream1_avg': avg_stream1_grad,
+                'stream2_avg': avg_stream2_grad
+            },
+            'note': 'Integrated stream importance is implicit in how gradients flow through integration weights'
         }
     
-    def calculate_stream_contributions(self,
-                                       data_loader: Optional[torch.utils.data.DataLoader] = None,
-                                       stream1_data: Optional[torch.Tensor] = None,
-                                       stream2_data: Optional[torch.Tensor] = None,
-                                       targets: Optional[torch.Tensor] = None,
-                                       batch_size: int = 32,
-                                       num_samples: int = 100):
+    def calculate_stream_contributions(self, data_loader: torch.utils.data.DataLoader):
         """
         Calculate how much each stream contributes to the final predictions.
 
-        Uses ablation analysis: measures performance drop when each stream is removed.
-        This shows how much the fusion layer relies on each stream for final predictions.
+        Uses ablation analysis: measures performance of each stream individually.
+        For LINet, the integrated stream represents the learned fusion of stream1 and stream2.
 
         Args:
             data_loader: DataLoader containing dual-channel input data
-            stream1_data: Color/RGB input data (if not using data_loader)
-            stream2_data: Brightness input data (if not using data_loader)
-            targets: Target tensor (required if not using data_loader)
-            batch_size: Batch size for analysis
-            num_samples: Number of samples to analyze (for efficiency)
 
         Returns:
-            Dictionary containing stream contribution analysis
+            Dictionary containing stream contribution analysis for all 3 streams
         """
         # Use the analyze_pathways method for ablation analysis
-        pathway_analysis = self.analyze_pathways(data_loader, stream1_data, stream2_data, targets, batch_size, num_samples)
-        
+        pathway_analysis = self.analyze_pathways(data_loader)
+
         full_accuracy = pathway_analysis['accuracy']['full_model']
-        color_accuracy = pathway_analysis['accuracy']['color_only']
-        brightness_accuracy = pathway_analysis['accuracy']['brightness_only']
-        
-        # Calculate importance as relative contribution to full model performance
-        color_drop = max(0, full_accuracy - brightness_accuracy)  # Performance drop without color
-        brightness_drop = max(0, full_accuracy - color_accuracy)  # Performance drop without brightness
-        
-        total_contribution = color_drop + brightness_drop
-        
+        stream1_accuracy = pathway_analysis['accuracy']['stream1_only']
+        stream2_accuracy = pathway_analysis['accuracy']['stream2_only']
+        integrated_accuracy = pathway_analysis['accuracy']['integrated_only']
+
+        # Calculate contribution scores
+        # The integrated stream should perform best (or equal to full model) since that's what we use for prediction
+        total_acc = stream1_accuracy + stream2_accuracy + integrated_accuracy
+
         return {
             'method': 'ablation',
-            'color_importance': color_drop / total_contribution if total_contribution > 0 else 0.5,
-            'brightness_importance': brightness_drop / total_contribution if total_contribution > 0 else 0.5,
-            'performance_drops': {
-                'without_color': color_drop,
-                'without_brightness': brightness_drop
-            },
+            'stream1_importance': stream1_accuracy / total_acc if total_acc > 0 else 0.33,
+            'stream2_importance': stream2_accuracy / total_acc if total_acc > 0 else 0.33,
+            'integrated_importance': integrated_accuracy / total_acc if total_acc > 0 else 0.34,
             'individual_accuracies': {
                 'full_model': full_accuracy,
-                'color_only': color_accuracy,
-                'brightness_only': brightness_accuracy
-            }
+                'stream1_only': stream1_accuracy,
+                'stream2_only': stream2_accuracy,
+                'integrated_only': integrated_accuracy
+            },
+            'relative_to_full_model': {
+                'stream1_ratio': stream1_accuracy / full_accuracy if full_accuracy > 0 else 0,
+                'stream2_ratio': stream2_accuracy / full_accuracy if full_accuracy > 0 else 0,
+                'integrated_ratio': integrated_accuracy / full_accuracy if full_accuracy > 0 else 1.0
+            },
+            'note': 'Integrated stream should perform best as it combines information from both input streams'
         }
     
-    def _calculate_feature_norm_importance(self, data_loader, stream1_data, stream2_data, targets, batch_size):
-        """Calculate importance based on feature norm magnitudes."""
+    def _calculate_feature_norm_importance(self, data_loader):
+        """Calculate importance based on feature norm magnitudes for all 3 streams."""
         # Use the analyze_pathways method for feature analysis
-        pathway_analysis = self.analyze_pathways(data_loader, stream1_data, stream2_data, targets, batch_size)
-        
-        color_norm = pathway_analysis['feature_norms']['color_mean']
-        brightness_norm = pathway_analysis['feature_norms']['brightness_mean']
-        total_norm = color_norm + brightness_norm
-        
+        pathway_analysis = self.analyze_pathways(data_loader)
+
+        stream1_norm = pathway_analysis['feature_norms']['stream1_mean']
+        stream2_norm = pathway_analysis['feature_norms']['stream2_mean']
+        integrated_norm = pathway_analysis['feature_norms']['integrated_mean']
+        total_norm = stream1_norm + stream2_norm + integrated_norm
+
         return {
             'method': 'feature_norm',
-            'color_importance': color_norm / total_norm if total_norm > 0 else 0.5,
-            'brightness_importance': brightness_norm / total_norm if total_norm > 0 else 0.5,
+            'stream1_importance': stream1_norm / total_norm if total_norm > 0 else 0.33,
+            'stream2_importance': stream2_norm / total_norm if total_norm > 0 else 0.33,
+            'integrated_importance': integrated_norm / total_norm if total_norm > 0 else 0.34,
             'feature_norms': {
-                'color_mean': color_norm,
-                'brightness_mean': brightness_norm,
-                'ratio': color_norm / brightness_norm if brightness_norm > 0 else float('inf')
+                'stream1_mean': stream1_norm,
+                'stream2_mean': stream2_norm,
+                'integrated_mean': integrated_norm,
+                'stream1_to_stream2_ratio': stream1_norm / stream2_norm if stream2_norm > 0 else float('inf'),
+                'integrated_to_stream1_ratio': integrated_norm / stream1_norm if stream1_norm > 0 else float('inf')
             }
         } 
 
-# Factory functions for common architectures
-def mc_resnet18(num_classes: int = 1000, **kwargs) -> MCResNet:
-    """Create a Multi-Channel ResNet-18 model."""
-    return MCResNet(
-        MCBasicBlock,
+# Factory functions for common LINet architectures
+def li_resnet18(num_classes: int = 1000, **kwargs) -> LINet:
+    """Create a Linear Integration ResNet-18 model."""
+    return LINet(
+        LIBasicBlock,
         [2, 2, 2, 2],
         num_classes=num_classes,
         **kwargs
     )
 
-def mc_resnet34(num_classes: int = 1000, **kwargs) -> MCResNet:
-    """Create a Multi-Channel ResNet-34 model."""
-    return MCResNet(
-        MCBasicBlock,
+def li_resnet34(num_classes: int = 1000, **kwargs) -> LINet:
+    """Create a Linear Integration ResNet-34 model."""
+    return LINet(
+        LIBasicBlock,
         [3, 4, 6, 3],
         num_classes=num_classes,
         **kwargs
     )
 
 
-def mc_resnet50(num_classes: int = 1000, **kwargs) -> MCResNet:
-    """Create a Multi-Channel ResNet-50 model."""
-    return MCResNet(
-        MCBottleneck,
+def li_resnet50(num_classes: int = 1000, **kwargs) -> LINet:
+    """Create a Linear Integration ResNet-50 model."""
+    return LINet(
+        LIBottleneck,
         [3, 4, 6, 3],
         num_classes=num_classes,
         **kwargs
     )
 
 
-def mc_resnet101(num_classes: int = 1000, **kwargs) -> MCResNet:
-    """Create a Multi-Channel ResNet-101 model."""
-    return MCResNet(
-        MCBottleneck,
+def li_resnet101(num_classes: int = 1000, **kwargs) -> LINet:
+    """Create a Linear Integration ResNet-101 model."""
+    return LINet(
+        LIBottleneck,
         [3, 4, 23, 3],
         num_classes=num_classes,
         **kwargs
     )
 
 
-def mc_resnet152(num_classes: int = 1000, **kwargs) -> MCResNet:
-    """Create a Multi-Channel ResNet-152 model."""
-    return MCResNet(
-        MCBottleneck,
+def li_resnet152(num_classes: int = 1000, **kwargs) -> LINet:
+    """Create a Linear Integration ResNet-152 model."""
+    return LINet(
+        LIBottleneck,
         [3, 8, 36, 3],
         num_classes=num_classes,
         **kwargs

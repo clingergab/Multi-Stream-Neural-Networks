@@ -368,17 +368,19 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
                                 stream_stats: Dict[str, float],
                                 model,
                                 epoch: int,
-                                freeze_on_plateau: bool,
                                 verbose: bool) -> bool:
     """
-    Check stream-specific early stopping and optionally freeze streams.
+    Check stream-specific early stopping and freeze streams when they plateau.
+
+    When a stream plateaus (no improvement for patience epochs), its parameters are frozen
+    while integration weights remain trainable, allowing the model to continue learning from
+    the other stream.
 
     Args:
         stream_early_stopping_state: Stream early stopping state dictionary
         stream_stats: Dictionary with stream1_val_acc and stream2_val_acc
         model: The model (to access stream1 and stream2 parameters)
         epoch: Current epoch number
-        freeze_on_plateau: Whether to freeze stream parameters when they plateau
         verbose: Whether to print freeze messages
 
     Returns:
@@ -407,12 +409,11 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
                 # Freeze Stream1
                 stream1_state['frozen'] = True
 
-                if freeze_on_plateau:
-                    # Freeze stream1 parameters in all MC layers
-                    for name, param in model.named_parameters():
-                        # Freeze parameters that belong to stream1 pathway
-                        if '.stream1_' in name:
-                            param.requires_grad = False
+                # Freeze stream1 parameters (stream-specific weights only)
+                # Integration weights remain trainable to allow rebalancing
+                for name, param in model.named_parameters():
+                    if '.stream1_' in name:
+                        param.requires_grad = False
 
                 if verbose:
                     print(f"❄️  Stream1 frozen (no improvement for {stream1_state['patience']} epochs, "
@@ -436,12 +437,11 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
                 # Freeze Stream2
                 stream2_state['frozen'] = True
 
-                if freeze_on_plateau:
-                    # Freeze stream2 parameters in all MC layers
-                    for name, param in model.named_parameters():
-                        # Freeze parameters that belong to stream2 pathway
-                        if '.stream2_' in name:
-                            param.requires_grad = False
+                # Freeze stream2 parameters (stream-specific weights only)
+                # Integration weights remain trainable to allow rebalancing
+                for name, param in model.named_parameters():
+                    if '.stream2_' in name:
+                        param.requires_grad = False
 
                 if verbose:
                     print(f"❄️  Stream2 frozen (no improvement for {stream2_state['patience']} epochs, "
