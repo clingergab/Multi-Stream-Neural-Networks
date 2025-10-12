@@ -32,7 +32,7 @@ from src.models.common import (
     finalize_progress_bar,
     update_history
 )
-from src.models.linear_integration.stream_monitor import StreamMonitor
+# StreamMonitor no longer needed - monitoring is done during main training/validation loops
 
 # Smart tqdm import - detect environment
 try:
@@ -395,8 +395,6 @@ class LINet(BaseModel):
             'stream1_val_acc': [],
             'stream2_train_acc': [],
             'stream2_val_acc': [],
-            'integrated_train_acc': [],
-            'integrated_val_acc': [],
             'stream1_lr': [],
             'stream2_lr': [],
             # Stream freezing events (populated if stream_early_stopping=True)
@@ -408,11 +406,6 @@ class LINet(BaseModel):
         # Set up scheduler
         self.scheduler = setup_scheduler(self.optimizer, self.scheduler_type, epochs, len(train_loader), **scheduler_kwargs)
 
-        # Initialize StreamMonitor once for the entire fit() call (preserves history across epochs)
-        stream_monitor_instance = None
-        if stream_monitoring and len(self.optimizer.param_groups) > 1:
-            stream_monitor_instance = StreamMonitor(self)
-
         for epoch in range(epochs):
             # Calculate total steps for this epoch (training + validation)
             total_steps = len(train_loader)
@@ -423,14 +416,21 @@ class LINet(BaseModel):
             pbar = create_progress_bar(verbose, epoch, epochs, total_steps)
             
             # Training phase - use helper method
-            avg_train_loss, train_accuracy = self._train_epoch(train_loader, history, pbar, gradient_accumulation_steps, grad_clip_norm, clear_cache_per_epoch)
-            
+            avg_train_loss, train_accuracy, stream1_train_acc, stream2_train_acc = self._train_epoch(
+                train_loader, history, pbar, gradient_accumulation_steps, grad_clip_norm, clear_cache_per_epoch,
+                stream_monitoring=stream_monitoring
+            )
+
             # Validation phase
             val_loss = 0.0
             val_acc = 0.0
-            
+            stream1_val_acc = 0.0
+            stream2_val_acc = 0.0
+
             if val_loader:
-                val_loss, val_acc = self._validate(val_loader, pbar=pbar)
+                val_loss, val_acc, stream1_val_acc, stream2_val_acc = self._validate(
+                    val_loader, pbar=pbar, stream_monitoring=stream_monitoring
+                )
                 
                 # Legacy save best model (preserve existing functionality)
                 if save_path and val_acc > best_val_acc:
@@ -486,15 +486,12 @@ class LINet(BaseModel):
 
             # Stream-specific monitoring (print immediately after progress bar, on same line continuation)
             stream_stats = {}
-            if stream_monitor_instance is not None:
+            if stream_monitoring and len(self.optimizer.param_groups) >= 3:
                 stream_stats = self._print_stream_monitoring(
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    monitor=stream_monitor_instance,
-                    train_loss=avg_train_loss,
-                    train_acc=train_accuracy,
-                    val_loss=val_loss,
-                    val_acc=val_acc
+                    stream1_train_acc=stream1_train_acc,
+                    stream1_val_acc=stream1_val_acc,
+                    stream2_train_acc=stream2_train_acc,
+                    stream2_val_acc=stream2_val_acc
                 )
                 # Save stream-specific metrics to history
                 if stream_stats:
@@ -502,8 +499,6 @@ class LINet(BaseModel):
                     history['stream1_val_acc'].append(stream_stats['stream1_val_acc'])
                     history['stream2_train_acc'].append(stream_stats['stream2_train_acc'])
                     history['stream2_val_acc'].append(stream_stats['stream2_val_acc'])
-                    history['integrated_train_acc'].append(stream_stats['integrated_train_acc'])
-                    history['integrated_val_acc'].append(stream_stats['integrated_val_acc'])
                     history['stream1_lr'].append(stream_stats['stream1_lr'])
                     history['stream2_lr'].append(stream_stats['stream2_lr'])
 
@@ -669,7 +664,7 @@ class LINet(BaseModel):
     
     def _train_epoch(self, train_loader: DataLoader, history: dict, pbar: Optional['TqdmType'] = None,
                      gradient_accumulation_steps: int = 1, grad_clip_norm: Optional[float] = None,
-                     clear_cache_per_epoch: bool = False) -> tuple:
+                     clear_cache_per_epoch: bool = False, stream_monitoring: bool = False) -> tuple:
         """
         Train the model for one epoch with GPU optimizations and gradient accumulation.
 
@@ -680,15 +675,22 @@ class LINet(BaseModel):
             gradient_accumulation_steps: Number of steps to accumulate gradients before updating
             grad_clip_norm: Maximum gradient norm for clipping (None to disable)
             clear_cache_per_epoch: Whether to clear CUDA cache after epoch
+            stream_monitoring: Whether to track stream-specific metrics during training
 
         Returns:
-            Tuple of (average_train_loss, train_accuracy)
+            Tuple of (average_train_loss, train_accuracy, stream1_train_acc, stream2_train_acc)
+            If stream_monitoring=False, stream accuracies will be 0.0
         """
         self.train()
         train_loss = 0.0
         train_batches = 0
         train_correct = 0
         train_total = 0
+
+        # Stream-specific tracking (if monitoring enabled)
+        stream1_train_correct = 0
+        stream2_train_correct = 0
+        stream_train_total = 0
         
         # Ensure gradient_accumulation_steps is at least 1 to avoid division by zero
         gradient_accumulation_steps = max(1, gradient_accumulation_steps)
@@ -769,12 +771,37 @@ class LINet(BaseModel):
             original_loss = loss.item() * gradient_accumulation_steps if gradient_accumulation_steps > 1 else loss.item()
             train_loss += original_loss
             train_batches += 1
-            
+
             # Calculate training accuracy
             with torch.no_grad():
                 _, predicted = torch.max(outputs, 1)
                 train_total += targets.size(0)
                 train_correct += (predicted == targets).sum().item()
+
+                # Stream-specific monitoring (track individual stream accuracies)
+                # IMPORTANT: Use eval() mode to disable dropout for reproducible monitoring
+                # Trade-off: BatchNorm will use running stats instead of batch stats
+                if stream_monitoring:
+                    was_training = self.training
+                    self.eval()  # Disable dropout, use BN running stats
+
+                    # Evaluate stream1 pathway
+                    stream1_features = self._forward_stream1_pathway(stream1_batch)
+                    stream1_features = self.dropout(stream1_features)  # No-op in eval
+                    stream1_out = self.fc(stream1_features)
+                    stream1_pred = stream1_out.argmax(1)
+                    stream1_train_correct += (stream1_pred == targets).sum().item()
+
+                    # Evaluate stream2 pathway
+                    stream2_features = self._forward_stream2_pathway(stream2_batch)
+                    stream2_features = self.dropout(stream2_features)  # No-op in eval
+                    stream2_out = self.fc(stream2_features)
+                    stream2_pred = stream2_out.argmax(1)
+                    stream2_train_correct += (stream2_pred == targets).sum().item()
+
+                    stream_train_total += targets.size(0)
+
+                    self.train(was_training)  # Restore original mode
 
             # OPTIMIZATION 1: Update progress bar much less frequently - MAJOR SPEEDUP
             if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(train_loader) - 1):
@@ -809,29 +836,40 @@ class LINet(BaseModel):
         avg_train_loss = train_loss / train_batches
         train_accuracy = train_correct / train_total
 
+        # Calculate stream-specific accuracies
+        stream1_train_acc = stream1_train_correct / max(stream_train_total, 1) if stream_monitoring else 0.0
+        stream2_train_acc = stream2_train_correct / max(stream_train_total, 1) if stream_monitoring else 0.0
+
         # Optional: Clear CUDA cache at end of epoch (only if experiencing OOM issues)
         # if clear_cache_per_epoch and self.device.type == 'cuda':
         #     torch.cuda.empty_cache()
 
-        return avg_train_loss, train_accuracy
+        return avg_train_loss, train_accuracy, stream1_train_acc, stream2_train_acc
     
-    def _validate(self, data_loader: DataLoader, 
-                  pbar: Optional['TqdmType'] = None) -> tuple:
+    def _validate(self, data_loader: DataLoader,
+                  pbar: Optional['TqdmType'] = None, stream_monitoring: bool = False) -> tuple:
         """
         Validate the model on the given data with GPU optimizations and reduced progress updates.
-        
+
         Args:
             data_loader: DataLoader containing dual-channel input data and targets
             pbar: Optional progress bar to update during validation
-            
+            stream_monitoring: Whether to track stream-specific metrics during validation
+
         Returns:
-            Tuple of (loss, accuracy)
+            Tuple of (loss, accuracy, stream1_val_acc, stream2_val_acc)
+            If stream_monitoring=False, stream accuracies will be 0.0
         """
-        
+
         self.eval()
         total_loss = 0.0
         correct = 0
         total = 0
+
+        # Stream-specific tracking (if monitoring enabled)
+        stream1_val_correct = 0
+        stream2_val_correct = 0
+        stream_val_total = 0
         
         # OPTIMIZATION 1: Progress bar update frequency for validation - major performance improvement
         update_frequency = max(1, len(data_loader) // 25)  # Update only 25 times during validation
@@ -856,6 +894,25 @@ class LINet(BaseModel):
                 _, predicted = torch.max(outputs, 1)
                 total += targets.size(0)
                 correct += (predicted == targets).sum().item()
+
+                # Stream-specific monitoring (track individual stream accuracies)
+                # Model is already in eval() mode (line 864), so dropout is disabled
+                if stream_monitoring:
+                    # Evaluate stream1 pathway
+                    stream1_features = self._forward_stream1_pathway(stream1_batch)
+                    stream1_features = self.dropout(stream1_features)  # No-op in eval
+                    stream1_out = self.fc(stream1_features)
+                    stream1_pred = stream1_out.argmax(1)
+                    stream1_val_correct += (stream1_pred == targets).sum().item()
+
+                    # Evaluate stream2 pathway
+                    stream2_features = self._forward_stream2_pathway(stream2_batch)
+                    stream2_features = self.dropout(stream2_features)  # No-op in eval
+                    stream2_out = self.fc(stream2_features)
+                    stream2_pred = stream2_out.argmax(1)
+                    stream2_val_correct += (stream2_pred == targets).sum().item()
+
+                    stream_val_total += targets.size(0)
 
                 # OPTIMIZATION 1: Update progress bar much less frequently during validation
                 if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(data_loader) - 1):
@@ -889,73 +946,50 @@ class LINet(BaseModel):
         
         avg_loss = total_loss / len(data_loader)
         accuracy = correct / total
-        
-        return avg_loss, accuracy
 
-    def _print_stream_monitoring(self, train_loader: DataLoader, val_loader: DataLoader,
-                                 monitor: 'StreamMonitor', train_loss: float, train_acc: float,
-                                 val_loss: float, val_acc: float) -> dict:
+        # Calculate stream-specific accuracies
+        stream1_val_acc = stream1_val_correct / max(stream_val_total, 1) if stream_monitoring else 0.0
+        stream2_val_acc = stream2_val_correct / max(stream_val_total, 1) if stream_monitoring else 0.0
+
+        return avg_loss, accuracy, stream1_val_acc, stream2_val_acc
+
+    def _print_stream_monitoring(self, stream1_train_acc: float, stream1_val_acc: float,
+                                 stream2_train_acc: float, stream2_val_acc: float) -> dict:
         """
-        Print stream-specific monitoring using StreamMonitor for all 3 streams.
+        Print stream-specific monitoring metrics (computed during main training loop).
 
         Args:
-            train_loader: Training data loader
-            val_loader: Validation data loader
-            monitor: StreamMonitor instance (reused across epochs to preserve history)
-            train_loss: Overall training loss (from full epoch)
-            train_acc: Overall training accuracy (from full epoch)
-            val_loss: Overall validation loss (from full epoch)
-            val_acc: Overall validation accuracy (from full epoch)
+            stream1_train_acc: Stream1 training accuracy (from full epoch)
+            stream1_val_acc: Stream1 validation accuracy (from full epoch)
+            stream2_train_acc: Stream2 training accuracy (from full epoch)
+            stream2_val_acc: Stream2 validation accuracy (from full epoch)
 
         Returns:
-            Dictionary containing stream-specific metrics (including integrated stream)
+            Dictionary containing stream-specific metrics for history tracking
         """
-        # Compute stream-specific overfitting indicators (includes train/val acc per stream)
-        # Use max_batches to limit evaluation time (20 batches = ~640 samples)
-        overfitting_stats = monitor.compute_stream_overfitting_indicators(
-            train_loss=train_loss,
-            val_loss=val_loss,
-            train_acc=train_acc,
-            val_acc=val_acc,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            max_batches=20
-        )
-
         # Get parameter groups info
         param_groups = self.optimizer.param_groups
 
-        # Build single-line monitoring output for all 3 streams
+        # Build single-line monitoring output for 2 input streams
         if len(param_groups) >= 3:
             # Stream1 (RGB)
             stream1_lr = param_groups[0]['lr']
             stream1_wd = param_groups[0]['weight_decay']
-            stream1_train = overfitting_stats['stream1_train_acc']
-            stream1_val = overfitting_stats['stream1_val_acc']
 
             # Stream2 (Depth)
             stream2_lr = param_groups[1]['lr']
             stream2_wd = param_groups[1]['weight_decay']
-            stream2_train = overfitting_stats['stream2_train_acc']
-            stream2_val = overfitting_stats['stream2_val_acc']
 
-            # Integrated stream
-            integrated_train = overfitting_stats['integrated_train_acc']
-            integrated_val = overfitting_stats['integrated_val_acc']
-
-            # Two-line output to show all 3 streams
-            print(f"    Stream1: [T_acc:{stream1_train:.4f}, V_acc:{stream1_val:.4f}, LR:{stream1_lr:.2e}] | "
-                  f"Stream2: [T_acc:{stream2_train:.4f}, V_acc:{stream2_val:.4f}, LR:{stream2_lr:.2e}]")
-            print(f"    Integrated: [T_acc:{integrated_train:.4f}, V_acc:{integrated_val:.4f}]")
+            # Display only stream1 and stream2 (full model metrics shown in progress bar above)
+            print(f"    Stream1: [T_acc:{stream1_train_acc:.4f}, V_acc:{stream1_val_acc:.4f}, LR:{stream1_lr:.2e}] | "
+                  f"Stream2: [T_acc:{stream2_train_acc:.4f}, V_acc:{stream2_val_acc:.4f}, LR:{stream2_lr:.2e}]")
 
             # Return stream stats for history tracking
             return {
-                'stream1_train_acc': stream1_train,
-                'stream1_val_acc': stream1_val,
-                'stream2_train_acc': stream2_train,
-                'stream2_val_acc': stream2_val,
-                'integrated_train_acc': integrated_train,
-                'integrated_val_acc': integrated_val,
+                'stream1_train_acc': stream1_train_acc,
+                'stream1_val_acc': stream1_val_acc,
+                'stream2_train_acc': stream2_train_acc,
+                'stream2_val_acc': stream2_val_acc,
                 'stream1_lr': stream1_lr,
                 'stream1_wd': stream1_wd,
                 'stream2_lr': stream2_lr,
