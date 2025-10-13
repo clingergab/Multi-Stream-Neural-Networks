@@ -486,21 +486,36 @@ class LINet(BaseModel):
 
             # Stream-specific monitoring (print immediately after progress bar, on same line continuation)
             stream_stats = {}
-            if stream_monitoring and len(self.optimizer.param_groups) >= 3:
-                stream_stats = self._print_stream_monitoring(
-                    stream1_train_acc=stream1_train_acc,
-                    stream1_val_acc=stream1_val_acc,
-                    stream2_train_acc=stream2_train_acc,
-                    stream2_val_acc=stream2_val_acc
-                )
-                # Save stream-specific metrics to history
-                if stream_stats:
-                    history['stream1_train_acc'].append(stream_stats['stream1_train_acc'])
-                    history['stream1_val_acc'].append(stream_stats['stream1_val_acc'])
-                    history['stream2_train_acc'].append(stream_stats['stream2_train_acc'])
-                    history['stream2_val_acc'].append(stream_stats['stream2_val_acc'])
-                    history['stream1_lr'].append(stream_stats['stream1_lr'])
-                    history['stream2_lr'].append(stream_stats['stream2_lr'])
+            if stream_monitoring:
+                # Always save stream accuracies to history (computed during training/validation)
+                history['stream1_train_acc'].append(stream1_train_acc)
+                history['stream1_val_acc'].append(stream1_val_acc)
+                history['stream2_train_acc'].append(stream2_train_acc)
+                history['stream2_val_acc'].append(stream2_val_acc)
+
+                # Print detailed metrics only if using stream-specific parameter groups
+                if len(self.optimizer.param_groups) >= 3:
+                    stream_stats = self._print_stream_monitoring(
+                        stream1_train_acc=stream1_train_acc,
+                        stream1_val_acc=stream1_val_acc,
+                        stream2_train_acc=stream2_train_acc,
+                        stream2_val_acc=stream2_val_acc
+                    )
+                    # Save learning rates (only available with stream-specific param groups)
+                    if stream_stats:
+                        history['stream1_lr'].append(stream_stats['stream1_lr'])
+                        history['stream2_lr'].append(stream_stats['stream2_lr'])
+                else:
+                    # Simple print without LR/WD (no stream-specific param groups)
+                    print(f"    Stream1: [T_acc:{stream1_train_acc:.4f}, V_acc:{stream1_val_acc:.4f}] | "
+                          f"Stream2: [T_acc:{stream2_train_acc:.4f}, V_acc:{stream2_val_acc:.4f}]")
+                    # Create minimal stream_stats for compatibility
+                    stream_stats = {
+                        'stream1_train_acc': stream1_train_acc,
+                        'stream1_val_acc': stream1_val_acc,
+                        'stream2_train_acc': stream2_train_acc,
+                        'stream2_val_acc': stream2_val_acc
+                    }
 
             # Stream-specific early stopping (freeze streams when they plateau)
             if stream_early_stopping_state['enabled'] and stream_stats:
@@ -778,24 +793,23 @@ class LINet(BaseModel):
                 train_total += targets.size(0)
                 train_correct += (predicted == targets).sum().item()
 
-                # Stream-specific monitoring (track individual stream accuracies)
+                # Stream-specific monitoring (ablation study via stream zeroing)
                 # IMPORTANT: Use eval() mode to disable dropout for reproducible monitoring
-                # Trade-off: BatchNorm will use running stats instead of batch stats
                 if stream_monitoring:
                     was_training = self.training
                     self.eval()  # Disable dropout, use BN running stats
 
-                    # Evaluate stream1 pathway
-                    stream1_features = self._forward_stream1_pathway(stream1_batch)
-                    stream1_features = self.dropout(stream1_features)  # No-op in eval
-                    stream1_out = self.fc(stream1_features)
+                    # Evaluate stream1 contribution by zeroing stream2 (ablation study)
+                    # This measures: "How well does THIS model perform with only stream1 data?"
+                    stream2_zeros = torch.zeros_like(stream2_batch)
+                    stream1_out = self(stream1_batch, stream2_zeros)
                     stream1_pred = stream1_out.argmax(1)
                     stream1_train_correct += (stream1_pred == targets).sum().item()
 
-                    # Evaluate stream2 pathway
-                    stream2_features = self._forward_stream2_pathway(stream2_batch)
-                    stream2_features = self.dropout(stream2_features)  # No-op in eval
-                    stream2_out = self.fc(stream2_features)
+                    # Evaluate stream2 contribution by zeroing stream1 (ablation study)
+                    # This measures: "How well does THIS model perform with only stream2 data?"
+                    stream1_zeros = torch.zeros_like(stream1_batch)
+                    stream2_out = self(stream1_zeros, stream2_batch)
                     stream2_pred = stream2_out.argmax(1)
                     stream2_train_correct += (stream2_pred == targets).sum().item()
 
@@ -895,20 +909,20 @@ class LINet(BaseModel):
                 total += targets.size(0)
                 correct += (predicted == targets).sum().item()
 
-                # Stream-specific monitoring (track individual stream accuracies)
+                # Stream-specific monitoring (ablation study via stream zeroing)
                 # Model is already in eval() mode (line 864), so dropout is disabled
                 if stream_monitoring:
-                    # Evaluate stream1 pathway
-                    stream1_features = self._forward_stream1_pathway(stream1_batch)
-                    stream1_features = self.dropout(stream1_features)  # No-op in eval
-                    stream1_out = self.fc(stream1_features)
+                    # Evaluate stream1 contribution by zeroing stream2 (ablation study)
+                    # This measures: "How well does THIS model perform with only stream1 data?"
+                    stream2_zeros = torch.zeros_like(stream2_batch)
+                    stream1_out = self(stream1_batch, stream2_zeros)
                     stream1_pred = stream1_out.argmax(1)
                     stream1_val_correct += (stream1_pred == targets).sum().item()
 
-                    # Evaluate stream2 pathway
-                    stream2_features = self._forward_stream2_pathway(stream2_batch)
-                    stream2_features = self.dropout(stream2_features)  # No-op in eval
-                    stream2_out = self.fc(stream2_features)
+                    # Evaluate stream2 contribution by zeroing stream1 (ablation study)
+                    # This measures: "How well does THIS model perform with only stream2 data?"
+                    stream1_zeros = torch.zeros_like(stream1_batch)
+                    stream2_out = self(stream1_zeros, stream2_batch)
                     stream2_pred = stream2_out.argmax(1)
                     stream2_val_correct += (stream2_pred == targets).sum().item()
 
