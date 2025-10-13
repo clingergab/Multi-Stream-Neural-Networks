@@ -610,11 +610,13 @@ class LINet(BaseModel):
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before evaluate().")
 
-        loss, accuracy = self._validate(data_loader)
+        loss, accuracy, stream1_val_acc, stream2_val_acc = self._validate(data_loader)
 
         return {
             'loss': loss,
-            'accuracy': accuracy
+            'accuracy': accuracy,
+            'stream1_accuracy': stream1_val_acc,
+            'stream2_accuracy': stream2_val_acc
         }
     def predict(self, data_loader: torch.utils.data.DataLoader) -> torch.Tensor:
         """
