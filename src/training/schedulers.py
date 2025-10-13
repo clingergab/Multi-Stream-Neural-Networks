@@ -5,6 +5,7 @@ This module provides custom schedulers that extend PyTorch's built-in schedulers
 with additional functionality useful for multi-stream learning.
 """
 
+import math
 import torch
 from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
@@ -149,7 +150,7 @@ def update_scheduler(scheduler, val_loss: float) -> None:
 
 class DecayingCosineAnnealingWarmRestarts:
     """
-    CosineAnnealingWarmRestarts with decaying restart peaks.
+    CosineAnnealingWarmRestarts with decaying restart peaks and support for fractional T_mult.
 
     Each time the scheduler restarts (warm restart), the peak learning rate
     is multiplied by `restart_decay`, creating a gradually decreasing envelope
@@ -173,7 +174,7 @@ class DecayingCosineAnnealingWarmRestarts:
     Args:
         optimizer: Wrapped optimizer
         T_0: Number of iterations for the first restart (in epochs or batches)
-        T_mult: Factor to increase T_i after each restart. Default: 1
+        T_mult: Factor to increase T_i after each restart. Can be fractional (e.g., 1.5). Default: 1
         eta_min: Minimum learning rate. Default: 0
         restart_decay: Multiply peak LR by this after each restart. Default: 1.0 (no decay)
         last_epoch: The index of last epoch. Default: -1
@@ -183,7 +184,7 @@ class DecayingCosineAnnealingWarmRestarts:
         >>> scheduler = DecayingCosineAnnealingWarmRestarts(
         ...     optimizer,
         ...     T_0=10,
-        ...     T_mult=2,
+        ...     T_mult=1.5,  # Fractional growth!
         ...     restart_decay=0.8,
         ...     eta_min=1e-6
         ... )
@@ -195,29 +196,30 @@ class DecayingCosineAnnealingWarmRestarts:
         - restart_decay=1.0 behaves identically to CosineAnnealingWarmRestarts
         - restart_decay=0.8 reduces peak by 20% each restart (recommended)
         - restart_decay=0.5 reduces peak by 50% each restart (aggressive)
+        - T_mult can be fractional (e.g., 1.5) - cycle lengths are floored to integers
     """
 
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
         T_0: int,
-        T_mult: int = 1,
+        T_mult: float = 1,
         eta_min: float = 0,
         restart_decay: float = 1.0,
         last_epoch: int = -1
     ):
         if not isinstance(optimizer, torch.optim.Optimizer):
             raise TypeError(f"optimizer must be an Optimizer, got {type(optimizer)}")
-        if T_0 <= 0:
-            raise ValueError(f"T_0 must be positive, got {T_0}")
-        if T_mult < 1:
-            raise ValueError(f"T_mult must be >= 1, got {T_mult}")
+        if T_0 <= 0 or not isinstance(T_0, int):
+            raise ValueError(f"T_0 must be a positive integer, got {T_0}")
+        if not isinstance(T_mult, (int, float)) or T_mult < 1.0:
+            raise ValueError(f"T_mult must be a number >= 1.0, got {T_mult}")
         if not 0.0 <= restart_decay <= 1.0:
             raise ValueError(f"restart_decay must be in [0, 1], got {restart_decay}")
 
         self.optimizer = optimizer
         self.T_0 = T_0
-        self.T_mult = T_mult
+        self.T_mult = float(T_mult)  # Ensure it's a float
         self.eta_min = eta_min
         self.restart_decay = restart_decay
         self.last_epoch = last_epoch
@@ -228,40 +230,113 @@ class DecayingCosineAnnealingWarmRestarts:
         # Track decay multiplier (starts at 1.0, multiplied by restart_decay each restart)
         self.current_multiplier = 1.0
 
-        # Create underlying CosineAnnealingWarmRestarts scheduler
-        self.scheduler = CosineAnnealingWarmRestarts(
-            optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min, last_epoch=last_epoch
-        )
+        # Current cycle tracking (integers) - follows PyTorch's pattern
+        self.T_i = T_0  # Current cycle length (integer)
+        # PyTorch starts T_cur at last_epoch, but since we don't call super().__init__
+        # which would call step() for last_epoch >= 0, we handle it directly:
+        # When last_epoch = -1 (default), the first step() will increment to 0
+        # When last_epoch >= 0, we've already done that many epochs
+        self.T_cur = last_epoch if last_epoch >= 0 else -1
 
-        # Track restart count
+        # Track restart count (our addition for decay tracking)
         self.restart_count = 0
+
+        # Store last learning rates
+        self._last_lr = None
+
+        # Mimic PyTorch's LRScheduler base class behavior:
+        # The base class calls step(0) during __init__ when last_epoch == -1
+        # This initializes T_cur and last_epoch to 0
+        if last_epoch == -1:
+            self.last_epoch = -1  # Will be set to 0 by step()
+            self.step(0)
+
+    def get_lr(self):
+        """
+        Compute learning rate using cosine annealing formula.
+
+        Returns:
+            List of learning rates for each parameter group
+        """
+        lrs = []
+        for base_lr in self.base_lrs:
+            # Current peak is base_lr * current_multiplier (accounts for decay)
+            current_peak = base_lr * self.current_multiplier
+
+            # Cosine annealing: eta_min + (peak - eta_min) * (1 + cos(π * T_cur / T_i)) / 2
+            lr = self.eta_min + (current_peak - self.eta_min) * \
+                 (1 + math.cos(math.pi * self.T_cur / self.T_i)) / 2
+            lrs.append(lr)
+
+        return lrs
 
     def step(self, epoch=None):
         """
         Step the scheduler.
 
-        This should be called once per epoch (or once per batch if using batch-level scheduling).
+        Follows PyTorch's CosineAnnealingWarmRestarts logic with additions for:
+        - Fractional T_mult support (floored to integers for cycle lengths)
+        - Peak LR decay via restart_decay parameter
 
         Args:
             epoch: Current epoch number (optional, for manual epoch setting)
         """
-        # Check if we're at a restart point (at the end of current cycle)
-        # T_cur is the current step within the cycle, T_i is the cycle length
-        if self.scheduler.T_cur + 1 >= self.scheduler.T_i:
-            self.restart_count += 1
-            self.current_multiplier *= self.restart_decay
+        # Handle first call - matches PyTorch's pattern
+        if epoch is None and self.last_epoch < 0:
+            epoch = 0
 
-            # Decay the base max LR for the next cycle
-            # We need to update both the optimizer param_groups and the scheduler's base_lrs
-            for i in range(len(self.optimizer.param_groups)):
-                new_base_lr = self.base_lrs[i] * self.current_multiplier
-                self.optimizer.param_groups[i]['lr'] = new_base_lr
-                self.scheduler.base_lrs[i] = new_base_lr
+        if epoch is None:
+            # Auto-increment mode (standard usage)
+            epoch = self.last_epoch + 1
+            self.T_cur = self.T_cur + 1
 
-        # Step the underlying scheduler (handles T_mult and cosine annealing automatically)
-        self.scheduler.step(epoch)
+            # Check for restart - matches PyTorch's pattern
+            if self.T_cur >= self.T_i:
+                # Our addition: apply decay when restarting
+                self.restart_count += 1
+                self.current_multiplier *= self.restart_decay
 
-        self.last_epoch += 1
+                # Reset position and grow cycle length
+                self.T_cur = self.T_cur - self.T_i
+                # Our modification: floor fractional T_mult to integer
+                self.T_i = int(math.floor(self.T_i * self.T_mult))
+        else:
+            # Manual epoch setting (advanced usage) - matches PyTorch's pattern
+            if epoch < 0:
+                raise ValueError(f"Expected non-negative epoch, but got {epoch}")
+
+            if epoch >= self.T_0:
+                if self.T_mult == 1:
+                    self.T_cur = epoch % self.T_0
+                else:
+                    # For fractional T_mult, use logarithm to find which cycle we're in
+                    # Note: This is an approximation for fractional T_mult
+                    n = int(math.log((epoch / self.T_0 * (self.T_mult - 1) + 1), self.T_mult))
+
+                    # Calculate T_cur based on cycle number
+                    # Sum of geometric series: T_0 * (T_mult^n - 1) / (T_mult - 1)
+                    cycle_start = self.T_0 * (self.T_mult**n - 1) / (self.T_mult - 1)
+                    self.T_cur = epoch - int(cycle_start)
+
+                    # Calculate current cycle length (floored)
+                    self.T_i = int(math.floor(self.T_0 * (self.T_mult ** n)))
+
+                    # Update decay multiplier based on cycle number
+                    self.restart_count = n
+                    self.current_multiplier = self.restart_decay ** n
+            else:
+                self.T_i = self.T_0
+                self.T_cur = epoch
+                self.restart_count = 0
+                self.current_multiplier = 1.0
+
+        self.last_epoch = int(math.floor(epoch))
+
+        # Update optimizer with new LRs - matches PyTorch's pattern
+        for param_group, lr in zip(self.optimizer.param_groups, self.get_lr()):
+            param_group['lr'] = lr
+
+        self._last_lr = [group['lr'] for group in self.optimizer.param_groups]
 
     def get_last_lr(self):
         """
@@ -270,7 +345,7 @@ class DecayingCosineAnnealingWarmRestarts:
         Returns:
             List of learning rates for each parameter group
         """
-        return [group['lr'] for group in self.optimizer.param_groups]
+        return self._last_lr
 
     @property
     def current_peak_lrs(self):
@@ -301,7 +376,9 @@ class DecayingCosineAnnealingWarmRestarts:
             'current_multiplier': self.current_multiplier,
             'restart_count': self.restart_count,
             'last_epoch': self.last_epoch,
-            'scheduler_state': self.scheduler.state_dict(),
+            'T_i': self.T_i,
+            'T_cur': self.T_cur,
+            '_last_lr': self._last_lr,
         }
 
     def load_state_dict(self, state_dict):
@@ -312,7 +389,7 @@ class DecayingCosineAnnealingWarmRestarts:
             state_dict: Scheduler state dict from state_dict()
         """
         self.T_0 = state_dict['T_0']
-        self.T_mult = state_dict['T_mult']
+        self.T_mult = float(state_dict['T_mult'])  # Ensure float
         self.eta_min = state_dict['eta_min']
         self.restart_decay = state_dict['restart_decay']
         self.base_lrs = state_dict['base_lrs']
@@ -328,17 +405,27 @@ class DecayingCosineAnnealingWarmRestarts:
 
         self.restart_count = state_dict['restart_count']
         self.last_epoch = state_dict['last_epoch']
-        self.scheduler.load_state_dict(state_dict['scheduler_state'])
 
-        # Update the scheduler's base_lrs to match current decayed values
-        for i in range(len(self.scheduler.base_lrs)):
-            self.scheduler.base_lrs[i] = self.base_lrs[i] * self.current_multiplier
+        # Load cycle state if available (new format)
+        if 'T_i' in state_dict and 'T_cur' in state_dict:
+            self.T_i = state_dict['T_i']
+            self.T_cur = state_dict['T_cur']
+        else:
+            # Old format: reconstruct from restart_count
+            self.T_i = self.T_0
+            for _ in range(self.restart_count):
+                self.T_i = int(math.floor(self.T_i * self.T_mult))
+            self.T_cur = 0
+
+        # Load last LR if available
+        if '_last_lr' in state_dict:
+            self._last_lr = state_dict['_last_lr']
+        else:
+            self._last_lr = self.base_lrs.copy()
 
         # Apply the current LR to the optimizer's param_groups
-        # The underlying scheduler has the correct _last_lr after load_state_dict
-        if hasattr(self.scheduler, '_last_lr'):
-            for i, param_group in enumerate(self.optimizer.param_groups):
-                param_group['lr'] = self.scheduler._last_lr[i]
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            param_group['lr'] = self._last_lr[i]
 
     def __repr__(self):
         """String representation of the scheduler."""
