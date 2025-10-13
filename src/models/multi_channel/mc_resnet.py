@@ -18,9 +18,8 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts
 from src.data_utils.dual_channel_dataset import DualChannelDataset, create_dual_channel_dataloaders, create_dual_channel_dataloader
+from src.training.schedulers import setup_scheduler, update_scheduler
 from src.models.common import (
-    setup_scheduler,
-    update_scheduler,
     save_checkpoint,
     setup_early_stopping,
     early_stopping_initiated,

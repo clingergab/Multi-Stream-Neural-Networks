@@ -3,8 +3,6 @@ Common utilities and helpers for all models.
 """
 
 from .model_helpers import (
-    setup_scheduler,
-    update_scheduler,
     print_epoch_progress,
     save_checkpoint,
     create_dataloader_from_tensors,
@@ -18,8 +16,6 @@ from .model_helpers import (
 )
 
 __all__ = [
-    'setup_scheduler',
-    'update_scheduler',
     'print_epoch_progress',
     'save_checkpoint',
     'create_dataloader_from_tensors',
