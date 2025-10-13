@@ -225,16 +225,15 @@ class DecayingCosineAnnealingWarmRestarts:
         # Store original base learning rates
         self.base_lrs = [group['lr'] for group in optimizer.param_groups]
 
-        # Track current peak LRs (will decay over time)
-        self.current_peak_lrs = self.base_lrs.copy()
+        # Track decay multiplier (starts at 1.0, multiplied by restart_decay each restart)
+        self.current_multiplier = 1.0
 
         # Create underlying CosineAnnealingWarmRestarts scheduler
         self.scheduler = CosineAnnealingWarmRestarts(
             optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min, last_epoch=last_epoch
         )
 
-        # Track for restart detection
-        self.prev_lrs = [group['lr'] for group in optimizer.param_groups]
+        # Track restart count
         self.restart_count = 0
 
     def step(self, epoch=None):
@@ -246,46 +245,22 @@ class DecayingCosineAnnealingWarmRestarts:
         Args:
             epoch: Current epoch number (optional, for manual epoch setting)
         """
-        # Get current LRs before stepping
-        current_lrs = [group['lr'] for group in self.optimizer.param_groups]
+        # Check if we're at a restart point (at the end of current cycle)
+        # T_cur is the current step within the cycle, T_i is the cycle length
+        if self.scheduler.T_cur + 1 >= self.scheduler.T_i:
+            self.restart_count += 1
+            self.current_multiplier *= self.restart_decay
 
-        # Step the underlying scheduler
+            # Decay the base max LR for the next cycle
+            # We need to update both the optimizer param_groups and the scheduler's base_lrs
+            for i in range(len(self.optimizer.param_groups)):
+                new_base_lr = self.base_lrs[i] * self.current_multiplier
+                self.optimizer.param_groups[i]['lr'] = new_base_lr
+                self.scheduler.base_lrs[i] = new_base_lr
+
+        # Step the underlying scheduler (handles T_mult and cosine annealing automatically)
         self.scheduler.step(epoch)
 
-        # Get new LRs after stepping
-        new_lrs = [group['lr'] for group in self.optimizer.param_groups]
-
-        # Detect restart: LR increased significantly (warm restart occurred)
-        # Use threshold to detect restart (new LR > 1.1 * old LR indicates jump)
-        restart_detected = any(
-            new_lr > old_lr * 1.1
-            for new_lr, old_lr in zip(new_lrs, current_lrs)
-        )
-
-        if restart_detected:
-            self.restart_count += 1
-
-            # Decay the peak LRs for the next cycle
-            self.current_peak_lrs = [
-                peak_lr * self.restart_decay
-                for peak_lr in self.current_peak_lrs
-            ]
-
-            # Set optimizer to new peak LRs (start of new cycle)
-            for param_group, new_peak_lr in zip(self.optimizer.param_groups, self.current_peak_lrs):
-                param_group['lr'] = new_peak_lr
-                param_group['initial_lr'] = new_peak_lr  # Update base LR for scheduler
-
-            # Recreate scheduler with new peak LRs
-            self.scheduler = CosineAnnealingWarmRestarts(
-                self.optimizer,
-                T_0=self.T_0,
-                T_mult=self.T_mult,
-                eta_min=self.eta_min,
-                last_epoch=-1  # Reset to start of new cycle
-            )
-
-        self.prev_lrs = new_lrs
         self.last_epoch += 1
 
     def get_last_lr(self):
@@ -296,6 +271,16 @@ class DecayingCosineAnnealingWarmRestarts:
             List of learning rates for each parameter group
         """
         return [group['lr'] for group in self.optimizer.param_groups]
+
+    @property
+    def current_peak_lrs(self):
+        """
+        Return current peak learning rates (for backward compatibility).
+
+        Returns:
+            List of current peak LRs for each parameter group
+        """
+        return [base_lr * self.current_multiplier for base_lr in self.base_lrs]
 
     def state_dict(self):
         """
@@ -313,7 +298,7 @@ class DecayingCosineAnnealingWarmRestarts:
             'eta_min': self.eta_min,
             'restart_decay': self.restart_decay,
             'base_lrs': self.base_lrs,
-            'current_peak_lrs': self.current_peak_lrs,
+            'current_multiplier': self.current_multiplier,
             'restart_count': self.restart_count,
             'last_epoch': self.last_epoch,
             'scheduler_state': self.scheduler.state_dict(),
@@ -331,10 +316,29 @@ class DecayingCosineAnnealingWarmRestarts:
         self.eta_min = state_dict['eta_min']
         self.restart_decay = state_dict['restart_decay']
         self.base_lrs = state_dict['base_lrs']
-        self.current_peak_lrs = state_dict['current_peak_lrs']
+
+        # Handle both old and new state dict formats
+        if 'current_multiplier' in state_dict:
+            self.current_multiplier = state_dict['current_multiplier']
+        elif 'current_peak_lrs' in state_dict:
+            # Old format: convert to multiplier
+            self.current_multiplier = state_dict['current_peak_lrs'][0] / self.base_lrs[0] if self.base_lrs[0] > 0 else 1.0
+        else:
+            self.current_multiplier = 1.0
+
         self.restart_count = state_dict['restart_count']
         self.last_epoch = state_dict['last_epoch']
         self.scheduler.load_state_dict(state_dict['scheduler_state'])
+
+        # Update the scheduler's base_lrs to match current decayed values
+        for i in range(len(self.scheduler.base_lrs)):
+            self.scheduler.base_lrs[i] = self.base_lrs[i] * self.current_multiplier
+
+        # Apply the current LR to the optimizer's param_groups
+        # The underlying scheduler has the correct _last_lr after load_state_dict
+        if hasattr(self.scheduler, '_last_lr'):
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                param_group['lr'] = self.scheduler._last_lr[i]
 
     def __repr__(self):
         """String representation of the scheduler."""
