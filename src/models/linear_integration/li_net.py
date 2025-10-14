@@ -314,7 +314,7 @@ class LINet(BaseModel):
         early_stopping: bool = False,
         patience: int = 10,
         min_delta: float = 0.001,
-        monitor: str = 'val_loss',  # 'val_loss' or 'val_accuracy'
+        monitor: str = 'val_loss',  # 'val_loss' or 'val_accuracy' (for both main and stream early stopping)
         restore_best_weights: bool = True,
         gradient_accumulation_steps: int = 1,  # Gradient accumulation for larger effective batch size
         grad_clip_norm: Optional[float] = None,  # Gradient clipping max norm (None = disabled)
@@ -339,7 +339,8 @@ class LINet(BaseModel):
             early_stopping: Whether to enable early stopping
             patience: Number of epochs to wait for improvement before stopping
             min_delta: Minimum change to qualify as an improvement
-            monitor: Metric to monitor ('val_loss' or 'val_accuracy')
+            monitor: Metric to monitor for both main and stream early stopping ('val_loss' or 'val_accuracy').
+                   Applied globally to main model early stopping and stream-specific early stopping.
             restore_best_weights: Whether to restore best weights when early stopping
             gradient_accumulation_steps: Number of steps to accumulate gradients before updating.
                                        Useful for simulating larger batch sizes (e.g., 4 steps = 4x effective batch size)
@@ -352,7 +353,8 @@ class LINet(BaseModel):
             stream_early_stopping: Enable stream-specific early stopping. When a stream plateaus, its
                                  parameters (.stream1_weight/.stream2_weight) are frozen while integration
                                  weights remain trainable, allowing the model to continue learning from the
-                                 other stream. Training stops when both streams are frozen.
+                                 other stream. Training stops when both streams are frozen. Uses same monitor
+                                 metric as main early stopping.
             stream1_patience: Number of epochs to wait before freezing Stream1 (RGB) if no improvement
             stream2_patience: Number of epochs to wait before freezing Stream2 (Depth) if no improvement
             stream_min_delta: Minimum improvement for stream metrics to count as progress
@@ -377,9 +379,9 @@ class LINet(BaseModel):
         # Early stopping setup
         early_stopping_state = setup_early_stopping(early_stopping, val_loader, monitor, patience, min_delta, verbose)
 
-        # Stream-specific early stopping setup
+        # Stream-specific early stopping setup (uses same monitor as main early stopping)
         stream_early_stopping_state = setup_stream_early_stopping(
-            stream_early_stopping, stream1_patience, stream2_patience, stream_min_delta, verbose
+            stream_early_stopping, monitor, stream1_patience, stream2_patience, stream_min_delta, verbose
         )
 
         # Warn if stream_early_stopping enabled without stream_monitoring
@@ -494,9 +496,11 @@ class LINet(BaseModel):
             val_acc = 0.0
             stream1_val_acc = 0.0
             stream2_val_acc = 0.0
+            stream1_val_loss = 0.0
+            stream2_val_loss = 0.0
 
             if val_loader:
-                val_loss, val_acc, stream1_val_acc, stream2_val_acc = self._validate(
+                val_loss, val_acc, stream1_val_acc, stream2_val_acc, stream1_val_loss, stream2_val_loss = self._validate(
                     val_loader, pbar=pbar, stream_monitoring=stream_monitoring
                 )
                 
@@ -600,7 +604,9 @@ class LINet(BaseModel):
                         stream1_train_acc=stream1_train_acc,
                         stream1_val_acc=stream1_val_acc,
                         stream2_train_acc=stream2_train_acc,
-                        stream2_val_acc=stream2_val_acc
+                        stream2_val_acc=stream2_val_acc,
+                        stream1_val_loss=stream1_val_loss,
+                        stream2_val_loss=stream2_val_loss
                     )
                     # Save learning rates (only available with stream-specific param groups)
                     if stream_stats:
@@ -614,8 +620,10 @@ class LINet(BaseModel):
                     stream_stats = {
                         'stream1_train_acc': stream1_train_acc,
                         'stream1_val_acc': stream1_val_acc,
+                        'stream1_val_loss': stream1_val_loss,
                         'stream2_train_acc': stream2_train_acc,
-                        'stream2_val_acc': stream2_val_acc
+                        'stream2_val_acc': stream2_val_acc,
+                        'stream2_val_loss': stream2_val_loss
                     }
 
             # Stream-specific early stopping (freeze streams when they plateau)
@@ -630,8 +638,10 @@ class LINet(BaseModel):
                     stream_stats=stream_stats,
                     model=self,
                     epoch=epoch,
+                    monitor=monitor,
                     verbose=verbose,
-                    val_acc=val_acc  # Pass full model validation accuracy
+                    val_acc=val_acc,  # Pass full model validation accuracy
+                    val_loss=val_loss  # Pass full model validation loss
                 )
 
                 # Record freezing events in history
@@ -672,29 +682,32 @@ class LINet(BaseModel):
 
         # Stream early stopping summary
         if stream_early_stopping_state['enabled']:
+            stream_monitor = stream_early_stopping_state['monitor']
             history['stream_early_stopping'] = {
+                'monitor': stream_monitor,
                 'stream1_frozen': stream_early_stopping_state['stream1']['frozen'],
                 'stream1_frozen_epoch': history['stream1_frozen_epoch'],
-                'stream1_best_acc': stream_early_stopping_state['stream1']['best_acc'],
+                'stream1_best_metric': stream_early_stopping_state['stream1']['best_metric'],
                 'stream2_frozen': stream_early_stopping_state['stream2']['frozen'],
                 'stream2_frozen_epoch': history['stream2_frozen_epoch'],
-                'stream2_best_acc': stream_early_stopping_state['stream2']['best_acc'],
+                'stream2_best_metric': stream_early_stopping_state['stream2']['best_metric'],
                 'all_frozen': stream_early_stopping_state['all_frozen']
             }
 
             if verbose:
                 print("\n❄️  Stream Early Stopping Summary:")
+                print(f"   Monitor: {stream_monitor}")
                 if stream_early_stopping_state['stream1']['frozen']:
                     print(f"   Stream1: Frozen at epoch {history['stream1_frozen_epoch']} "
-                          f"(best val_acc: {stream_early_stopping_state['stream1']['best_acc']:.4f})")
+                          f"(best {stream_monitor}: {stream_early_stopping_state['stream1']['best_metric']:.4f})")
                 else:
-                    print(f"   Stream1: Not frozen (final val_acc: {stream_early_stopping_state['stream1']['best_acc']:.4f})")
+                    print(f"   Stream1: Not frozen (final {stream_monitor}: {stream_early_stopping_state['stream1']['best_metric']:.4f})")
 
                 if stream_early_stopping_state['stream2']['frozen']:
                     print(f"   Stream2: Frozen at epoch {history['stream2_frozen_epoch']} "
-                          f"(best val_acc: {stream_early_stopping_state['stream2']['best_acc']:.4f})")
+                          f"(best {stream_monitor}: {stream_early_stopping_state['stream2']['best_metric']:.4f})")
                 else:
-                    print(f"   Stream2: Not frozen (final val_acc: {stream_early_stopping_state['stream2']['best_acc']:.4f})")
+                    print(f"   Stream2: Not frozen (final {stream_monitor}: {stream_early_stopping_state['stream2']['best_metric']:.4f})")
 
         return history
 
@@ -1011,8 +1024,8 @@ class LINet(BaseModel):
             stream_monitoring: Whether to track stream-specific metrics during validation
 
         Returns:
-            Tuple of (loss, accuracy, stream1_val_acc, stream2_val_acc)
-            If stream_monitoring=False, stream accuracies will be 0.0
+            Tuple of (loss, accuracy, stream1_val_acc, stream2_val_acc, stream1_val_loss, stream2_val_loss)
+            If stream_monitoring=False, stream accuracies and losses will be 0.0
         """
 
         self.eval()
@@ -1023,6 +1036,8 @@ class LINet(BaseModel):
         # Stream-specific tracking (if monitoring enabled)
         stream1_val_correct = 0
         stream2_val_correct = 0
+        stream1_val_loss = 0.0
+        stream2_val_loss = 0.0
         stream_val_total = 0
         
         # OPTIMIZATION 1: Progress bar update frequency for validation - major performance improvement
@@ -1059,6 +1074,12 @@ class LINet(BaseModel):
                     # Classify with auxiliary classifiers
                     stream1_outputs = self.fc_stream1(stream1_features)
                     stream2_outputs = self.fc_stream2(stream2_features)
+
+                    # Calculate stream losses
+                    stream1_loss = self.criterion(stream1_outputs, targets)
+                    stream2_loss = self.criterion(stream2_outputs, targets)
+                    stream1_val_loss += stream1_loss.item() * targets.size(0)
+                    stream2_val_loss += stream2_loss.item() * targets.size(0)
 
                     stream1_pred = stream1_outputs.argmax(1)
                     stream2_pred = stream2_outputs.argmax(1)
@@ -1100,14 +1121,17 @@ class LINet(BaseModel):
         avg_loss = total_loss / len(data_loader)
         accuracy = correct / total
 
-        # Calculate stream-specific accuracies
+        # Calculate stream-specific accuracies and losses
         stream1_val_acc = stream1_val_correct / max(stream_val_total, 1) if stream_monitoring else 0.0
         stream2_val_acc = stream2_val_correct / max(stream_val_total, 1) if stream_monitoring else 0.0
+        avg_stream1_val_loss = stream1_val_loss / max(stream_val_total, 1) if stream_monitoring else 0.0
+        avg_stream2_val_loss = stream2_val_loss / max(stream_val_total, 1) if stream_monitoring else 0.0
 
-        return avg_loss, accuracy, stream1_val_acc, stream2_val_acc
+        return avg_loss, accuracy, stream1_val_acc, stream2_val_acc, avg_stream1_val_loss, avg_stream2_val_loss
 
     def _print_stream_monitoring(self, stream1_train_acc: float, stream1_val_acc: float,
-                                 stream2_train_acc: float, stream2_val_acc: float) -> dict:
+                                 stream2_train_acc: float, stream2_val_acc: float,
+                                 stream1_val_loss: float = 0.0, stream2_val_loss: float = 0.0) -> dict:
         """
         Print stream-specific monitoring metrics (computed during main training loop).
 
@@ -1116,6 +1140,8 @@ class LINet(BaseModel):
             stream1_val_acc: Stream1 validation accuracy (from full epoch)
             stream2_train_acc: Stream2 training accuracy (from full epoch)
             stream2_val_acc: Stream2 validation accuracy (from full epoch)
+            stream1_val_loss: Stream1 validation loss (from full epoch)
+            stream2_val_loss: Stream2 validation loss (from full epoch)
 
         Returns:
             Dictionary containing stream-specific metrics for history tracking
@@ -1141,8 +1167,10 @@ class LINet(BaseModel):
             return {
                 'stream1_train_acc': stream1_train_acc,
                 'stream1_val_acc': stream1_val_acc,
+                'stream1_val_loss': stream1_val_loss,
                 'stream2_train_acc': stream2_train_acc,
                 'stream2_val_acc': stream2_val_acc,
+                'stream2_val_loss': stream2_val_loss,
                 'stream1_lr': stream1_lr,
                 'stream1_wd': stream1_wd,
                 'stream2_lr': stream2_lr,

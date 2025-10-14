@@ -119,14 +119,15 @@ def test_stream_weights_restored_before_freezing(model_and_data, capsys):
     stream2_frozen = history['stream_early_stopping']['stream2_frozen']
     all_frozen = history['stream_early_stopping']['all_frozen']
 
-    # If a stream was frozen, we should see restoration message in output
+    # If a stream was frozen, we should see freeze message in output
+    # (Weights are restored silently before freezing)
     if stream1_frozen:
-        assert "Restored Stream1 best weights" in captured.out or "🔄 Restored Stream1" in captured.out
-        print(f"\n✓ Stream1 was frozen and weights were restored from epoch {history['stream1_frozen_epoch']}")
+        assert "Stream1 frozen" in captured.out or "❄️  Stream1" in captured.out
+        print(f"\n✓ Stream1 was frozen (weights restored before freezing) at epoch {history['stream1_frozen_epoch']}")
 
     if stream2_frozen:
-        assert "Restored Stream2 best weights" in captured.out or "🔄 Restored Stream2" in captured.out
-        print(f"\n✓ Stream2 was frozen and weights were restored from epoch {history['stream2_frozen_epoch']}")
+        assert "Stream2 frozen" in captured.out or "❄️  Stream2" in captured.out
+        print(f"\n✓ Stream2 was frozen (weights restored before freezing) at epoch {history['stream2_frozen_epoch']}")
 
     # If all streams frozen, we should see full model restoration message
     if all_frozen:
@@ -136,9 +137,9 @@ def test_stream_weights_restored_before_freezing(model_and_data, capsys):
     # At least one stream should have been frozen with this patience setting
     assert stream1_frozen or stream2_frozen, "Expected at least one stream to freeze with patience=2"
 
-    print(f"\nFinal stream accuracies:")
-    print(f"  Stream1: {history['stream_early_stopping']['stream1_best_acc']:.4f}")
-    print(f"  Stream2: {history['stream_early_stopping']['stream2_best_acc']:.4f}")
+    print(f"\nFinal stream metrics:")
+    print(f"  Stream1: {history['stream_early_stopping']['stream1_best_metric']:.4f}")
+    print(f"  Stream2: {history['stream_early_stopping']['stream2_best_metric']:.4f}")
 
 
 def test_correct_stream_weights_are_saved():

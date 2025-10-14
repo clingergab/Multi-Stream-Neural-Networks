@@ -423,7 +423,7 @@ class MCResNet(BaseModel):
 
         # Stream-specific early stopping setup
         stream_early_stopping_state = setup_stream_early_stopping(
-            stream_early_stopping, stream1_patience, stream2_patience, stream_min_delta, verbose
+            stream_early_stopping, monitor, stream1_patience, stream2_patience, stream_min_delta, verbose
         )
 
         # Warn if stream_early_stopping enabled without stream_monitoring
@@ -480,7 +480,7 @@ class MCResNet(BaseModel):
             stream2_val_acc = 0.0
 
             if val_loader:
-                val_loss, val_acc, stream1_val_acc, stream2_val_acc = self._validate(
+                val_loss, val_acc, stream1_val_acc, stream2_val_acc, stream1_val_loss, stream2_val_loss = self._validate(
                     val_loader, pbar=pbar, stream_monitoring=stream_monitoring
                 )
                 
@@ -576,7 +576,9 @@ class MCResNet(BaseModel):
                     stream1_train_acc=stream1_train_acc,
                     stream1_val_acc=stream1_val_acc,
                     stream2_train_acc=stream2_train_acc,
-                    stream2_val_acc=stream2_val_acc
+                    stream2_val_acc=stream2_val_acc,
+                    stream1_val_loss=stream1_val_loss,
+                    stream2_val_loss=stream2_val_loss
                 )
                 # Save stream-specific metrics to history
                 if stream_stats:
@@ -599,8 +601,10 @@ class MCResNet(BaseModel):
                     stream_stats=stream_stats,
                     model=self,
                     epoch=epoch,
+                    monitor=monitor,
                     verbose=verbose,
-                    val_acc=val_acc  # Pass full model validation accuracy
+                    val_acc=val_acc,  # Pass full model validation accuracy
+                    val_loss=val_loss  # Pass full model validation loss
                 )
 
                 # Record freezing events in history
@@ -644,10 +648,10 @@ class MCResNet(BaseModel):
             history['stream_early_stopping'] = {
                 'stream1_frozen': stream_early_stopping_state['stream1']['frozen'],
                 'stream1_frozen_epoch': history['stream1_frozen_epoch'],
-                'stream1_best_acc': stream_early_stopping_state['stream1']['best_acc'],
+                'stream1_best_metric': stream_early_stopping_state['stream1']['best_metric'],
                 'stream2_frozen': stream_early_stopping_state['stream2']['frozen'],
                 'stream2_frozen_epoch': history['stream2_frozen_epoch'],
-                'stream2_best_acc': stream_early_stopping_state['stream2']['best_acc'],
+                'stream2_best_metric': stream_early_stopping_state['stream2']['best_metric'],
                 'all_frozen': stream_early_stopping_state['all_frozen']
             }
 
@@ -655,15 +659,15 @@ class MCResNet(BaseModel):
                 print("\n❄️  Stream Early Stopping Summary:")
                 if stream_early_stopping_state['stream1']['frozen']:
                     print(f"   Stream1: Frozen at epoch {history['stream1_frozen_epoch']} "
-                          f"(best val_acc: {stream_early_stopping_state['stream1']['best_acc']:.4f})")
+                          f"(best {monitor}: {stream_early_stopping_state['stream1']['best_metric']:.4f})")
                 else:
-                    print(f"   Stream1: Not frozen (final val_acc: {stream_early_stopping_state['stream1']['best_acc']:.4f})")
+                    print(f"   Stream1: Not frozen (final {monitor}: {stream_early_stopping_state['stream1']['best_metric']:.4f})")
 
                 if stream_early_stopping_state['stream2']['frozen']:
                     print(f"   Stream2: Frozen at epoch {history['stream2_frozen_epoch']} "
-                          f"(best val_acc: {stream_early_stopping_state['stream2']['best_acc']:.4f})")
+                          f"(best {monitor}: {stream_early_stopping_state['stream2']['best_metric']:.4f})")
                 else:
-                    print(f"   Stream2: Not frozen (final val_acc: {stream_early_stopping_state['stream2']['best_acc']:.4f})")
+                    print(f"   Stream2: Not frozen (final {monitor}: {stream_early_stopping_state['stream2']['best_metric']:.4f})")
 
         return history
 
@@ -700,7 +704,7 @@ class MCResNet(BaseModel):
                 batch_size=batch_size, num_workers=0
             )
         
-        loss, accuracy = self._validate(data_loader)
+        loss, accuracy, _, _, _, _ = self._validate(data_loader)
         
         return {
             'loss': loss,
@@ -1003,8 +1007,8 @@ class MCResNet(BaseModel):
             stream_monitoring: Whether to track stream-specific metrics during validation
 
         Returns:
-            Tuple of (loss, accuracy, stream1_val_acc, stream2_val_acc)
-            If stream_monitoring=False, stream accuracies will be 0.0
+            Tuple of (loss, accuracy, stream1_val_acc, stream2_val_acc, stream1_val_loss, stream2_val_loss)
+            If stream_monitoring=False, stream accuracies and losses will be 0.0
         """
 
         self.eval()
@@ -1015,6 +1019,8 @@ class MCResNet(BaseModel):
         # Stream-specific tracking (if monitoring enabled)
         stream1_val_correct = 0
         stream2_val_correct = 0
+        stream1_val_loss = 0.0
+        stream2_val_loss = 0.0
         stream_val_total = 0
 
         # OPTIMIZATION 1: Progress bar update frequency for validation - major performance improvement
@@ -1041,7 +1047,7 @@ class MCResNet(BaseModel):
                 total += targets.size(0)
                 correct += (predicted == targets).sum().item()
 
-                # Stream-specific monitoring (track individual stream accuracies)
+                # Stream-specific monitoring (track individual stream accuracies and losses)
                 # Model is already in eval() mode (line 924), so dropout is disabled
                 if stream_monitoring:
                     # Ablation study: Measure each stream's contribution
@@ -1054,10 +1060,18 @@ class MCResNet(BaseModel):
                     stream1_pred = stream1_out.argmax(1)
                     stream1_val_correct += (stream1_pred == targets).sum().item()
 
+                    # Calculate stream1 loss
+                    stream1_loss = self.criterion(stream1_out, targets)
+                    stream1_val_loss += stream1_loss.item() * targets.size(0)
+
                     # Evaluate stream2 by zeroing stream1 (measure stream2's contribution)
                     stream2_out = self._forward_ablation(rgb_batch, brightness_batch, zero_stream1=True)
                     stream2_pred = stream2_out.argmax(1)
                     stream2_val_correct += (stream2_pred == targets).sum().item()
+
+                    # Calculate stream2 loss
+                    stream2_loss = self.criterion(stream2_out, targets)
+                    stream2_val_loss += stream2_loss.item() * targets.size(0)
 
                     stream_val_total += targets.size(0)
 
@@ -1094,14 +1108,17 @@ class MCResNet(BaseModel):
         avg_loss = total_loss / len(data_loader)
         accuracy = correct / total
 
-        # Calculate stream accuracies
+        # Calculate stream accuracies and average losses
         stream1_val_acc = stream1_val_correct / stream_val_total if stream_val_total > 0 else 0.0
         stream2_val_acc = stream2_val_correct / stream_val_total if stream_val_total > 0 else 0.0
+        avg_stream1_val_loss = stream1_val_loss / stream_val_total if stream_val_total > 0 else 0.0
+        avg_stream2_val_loss = stream2_val_loss / stream_val_total if stream_val_total > 0 else 0.0
 
-        return avg_loss, accuracy, stream1_val_acc, stream2_val_acc
+        return avg_loss, accuracy, stream1_val_acc, stream2_val_acc, avg_stream1_val_loss, avg_stream2_val_loss
 
     def _print_stream_monitoring(self, stream1_train_acc: float, stream1_val_acc: float,
-                                 stream2_train_acc: float, stream2_val_acc: float) -> dict:
+                                 stream2_train_acc: float, stream2_val_acc: float,
+                                 stream1_val_loss: float = 0.0, stream2_val_loss: float = 0.0) -> dict:
         """
         Print stream-specific monitoring metrics (computed during main training loop).
         Args:
@@ -1109,6 +1126,8 @@ class MCResNet(BaseModel):
             stream1_val_acc: Stream1 validation accuracy (from full epoch)
             stream2_train_acc: Stream2 training accuracy (from full epoch)
             stream2_val_acc: Stream2 validation accuracy (from full epoch)
+            stream1_val_loss: Stream1 validation loss (from full epoch)
+            stream2_val_loss: Stream2 validation loss (from full epoch)
         Returns:
             Dictionary containing stream-specific metrics for history tracking
         """
@@ -1129,8 +1148,10 @@ class MCResNet(BaseModel):
             return {
                 'stream1_train_acc': stream1_train_acc,
                 'stream1_val_acc': stream1_val_acc,
+                'stream1_val_loss': stream1_val_loss,
                 'stream2_train_acc': stream2_train_acc,
                 'stream2_val_acc': stream2_val_acc,
+                'stream2_val_loss': stream2_val_loss,
                 'stream1_lr': stream1_lr,
                 'stream1_wd': stream1_wd,
                 'stream2_lr': stream2_lr,
