@@ -448,11 +448,44 @@ class LINet(BaseModel):
                 ):
                     # Restore best weights if requested
                     if restore_best_weights and early_stopping_state['best_weights'] is not None:
+                        # Check if stream early stopping is enabled and which streams are frozen
+                        stream_es_enabled = stream_early_stopping_state['enabled']
+                        stream1_frozen = stream_es_enabled and stream_early_stopping_state.get('stream1', {}).get('frozen', False)
+                        stream2_frozen = stream_es_enabled and stream_early_stopping_state.get('stream2', {}).get('frozen', False)
+
+                        # Save frozen stream weights before restoring (to preserve them)
+                        frozen_stream_weights = {}
+                        if stream1_frozen and stream_early_stopping_state['stream1']['best_weights'] is not None:
+                            frozen_stream_weights.update({
+                                k: v.clone() for k, v in stream_early_stopping_state['stream1']['best_weights'].items()
+                            })
+                        if stream2_frozen and stream_early_stopping_state['stream2']['best_weights'] is not None:
+                            frozen_stream_weights.update({
+                                k: v.clone() for k, v in stream_early_stopping_state['stream2']['best_weights'].items()
+                            })
+
+                        # Restore best weights from main early stopping (includes all unfrozen streams)
                         self.load_state_dict({
                             k: v.to(self.device) for k, v in early_stopping_state['best_weights'].items()
                         })
+
+                        # Restore frozen stream weights back (they keep their best weights, not main epoch weights)
+                        if frozen_stream_weights:
+                            for name, param in self.named_parameters():
+                                if name in frozen_stream_weights:
+                                    param.data.copy_(frozen_stream_weights[name].to(self.device))
+
+                        # Print appropriate message
                         if verbose:
-                            print("🔄 Restored best model weights")
+                            if stream1_frozen or stream2_frozen:
+                                preserved_streams = []
+                                if stream1_frozen:
+                                    preserved_streams.append("Stream1")
+                                if stream2_frozen:
+                                    preserved_streams.append("Stream2")
+                                print(f"🔄 Restored best model weights (preserved frozen {', '.join(preserved_streams)})")
+                            else:
+                                print("🔄 Restored best model weights")
                     break
             
             # Step epoch-based schedulers at epoch end
@@ -528,7 +561,8 @@ class LINet(BaseModel):
                     stream_stats=stream_stats,
                     model=self,
                     epoch=epoch,
-                    verbose=verbose
+                    verbose=verbose,
+                    val_acc=val_acc  # Pass full model validation accuracy
                 )
 
                 # Record freezing events in history
