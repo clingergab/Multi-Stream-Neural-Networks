@@ -152,6 +152,12 @@ class LINet(BaseModel):
         # No fusion needed - integrated stream is the final representation!
         feature_dim = 512 * block.expansion
         self.fc = nn.Linear(feature_dim, self.num_classes)
+
+        # Auxiliary classifiers for stream monitoring (gradient-isolated)
+        # These learn to classify from stream features but DON'T affect stream training via .detach()
+        # Only used when stream_monitoring=True
+        self.fc_stream1 = nn.Linear(feature_dim, self.num_classes)
+        self.fc_stream2 = nn.Linear(feature_dim, self.num_classes)
     
     def _initialize_weights(self, zero_init_residual: bool):
         """Initialize network weights for 3-stream architecture."""
@@ -339,7 +345,10 @@ class LINet(BaseModel):
                                        Useful for simulating larger batch sizes (e.g., 4 steps = 4x effective batch size)
             grad_clip_norm: Maximum gradient norm for clipping (None to disable). Standard values: 1.0 or 5.0
             clear_cache_per_epoch: Whether to clear CUDA cache after each epoch (only enable if OOM issues)
-            stream_monitoring: Enable stream-specific monitoring. Shows per-stream LR, WD, train/val acc
+            stream_monitoring: Enable stream-specific monitoring. Shows per-stream LR, WD, train/val acc.
+                            Auxiliary classifiers (fc_stream1, fc_stream2) learn to classify stream features
+                            but are gradient-isolated (use .detach()) so they DON'T affect stream weight training.
+                            This provides accurate stream accuracy metrics without changing main training dynamics.
             stream_early_stopping: Enable stream-specific early stopping. When a stream plateaus, its
                                  parameters (.stream1_weight/.stream2_weight) are frozen while integration
                                  weights remain trainable, allowing the model to continue learning from the
@@ -377,6 +386,66 @@ class LINet(BaseModel):
         if stream_early_stopping and not stream_monitoring and verbose:
             print("⚠️  Warning: stream_early_stopping=True requires stream_monitoring=True to work")
             print("   Stream early stopping will be disabled until stream_monitoring is enabled")
+
+        # Create separate optimizer for auxiliary classifiers (if stream monitoring enabled)
+        # This ensures auxiliary training doesn't affect main model's optimizer state
+        aux_optimizer = None
+        if stream_monitoring:
+            aux_params = [
+                self.fc_stream1.weight, self.fc_stream1.bias,
+                self.fc_stream2.weight, self.fc_stream2.bias
+            ]
+            # Use same optimizer type and ALL hyperparameters as main optimizer
+            # This ensures auxiliary classifiers train identically to main model
+            main_group = self.optimizer.param_groups[0]
+
+            if isinstance(self.optimizer, torch.optim.Adam):
+                # Copy all Adam hyperparameters from main optimizer
+                aux_optimizer = torch.optim.Adam(
+                    aux_params,
+                    lr=main_group['lr'],
+                    betas=main_group.get('betas', (0.9, 0.999)),
+                    eps=main_group.get('eps', 1e-8),
+                    weight_decay=main_group.get('weight_decay', 0),
+                    amsgrad=main_group.get('amsgrad', False)
+                )
+            elif isinstance(self.optimizer, torch.optim.AdamW):
+                # Copy all AdamW hyperparameters from main optimizer
+                aux_optimizer = torch.optim.AdamW(
+                    aux_params,
+                    lr=main_group['lr'],
+                    betas=main_group.get('betas', (0.9, 0.999)),
+                    eps=main_group.get('eps', 1e-8),
+                    weight_decay=main_group.get('weight_decay', 0),
+                    amsgrad=main_group.get('amsgrad', False)
+                )
+            elif isinstance(self.optimizer, torch.optim.SGD):
+                # Copy all SGD hyperparameters from main optimizer
+                aux_optimizer = torch.optim.SGD(
+                    aux_params,
+                    lr=main_group['lr'],
+                    momentum=main_group.get('momentum', 0),
+                    dampening=main_group.get('dampening', 0),
+                    weight_decay=main_group.get('weight_decay', 0),
+                    nesterov=main_group.get('nesterov', False)
+                )
+            elif isinstance(self.optimizer, torch.optim.RMSprop):
+                # Copy all RMSprop hyperparameters from main optimizer
+                aux_optimizer = torch.optim.RMSprop(
+                    aux_params,
+                    lr=main_group['lr'],
+                    alpha=main_group.get('alpha', 0.99),
+                    eps=main_group.get('eps', 1e-8),
+                    weight_decay=main_group.get('weight_decay', 0),
+                    momentum=main_group.get('momentum', 0)
+                )
+            else:
+                # Fallback: use Adam with main optimizer's learning rate and weight_decay
+                aux_optimizer = torch.optim.Adam(
+                    aux_params,
+                    lr=main_group['lr'],
+                    weight_decay=main_group.get('weight_decay', 0)
+                )
 
         # Legacy best model saving (preserve existing functionality)
         best_val_acc = 0.0
@@ -417,7 +486,7 @@ class LINet(BaseModel):
             # Training phase - use helper method
             avg_train_loss, train_accuracy, stream1_train_acc, stream2_train_acc = self._train_epoch(
                 train_loader, history, pbar, gradient_accumulation_steps, grad_clip_norm, clear_cache_per_epoch,
-                stream_monitoring=stream_monitoring
+                stream_monitoring=stream_monitoring, aux_optimizer=aux_optimizer
             )
 
             # Validation phase
@@ -712,7 +781,8 @@ class LINet(BaseModel):
     
     def _train_epoch(self, train_loader: DataLoader, history: dict, pbar: Optional['TqdmType'] = None,
                      gradient_accumulation_steps: int = 1, grad_clip_norm: Optional[float] = None,
-                     clear_cache_per_epoch: bool = False, stream_monitoring: bool = False) -> tuple:
+                     clear_cache_per_epoch: bool = False, stream_monitoring: bool = False,
+                     aux_optimizer: Optional[torch.optim.Optimizer] = None) -> tuple:
         """
         Train the model for one epoch with GPU optimizations and gradient accumulation.
 
@@ -723,7 +793,9 @@ class LINet(BaseModel):
             gradient_accumulation_steps: Number of steps to accumulate gradients before updating
             grad_clip_norm: Maximum gradient norm for clipping (None to disable)
             clear_cache_per_epoch: Whether to clear CUDA cache after epoch
-            stream_monitoring: Whether to track stream-specific metrics during training
+            stream_monitoring: Whether to track stream-specific metrics during training.
+                            Auxiliary classifiers are trained with full gradients (gradient-isolated)
+                            to provide accurate monitoring without affecting main model.
 
         Returns:
             Tuple of (average_train_loss, train_accuracy, stream1_train_acc, stream2_train_acc)
@@ -820,35 +892,70 @@ class LINet(BaseModel):
             train_loss += original_loss
             train_batches += 1
 
+            # Stream-specific monitoring with auxiliary classifiers (gradient-isolated)
+            # This happens AFTER main optimizer.step() so auxiliary classifiers can learn independently
+            # Note: Full gradients used (no scaling) for accurate monitoring
+            if stream_monitoring:
+                # === TRAINING PHASE: Train auxiliary classifiers ===
+                # Forward through stream pathways
+                stream1_features = self._forward_stream1_pathway(stream1_batch)
+                stream2_features = self._forward_stream2_pathway(stream2_batch)
+
+                # DETACH features - stops gradient flow to stream weights!
+                stream1_features_detached = stream1_features.detach()
+                stream2_features_detached = stream2_features.detach()
+
+                # Classify with auxiliary classifiers (only they get gradients)
+                stream1_outputs = self.fc_stream1(stream1_features_detached)
+                stream2_outputs = self.fc_stream2(stream2_features_detached)
+
+                # Compute auxiliary losses (full gradient, no scaling)
+                stream1_aux_loss = self.criterion(stream1_outputs, targets)
+                stream2_aux_loss = self.criterion(stream2_outputs, targets)
+
+                # Backward pass for auxiliary classifiers only (detached features ensure no gradient to streams)
+                # Each stream's classifier learns independently with full gradients
+                # CRITICAL: Use separate aux_optimizer to avoid affecting main optimizer's internal state
+                if self.use_amp:
+                    self.scaler.scale(stream1_aux_loss).backward()
+                    self.scaler.scale(stream2_aux_loss).backward()
+                    # Update auxiliary classifiers using separate optimizer
+                    self.scaler.step(aux_optimizer)
+                    self.scaler.update()
+                else:
+                    stream1_aux_loss.backward()
+                    stream2_aux_loss.backward()
+                    # Update auxiliary classifiers using separate optimizer
+                    aux_optimizer.step()
+
+                # Zero gradients for auxiliary optimizer
+                aux_optimizer.zero_grad()
+
+                # === ACCURACY MEASUREMENT PHASE: Calculate stream accuracies ===
+                with torch.no_grad():
+                    was_training = self.training
+                    self.eval()  # Disable dropout, use BN running stats
+
+                    stream1_features = self._forward_stream1_pathway(stream1_batch)
+                    stream2_features = self._forward_stream2_pathway(stream2_batch)
+
+                    stream1_outputs = self.fc_stream1(stream1_features)
+                    stream2_outputs = self.fc_stream2(stream2_features)
+
+                    stream1_pred = stream1_outputs.argmax(1)
+                    stream2_pred = stream2_outputs.argmax(1)
+
+                    stream1_train_correct += (stream1_pred == targets).sum().item()
+                    stream2_train_correct += (stream2_pred == targets).sum().item()
+                    stream_train_total += targets.size(0)
+
+                    self.train(was_training)  # Restore training mode
+
             # Calculate training accuracy
             with torch.no_grad():
                 _, predicted = torch.max(outputs, 1)
                 train_total += targets.size(0)
                 train_correct += (predicted == targets).sum().item()
-
-                # Stream-specific monitoring (ablation study via stream zeroing)
-                # IMPORTANT: Use eval() mode to disable dropout for reproducible monitoring
-                if stream_monitoring:
-                    was_training = self.training
-                    self.eval()  # Disable dropout, use BN running stats
-
-                    # Evaluate stream1 contribution by zeroing stream2 (ablation study)
-                    # This measures: "How well does THIS model perform with only stream1 data?"
-                    stream2_zeros = torch.zeros_like(stream2_batch)
-                    stream1_out = self(stream1_batch, stream2_zeros)
-                    stream1_pred = stream1_out.argmax(1)
-                    stream1_train_correct += (stream1_pred == targets).sum().item()
-
-                    # Evaluate stream2 contribution by zeroing stream1 (ablation study)
-                    # This measures: "How well does THIS model perform with only stream2 data?"
-                    stream1_zeros = torch.zeros_like(stream1_batch)
-                    stream2_out = self(stream1_zeros, stream2_batch)
-                    stream2_pred = stream2_out.argmax(1)
-                    stream2_train_correct += (stream2_pred == targets).sum().item()
-
-                    stream_train_total += targets.size(0)
-
-                    self.train(was_training)  # Restore original mode
 
             # OPTIMIZATION 1: Update progress bar much less frequently - MAJOR SPEEDUP
             if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(train_loader) - 1):
@@ -942,23 +1049,22 @@ class LINet(BaseModel):
                 total += targets.size(0)
                 correct += (predicted == targets).sum().item()
 
-                # Stream-specific monitoring (ablation study via stream zeroing)
-                # Model is already in eval() mode (line 864), so dropout is disabled
+                # Stream-specific monitoring with auxiliary classifiers
+                # Model is already in eval() mode, so dropout is disabled
                 if stream_monitoring:
-                    # Evaluate stream1 contribution by zeroing stream2 (ablation study)
-                    # This measures: "How well does THIS model perform with only stream1 data?"
-                    stream2_zeros = torch.zeros_like(stream2_batch)
-                    stream1_out = self(stream1_batch, stream2_zeros)
-                    stream1_pred = stream1_out.argmax(1)
+                    # Forward through stream pathways
+                    stream1_features = self._forward_stream1_pathway(stream1_batch)
+                    stream2_features = self._forward_stream2_pathway(stream2_batch)
+
+                    # Classify with auxiliary classifiers
+                    stream1_outputs = self.fc_stream1(stream1_features)
+                    stream2_outputs = self.fc_stream2(stream2_features)
+
+                    stream1_pred = stream1_outputs.argmax(1)
+                    stream2_pred = stream2_outputs.argmax(1)
+
                     stream1_val_correct += (stream1_pred == targets).sum().item()
-
-                    # Evaluate stream2 contribution by zeroing stream1 (ablation study)
-                    # This measures: "How well does THIS model perform with only stream2 data?"
-                    stream1_zeros = torch.zeros_like(stream1_batch)
-                    stream2_out = self(stream1_zeros, stream2_batch)
-                    stream2_pred = stream2_out.argmax(1)
                     stream2_val_correct += (stream2_pred == targets).sum().item()
-
                     stream_val_total += targets.size(0)
 
                 # OPTIMIZATION 1: Update progress bar much less frequently during validation
@@ -1169,11 +1275,17 @@ class LINet(BaseModel):
         """
         Analyze the contribution and performance of individual pathways.
 
+        Uses auxiliary classifiers (fc_stream1, fc_stream2) for stream1/stream2 accuracy.
+        Uses main classifier (fc) for integrated pathway and full model accuracy.
+
         Args:
             data_loader: DataLoader containing dual-channel input data
 
         Returns:
-            Dictionary containing pathway analysis results for all 3 streams
+            Dictionary containing pathway analysis results for all 3 streams:
+            - accuracy: stream1_only, stream2_only, integrated_only, full_model
+            - loss: for each pathway
+            - feature_norms: mean/std for each pathway's feature activations
         """
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before analyze_pathways().")
@@ -1214,20 +1326,20 @@ class LINet(BaseModel):
                 _, full_predicted = torch.max(full_outputs, 1)
                 full_model_correct += (full_predicted == targets_batch).sum().item()
 
-                # Stream1 pathway only
+                # Stream1 pathway only - USE AUXILIARY CLASSIFIER
                 stream1_features = self._forward_stream1_pathway(stream1_batch)
                 stream1_feature_norms.append(torch.norm(stream1_features, dim=1).cpu())
-                stream1_outputs = self.fc(stream1_features)
+                stream1_outputs = self.fc_stream1(stream1_features)  # Auxiliary classifier!
                 stream1_loss = self.criterion(stream1_outputs, targets_batch)
                 stream1_only_loss += stream1_loss.item() * batch_size_actual
 
                 _, stream1_predicted = torch.max(stream1_outputs, 1)
                 stream1_only_correct += (stream1_predicted == targets_batch).sum().item()
 
-                # Stream2 pathway only
+                # Stream2 pathway only - USE AUXILIARY CLASSIFIER
                 stream2_features = self._forward_stream2_pathway(stream2_batch)
                 stream2_feature_norms.append(torch.norm(stream2_features, dim=1).cpu())
-                stream2_outputs = self.fc(stream2_features)
+                stream2_outputs = self.fc_stream2(stream2_features)  # Auxiliary classifier!
                 stream2_loss = self.criterion(stream2_outputs, targets_batch)
                 stream2_only_loss += stream2_loss.item() * batch_size_actual
 
@@ -1409,7 +1521,7 @@ class LINet(BaseModel):
         elif method == 'ablation':
             return self.calculate_stream_contributions(data_loader)
         elif method == 'feature_norm':
-            return self._calculate_feature_norm_importance(data_loader)
+            return self.calculate_feature_norm_importance(data_loader)
         else:
             raise ValueError(f"Unknown importance method: {method}. Choose from 'gradient', 'ablation', 'feature_norm'")
     
@@ -1477,20 +1589,86 @@ class LINet(BaseModel):
             },
             'note': 'Integrated stream importance is implicit in how gradients flow through integration weights'
         }
-    
+
+    def calculate_stream_contributions_to_integration(self, data_loader: torch.utils.data.DataLoader = None):
+        """
+        Calculate how much each input stream contributes to the integrated stream.
+
+        This method measures architectural contribution by analyzing integration weight magnitudes:
+        ||integration_from_stream1|| vs ||integration_from_stream2||
+
+        This directly answers: "How much does the model architecture favor each stream?"
+
+        Simple, fast, and interpretable:
+        - No data required (analyzes learned weights)
+        - Stable (doesn't vary with data sampling)
+        - Clear meaning: "The model uses X% from stream1, Y% from stream2"
+
+        Args:
+            data_loader: Not used, kept for backward compatibility
+
+        Returns:
+            Dictionary containing:
+            - stream1_contribution: float (0-1) - proportion from stream1 based on integration weights
+            - stream2_contribution: float (0-1) - proportion from stream2 based on integration weights
+            - raw_norms: dict with actual weight norms for each stream
+        """
+        # Analyze integration weight magnitudes across all LIConv2d layers
+        stream1_weight_norm = 0.0
+        stream2_weight_norm = 0.0
+
+        for name, param in self.named_parameters():
+            if 'integration_from_stream1' in name:
+                stream1_weight_norm += torch.norm(param).item()
+            elif 'integration_from_stream2' in name:
+                stream2_weight_norm += torch.norm(param).item()
+
+        total_weight_norm = stream1_weight_norm + stream2_weight_norm
+
+        return {
+            'method': 'integration_weights',
+            'stream1_contribution': stream1_weight_norm / total_weight_norm if total_weight_norm > 0 else 0.5,
+            'stream2_contribution': stream2_weight_norm / total_weight_norm if total_weight_norm > 0 else 0.5,
+            'raw_norms': {
+                'stream1_integration_weights': stream1_weight_norm,
+                'stream2_integration_weights': stream2_weight_norm,
+                'total': total_weight_norm
+            },
+            'interpretation': {
+                'stream1_percentage': f"{100 * stream1_weight_norm / total_weight_norm:.1f}%" if total_weight_norm > 0 else "50.0%",
+                'stream2_percentage': f"{100 * stream2_weight_norm / total_weight_norm:.1f}%" if total_weight_norm > 0 else "50.0%"
+            },
+            'note': 'Measures architectural contribution based on integration weight magnitudes. '
+                   'Reflects how the trained model structurally combines the two input streams.'
+        }
+
     def calculate_stream_contributions(self, data_loader: torch.utils.data.DataLoader):
         """
-        Calculate how much each stream contributes to the final predictions.
+        DEPRECATED: Calculate hypothetical classification ability of each stream.
 
-        Uses ablation analysis: measures performance of each stream individually.
-        For LINet, the integrated stream represents the learned fusion of stream1 and stream2.
+        WARNING: This method is MISLEADING for LINet because stream1/stream2 don't directly classify.
+        They only feed into the integrated stream through integration weights.
+
+        This method measures: "How well could each stream classify IF it had its own classifier?"
+        But in LINet, streams DON'T have classifiers - only the integrated stream does.
+
+        **Use calculate_stream_contributions_to_integration() instead** for meaningful analysis
+        of how much each input stream contributes to the integrated stream's features.
 
         Args:
             data_loader: DataLoader containing dual-channel input data
 
         Returns:
-            Dictionary containing stream contribution analysis for all 3 streams
+            Dictionary containing hypothetical stream classification abilities (misleading for LINet)
         """
+        import warnings
+        warnings.warn(
+            "calculate_stream_contributions() is deprecated and misleading for LINet. "
+            "It measures hypothetical classification ability, but streams don't directly classify. "
+            "Use calculate_stream_contributions_to_integration() instead for meaningful contribution analysis.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         # Use the analyze_pathways method for ablation analysis
         pathway_analysis = self.analyze_pathways(data_loader)
 
@@ -1522,7 +1700,7 @@ class LINet(BaseModel):
             'note': 'Integrated stream should perform best as it combines information from both input streams'
         }
     
-    def _calculate_feature_norm_importance(self, data_loader):
+    def calculate_feature_norm_importance(self, data_loader):
         """Calculate importance based on feature norm magnitudes for all 3 streams."""
         # Use the analyze_pathways method for feature analysis
         pathway_analysis = self.analyze_pathways(data_loader)

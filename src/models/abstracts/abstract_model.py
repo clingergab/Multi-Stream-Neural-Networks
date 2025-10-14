@@ -261,6 +261,10 @@ class BaseModel(nn.Module, ABC):
         # Filter kwargs to only include allowed optimizer parameters
         optimizer_kwargs = {k: v for k, v in kwargs.items() if k in allowed_params}
 
+        # Extract eps from optimizer_kwargs to avoid duplicate keyword argument error
+        # (we set default eps=1e-8 explicitly, but user might pass custom eps)
+        eps = optimizer_kwargs.pop('eps', 1e-8)
+
         # Check if stream-specific optimization is requested
         use_stream_specific = any([stream1_lr is not None, stream2_lr is not None,
                                    stream1_weight_decay is not None, stream2_weight_decay is not None])
@@ -296,9 +300,9 @@ class BaseModel(nn.Module, ABC):
 
             # Configure optimizer with parameter groups
             if optimizer.lower() == 'adam':
-                self.optimizer = torch.optim.Adam(param_groups, eps=1e-8, **optimizer_kwargs)
+                self.optimizer = torch.optim.Adam(param_groups, eps=eps, **optimizer_kwargs)
             elif optimizer.lower() == 'adamw':
-                self.optimizer = torch.optim.AdamW(param_groups, eps=1e-8, **optimizer_kwargs)
+                self.optimizer = torch.optim.AdamW(param_groups, eps=eps, **optimizer_kwargs)
             elif optimizer.lower() == 'sgd':
                 momentum = kwargs.get('momentum', 0.9)
                 nesterov = kwargs.get('nesterov', True)
@@ -319,9 +323,9 @@ class BaseModel(nn.Module, ABC):
         else:
             # Standard single-LR optimization
             if optimizer.lower() == 'adam':
-                self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=1e-8, **optimizer_kwargs)
+                self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=eps, **optimizer_kwargs)
             elif optimizer.lower() == 'adamw':
-                self.optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=1e-8, **optimizer_kwargs)
+                self.optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=eps, **optimizer_kwargs)
             elif optimizer.lower() == 'sgd':
                 # Use SGD with Nesterov momentum (standard practice)
                 # momentum and nesterov are handled explicitly (not in optimizer_kwargs) to provide defaults
