@@ -333,8 +333,6 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
                     for name, param in model.named_parameters():
                         if '.stream1_' in name and name in stream1_state['best_weights']:
                             param.data.copy_(stream1_state['best_weights'][name].to(param.device))
-                    if verbose:
-                        print(f"🔄 Restored Stream1 best weights from epoch {stream1_state['best_epoch'] + 1}")
 
                 # Freeze Stream1
                 stream1_state['frozen'] = True
@@ -376,8 +374,6 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
                     for name, param in model.named_parameters():
                         if '.stream2_' in name and name in stream2_state['best_weights']:
                             param.data.copy_(stream2_state['best_weights'][name].to(param.device))
-                    if verbose:
-                        print(f"🔄 Restored Stream2 best weights from epoch {stream2_state['best_epoch'] + 1}")
 
                 # Freeze Stream2
                 stream2_state['frozen'] = True
