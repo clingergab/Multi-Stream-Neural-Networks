@@ -614,8 +614,8 @@ class LINet(BaseModel):
                         history['stream2_lr'].append(stream_stats['stream2_lr'])
                 else:
                     # Simple print without LR/WD (no stream-specific param groups)
-                    print(f"    Stream1: [T_acc:{stream1_train_acc:.4f}, V_acc:{stream1_val_acc:.4f}] | "
-                          f"Stream2: [T_acc:{stream2_train_acc:.4f}, V_acc:{stream2_val_acc:.4f}]")
+                    print(f"  Stream1: T_acc:{stream1_train_acc:.4f}, V_acc:{stream1_val_acc:.4f}, V_loss:{stream1_val_loss:.4f} | "
+                          f"Stream2: T_acc:{stream2_train_acc:.4f}, V_acc:{stream2_val_acc:.4f}, V_loss:{stream2_val_loss:.4f}")
                     # Create minimal stream_stats for compatibility
                     stream_stats = {
                         'stream1_train_acc': stream1_train_acc,
