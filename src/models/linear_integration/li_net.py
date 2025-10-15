@@ -615,7 +615,7 @@ class LINet(BaseModel):
                 else:
                     # Simple print without LR/WD (no stream-specific param groups)
                     print(f"  Stream1: T_acc:{stream1_train_acc:.4f}, V_acc:{stream1_val_acc:.4f}, V_loss:{stream1_val_loss:.4f} | "
-                          f"Stream2: T_acc:{stream2_train_acc:.4f}, V_acc:{stream2_val_acc:.4f}, V_loss:{stream2_val_loss:.4f}")
+                          f"Stream2: T_acc:{stream2_train_acc:.4f}, V_acc:{stream2_val_acc:.4f}, V_loss:{stream2_val_loss:.4f}]")
                     # Create minimal stream_stats for compatibility
                     stream_stats = {
                         'stream1_train_acc': stream1_train_acc,
@@ -1160,8 +1160,8 @@ class LINet(BaseModel):
             stream2_wd = param_groups[1]['weight_decay']
 
             # Display only stream1 and stream2 (full model metrics shown in progress bar above)
-            print(f"    Stream1: [T_acc:{stream1_train_acc:.4f}, V_acc:{stream1_val_acc:.4f}, LR:{stream1_lr:.2e}] | "
-                  f"Stream2: [T_acc:{stream2_train_acc:.4f}, V_acc:{stream2_val_acc:.4f}, LR:{stream2_lr:.2e}]")
+            print(f"  Stream1: T_acc:{stream1_train_acc:.4f}, V_acc:{stream1_val_acc:.4f}, V_loss:{stream1_val_loss:.4f}, LR:{stream1_lr:.2e} | "
+                  f"Stream2: T_acc:{stream2_train_acc:.4f}, V_acc:{stream2_val_acc:.4f}, V_loss:{stream2_val_loss:.4f}, LR:{stream2_lr:.2e}")
 
             # Return stream stats for history tracking
             return {
