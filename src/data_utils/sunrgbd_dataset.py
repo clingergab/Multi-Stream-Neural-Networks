@@ -147,35 +147,58 @@ class SUNRGBDDataset(Dataset):
                 rgb = rgb.transpose(Image.FLIP_LEFT_RIGHT)
                 depth = depth.transpose(Image.FLIP_LEFT_RIGHT)
 
-            # 2. Synchronized Random Resized Crop (CRITICAL - always apply)
-            # Scale 0.8-1.0 is conservative (not too aggressive)
-            i, j, h, w = transforms.RandomResizedCrop.get_params(
-                rgb, scale=(0.8, 1.0), ratio=(0.95, 1.05)
-            )
-            rgb = transforms.functional.resized_crop(rgb, i, j, h, w, self.target_size)
-            depth = transforms.functional.resized_crop(depth, i, j, h, w, self.target_size)
+            # 2. Synchronized Random Resized Crop (50% probability)
+            # IMPORTANT: Scene classification needs context, so crop is probabilistic
+            # 50% get crop (scale variance), 50% get full scene (context preserved)
+            if np.random.random() < 0.5:
+                i, j, h, w = transforms.RandomResizedCrop.get_params(
+                    rgb, scale=(0.9, 1.0), ratio=(0.95, 1.05)  # Gentle crop 90-100%
+                )
+                rgb = transforms.functional.resized_crop(rgb, i, j, h, w, self.target_size)
+                depth = transforms.functional.resized_crop(depth, i, j, h, w, self.target_size)
+            else:
+                # No crop - preserve full scene context
+                rgb = transforms.functional.resize(rgb, self.target_size)
+                depth = transforms.functional.resize(depth, self.target_size)
 
-            # 3. RGB-Only: Moderate Color Jitter (50% probability)
-            # Conservative values to avoid over-augmentation
+            # 3. RGB-Only: Color Jitter (50% probability)
+            # Applies brightness, contrast, saturation, hue adjustments
             if np.random.random() < 0.5:
                 color_jitter = transforms.ColorJitter(
-                    brightness=0.2,  # ±20% (conservative)
+                    brightness=0.2,  # ±20%
                     contrast=0.2,    # ±20%
                     saturation=0.2,  # ±20%
                     hue=0.05         # ±5% (small hue shift)
                 )
                 rgb = color_jitter(rgb)
 
-            # 4. RGB-Only: Occasional Grayscale (5% - rare, just for robustness)
+            # 4. RGB-Only: Occasional Grayscale (5% - rare, for robustness)
             if np.random.random() < 0.05:
                 rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
-            # 5. Depth-Only: Light Gaussian Noise (20% probability)
-            # Simulates sensor noise without being too aggressive
-            if np.random.random() < 0.2:
+            # 5. Depth-Only: Combined Appearance Augmentation (50% probability)
+            # IMPORTANT: Matches RGB's 50% color jitter - single augmentation block
+            # Applies brightness + contrast + noise together (like RGB does color jitter)
+            if np.random.random() < 0.5:
                 depth_array = np.array(depth, dtype=np.float32)
-                noise = np.random.normal(0, 3, depth_array.shape)  # Std=3 (light noise)
-                depth_array = np.clip(depth_array + noise, 0, 255)
+
+                # Apply brightness and contrast
+                # Slightly higher than RGB (±25% vs ±20%) to compensate for:
+                #   1. Depth having 1 channel vs RGB's 3 channels
+                #   2. Reduced crop probability (50% vs previous 100%)
+                brightness_factor = np.random.uniform(0.75, 1.25)  # ±25%
+                contrast_factor = np.random.uniform(0.75, 1.25)    # ±25%
+
+                # Apply contrast then brightness (same order as ColorJitter)
+                depth_array = (depth_array - 127.5) * contrast_factor + 127.5
+                depth_array = depth_array * brightness_factor
+
+                # Add Gaussian noise (simulates sensor noise)
+                # Moderate std to avoid excessive noise while providing robustness
+                noise = np.random.normal(0, 15, depth_array.shape)
+                depth_array = depth_array + noise
+
+                depth_array = np.clip(depth_array, 0, 255)
                 depth = Image.fromarray(depth_array.astype(np.uint8), mode='L')
 
         else:
@@ -195,17 +218,25 @@ class SUNRGBDDataset(Dataset):
             depth, mean=[0.5027], std=[0.2197]
         )
 
-        # 6. Post-normalization Random Erasing (10% - conservative)
+        # 7. Post-normalization Random Erasing (10% each - balanced)
         # Applied after normalization for both modalities
-        if self.train and np.random.random() < 0.1:
-            erasing = transforms.RandomErasing(
-                p=1.0,
-                scale=(0.02, 0.1),     # Small patches (2-10% of image)
-                ratio=(0.5, 2.0)       # Reasonable aspect ratios
-            )
-            rgb = erasing(rgb)
-            # Depth gets separate random erasing (different patches)
-            if np.random.random() < 0.5:  # Only 5% overall (10% * 50%)
+        if self.train:
+            # RGB random erasing (10%)
+            if np.random.random() < 0.1:
+                erasing = transforms.RandomErasing(
+                    p=1.0,
+                    scale=(0.02, 0.1),     # Small patches (2-10% of image)
+                    ratio=(0.5, 2.0)       # Reasonable aspect ratios
+                )
+                rgb = erasing(rgb)
+
+            # Depth random erasing (10% - separate and equal)
+            if np.random.random() < 0.1:
+                erasing = transforms.RandomErasing(
+                    p=1.0,
+                    scale=(0.02, 0.1),
+                    ratio=(0.5, 2.0)
+                )
                 depth = erasing(depth)
 
         # Get label
