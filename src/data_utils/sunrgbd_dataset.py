@@ -116,7 +116,7 @@ class SUNRGBDDataset(Dataset):
         """
         Returns:
             rgb: RGB image tensor [3, H, W]
-            depth: Depth image tensor [1, H, W] or [3, H, W] if depth is RGB format
+            depth: Depth image tensor [1, H, W]
             label: Class label (0-14)
         """
         # Load RGB image
@@ -128,11 +128,8 @@ class SUNRGBDDataset(Dataset):
         depth = Image.open(depth_path)
 
         # Convert depth to grayscale/float format
-        # Depth images can be in various modes (I, I;16, RGB, L)
         if depth.mode in ('I', 'I;16', 'I;16B'):
-            # 16-bit integer mode - convert to uint8 for PIL compatibility
             depth_array = np.array(depth, dtype=np.float32)
-            # Normalize to 0-255 range
             if depth_array.max() > 0:
                 depth_array = (depth_array / depth_array.max() * 255).astype(np.uint8)
             else:
@@ -143,29 +140,73 @@ class SUNRGBDDataset(Dataset):
         elif depth.mode != 'L':
             depth = depth.convert('L')
 
-        # Apply synchronized horizontal flip (if training)
-        # CRITICAL: RGB and Depth must be flipped together to maintain alignment!
-        if self.train and np.random.random() < 0.5:
-            # Flip both images horizontally
-            rgb = rgb.transpose(Image.FLIP_LEFT_RIGHT)
-            depth = depth.transpose(Image.FLIP_LEFT_RIGHT)
+        # ==================== TRAINING AUGMENTATION ====================
+        if self.train:
+            # 1. Synchronized Random Horizontal Flip (50%)
+            if np.random.random() < 0.5:
+                rgb = rgb.transpose(Image.FLIP_LEFT_RIGHT)
+                depth = depth.transpose(Image.FLIP_LEFT_RIGHT)
 
-        # Apply shared transform (if any)
-        if self.shared_transform is not None:
-            # Need to apply same random transform to both
-            # This requires using torch.random state
-            seed = np.random.randint(2147483647)
-            torch.manual_seed(seed)
-            rgb = self.shared_transform(rgb)
-            torch.manual_seed(seed)
-            depth = self.shared_transform(depth)
+            # 2. Synchronized Random Resized Crop (CRITICAL - always apply)
+            # Scale 0.8-1.0 is conservative (not too aggressive)
+            i, j, h, w = transforms.RandomResizedCrop.get_params(
+                rgb, scale=(0.8, 1.0), ratio=(0.95, 1.05)
+            )
+            rgb = transforms.functional.resized_crop(rgb, i, j, h, w, self.target_size)
+            depth = transforms.functional.resized_crop(depth, i, j, h, w, self.target_size)
 
-        # Apply individual transforms (NO random augmentations here!)
-        if self.rgb_transform is not None:
-            rgb = self.rgb_transform(rgb)
+            # 3. RGB-Only: Moderate Color Jitter (50% probability)
+            # Conservative values to avoid over-augmentation
+            if np.random.random() < 0.5:
+                color_jitter = transforms.ColorJitter(
+                    brightness=0.2,  # ±20% (conservative)
+                    contrast=0.2,    # ±20%
+                    saturation=0.2,  # ±20%
+                    hue=0.05         # ±5% (small hue shift)
+                )
+                rgb = color_jitter(rgb)
 
-        if self.depth_transform is not None:
-            depth = self.depth_transform(depth)
+            # 4. RGB-Only: Occasional Grayscale (5% - rare, just for robustness)
+            if np.random.random() < 0.05:
+                rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
+
+            # 5. Depth-Only: Light Gaussian Noise (20% probability)
+            # Simulates sensor noise without being too aggressive
+            if np.random.random() < 0.2:
+                depth_array = np.array(depth, dtype=np.float32)
+                noise = np.random.normal(0, 3, depth_array.shape)  # Std=3 (light noise)
+                depth_array = np.clip(depth_array + noise, 0, 255)
+                depth = Image.fromarray(depth_array.astype(np.uint8), mode='L')
+
+        else:
+            # Validation: just resize (no augmentation)
+            rgb = transforms.functional.resize(rgb, self.target_size)
+            depth = transforms.functional.resize(depth, self.target_size)
+
+        # ==================== NORMALIZATION ====================
+        # Convert to tensor and normalize
+        rgb = transforms.functional.to_tensor(rgb)
+        rgb = transforms.functional.normalize(
+            rgb, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+        )
+
+        depth = transforms.functional.to_tensor(depth)
+        depth = transforms.functional.normalize(
+            depth, mean=[0.5027], std=[0.2197]
+        )
+
+        # 6. Post-normalization Random Erasing (10% - conservative)
+        # Applied after normalization for both modalities
+        if self.train and np.random.random() < 0.1:
+            erasing = transforms.RandomErasing(
+                p=1.0,
+                scale=(0.02, 0.1),     # Small patches (2-10% of image)
+                ratio=(0.5, 2.0)       # Reasonable aspect ratios
+            )
+            rgb = erasing(rgb)
+            # Depth gets separate random erasing (different patches)
+            if np.random.random() < 0.5:  # Only 5% overall (10% * 50%)
+                depth = erasing(depth)
 
         # Get label
         label = self.labels[idx]
