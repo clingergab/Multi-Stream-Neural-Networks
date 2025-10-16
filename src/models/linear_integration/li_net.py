@@ -19,14 +19,9 @@ from torch.amp import autocast
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts
-from src.data_utils.dual_channel_dataset import DualChannelDataset, create_dual_channel_dataloaders, create_dual_channel_dataloader
-from src.training.schedulers import setup_scheduler, update_scheduler
+from src.training.schedulers import setup_scheduler
 from src.models.common import (
     save_checkpoint,
-    setup_early_stopping,
-    early_stopping_initiated,
-    setup_stream_early_stopping,
-    check_stream_early_stopping,
     create_progress_bar,
     finalize_progress_bar,
     update_history
@@ -303,6 +298,337 @@ class LINet(BaseModel):
         logits = self.fc(integrated_features)
         return logits
 
+    # ==================== Early Stopping Helper Methods ====================
+
+    def _setup_early_stopping(self, enabled: bool, val_loader, monitor: str,
+                             patience: int, min_delta: float, verbose: bool) -> dict:
+        """
+        Initialize early stopping state.
+
+        Returns a dictionary with:
+        - enabled: bool
+        - patience: int
+        - best_metric: float (initialized based on monitor)
+        - patience_counter: int
+        - best_epoch: int
+        - best_weights: dict or None
+        """
+        if enabled and val_loader is None:
+            if verbose:
+                print("⚠️  Early stopping requested but no validation data provided. Disabling.")
+            enabled = False
+
+        if not enabled:
+            return {'enabled': False}
+
+        # Validate monitor
+        if monitor not in ('val_loss', 'val_accuracy'):
+            raise ValueError(f"Invalid monitor: {monitor}. Use 'val_loss' or 'val_accuracy'.")
+
+        # Initialize best metric based on monitor type
+        best_metric = float('inf') if monitor == 'val_loss' else 0.0
+
+        if verbose:
+            print(f"🛑 Early stopping enabled: monitoring {monitor} with patience={patience}, min_delta={min_delta}")
+
+        return {
+            'enabled': True,
+            'patience': patience,
+            'best_metric': best_metric,
+            'patience_counter': 0,
+            'best_epoch': 0,
+            'best_weights': None
+        }
+
+    def _setup_stream_early_stopping(self, enabled: bool, monitor: str,
+                                     stream1_patience: int, stream2_patience: int,
+                                     min_delta: float, verbose: bool) -> dict:
+        """
+        Initialize stream-specific early stopping state.
+
+        Returns a dictionary with per-stream state and a full model checkpoint
+        for when all streams freeze.
+        """
+        if not enabled:
+            return {'enabled': False}
+
+        # Validate monitor
+        if monitor not in ('val_loss', 'val_accuracy'):
+            raise ValueError(f"Invalid monitor: {monitor}. Use 'val_loss' or 'val_accuracy'.")
+
+        # Initialize best metric based on monitor type
+        best_metric = float('inf') if monitor == 'val_loss' else 0.0
+
+        if verbose:
+            print(f"❄️  Stream-specific early stopping enabled:")
+            print(f"   Monitor: {monitor}")
+            print(f"   Stream1 patience: {stream1_patience}, Stream2 patience: {stream2_patience}")
+            print(f"   Min delta: {min_delta}")
+
+        return {
+            'enabled': True,
+            'stream1': {
+                'best_metric': best_metric,
+                'patience': stream1_patience,
+                'patience_counter': 0,
+                'best_epoch': 0,
+                'frozen': False,
+                'best_weights': None
+            },
+            'stream2': {
+                'best_metric': best_metric,
+                'patience': stream2_patience,
+                'patience_counter': 0,
+                'best_epoch': 0,
+                'frozen': False,
+                'best_weights': None
+            },
+            'all_frozen': False,
+            'best_full_model': {
+                'best_metric': best_metric,
+                'epoch': 0,
+                'weights': None
+            }
+        }
+
+    def _should_update_checkpoint(self, current_metric: float, best_metric: float,
+                                   monitor: str, min_delta: float) -> bool:
+        """Check if current metric is better than best metric."""
+        if monitor == 'val_loss':
+            return current_metric < (best_metric - min_delta)
+        else:  # val_accuracy
+            return current_metric > (best_metric + min_delta)
+
+    def _save_checkpoint(self) -> dict:
+        """Save current model state as checkpoint."""
+        return {k: v.cpu().clone() for k, v in self.state_dict().items()}
+
+    def _update_frozen_stream_weights_in_checkpoint(self, checkpoint: dict,
+                                                     stream_early_stopping_state: dict) -> None:
+        """
+        Update checkpoint with frozen stream weights from their best epochs.
+
+        This ensures that frozen streams stay at their best performance while
+        the rest of the model is at the overall best epoch.
+        """
+        if stream_early_stopping_state['stream1']['frozen']:
+            best_weights = stream_early_stopping_state['stream1']['best_weights']
+            if best_weights is not None:
+                for name, weight in best_weights.items():
+                    checkpoint[name] = weight.clone()
+
+        if stream_early_stopping_state['stream2']['frozen']:
+            best_weights = stream_early_stopping_state['stream2']['best_weights']
+            if best_weights is not None:
+                for name, weight in best_weights.items():
+                    checkpoint[name] = weight.clone()
+
+    def _restore_checkpoint(self, checkpoint: dict, verbose: bool = True,
+                           stream_early_stopping_state: Optional[dict] = None) -> None:
+        """Restore model from checkpoint."""
+        self.load_state_dict({k: v.to(self.device) for k, v in checkpoint.items()})
+
+        if verbose:
+            if stream_early_stopping_state and stream_early_stopping_state['enabled']:
+                frozen_streams = []
+                if stream_early_stopping_state['stream1']['frozen']:
+                    frozen_streams.append("Stream1")
+                if stream_early_stopping_state['stream2']['frozen']:
+                    frozen_streams.append("Stream2")
+
+                if frozen_streams:
+                    print(f"🔄 Restored best model weights (preserved frozen {', '.join(frozen_streams)})")
+                else:
+                    print("🔄 Restored best model weights")
+            else:
+                print("🔄 Restored best model weights")
+
+    def _should_stop_early(self, patience_counter: int, patience: int) -> bool:
+        """Check if patience is exhausted."""
+        return patience_counter > patience
+
+    # ==================== Stream Early Stopping Helpers ====================
+
+    def _update_best_full_model(self, stream_early_stopping_state: dict,
+                                val_loss: float, val_acc: float,
+                                monitor: str, min_delta: float, epoch: int) -> None:
+        """
+        Update best full model checkpoint in stream early stopping state.
+
+        This tracks the best overall model performance for restoration when all streams freeze.
+        """
+        best_full = stream_early_stopping_state['best_full_model']
+
+        # Get current metric based on monitor type
+        current_metric = val_loss if monitor == 'val_loss' else val_acc
+
+        # Check if we should update
+        if self._should_update_checkpoint(current_metric, best_full['best_metric'], monitor, min_delta):
+            best_full['best_metric'] = current_metric
+            best_full['epoch'] = epoch
+            # Save full model state (captures current model including any frozen streams)
+            best_full['weights'] = self._save_checkpoint()
+
+    def _check_stream_improvement(self, stream_state: dict, stream_metric: float,
+                                  monitor: str, min_delta: float, epoch: int,
+                                  stream_name: str) -> bool:
+        """
+        Check if a stream has improved and update its state accordingly.
+
+        Returns:
+            True if improvement detected, False otherwise
+        """
+        if self._should_update_checkpoint(stream_metric, stream_state['best_metric'], monitor, min_delta):
+            # Improvement detected
+            stream_state['best_metric'] = stream_metric
+            stream_state['best_epoch'] = epoch
+            stream_state['patience_counter'] = 0
+
+            # Save best stream weights using state_dict
+            model_state = self.state_dict()
+            stream_state['best_weights'] = {
+                name: weight.cpu().clone()
+                for name, weight in model_state.items()
+                if f'.{stream_name}_' in name
+            }
+            return True
+        else:
+            # No improvement
+            stream_state['patience_counter'] += 1
+            return False
+
+    def _freeze_stream(self, stream_state: dict, stream_name: str,
+                      epoch: int, monitor: str, verbose: bool) -> None:
+        """
+        Freeze a stream by restoring its best weights and setting requires_grad=False.
+        """
+        # Restore best weights before freezing
+        if stream_state['best_weights'] is not None:
+            for name, param in self.named_parameters():
+                if f'.{stream_name}_' in name and name in stream_state['best_weights']:
+                    param.data.copy_(stream_state['best_weights'][name].to(param.device))
+
+        # Freeze stream
+        stream_state['frozen'] = True
+        stream_state['freeze_epoch'] = epoch
+
+        # Set requires_grad = False for stream parameters
+        # Integration weights remain trainable to allow rebalancing
+        for name, param in self.named_parameters():
+            if f'.{stream_name}_' in name:
+                param.requires_grad = False
+
+        if verbose:
+            metric_str = f"{monitor}: {stream_state['best_metric']:.4f}"
+            stream_label = "Stream1 (RGB)" if stream_name == "stream1" else "Stream2 (Depth)"
+            print(f"❄️  {stream_label} frozen (no improvement for {stream_state['patience']} epochs, "
+                  f"best {metric_str} at epoch {stream_state['best_epoch'] + 1})")
+
+    def _restore_best_full_model(self, stream_early_stopping_state: dict,
+                                 monitor: str, verbose: bool) -> None:
+        """
+        Restore best full model when all streams are frozen.
+
+        Since we update best_full_model['weights'] whenever streams freeze (in li_net.py),
+        this checkpoint already has the correct hybrid state with frozen streams at their
+        best epochs. We just restore it directly without any additional preservation logic.
+        """
+        best_full = stream_early_stopping_state['best_full_model']
+
+        if best_full['weights'] is not None:
+            # Restore checkpoint (already has frozen streams at their best epochs)
+            self.load_state_dict({k: v.to(self.device) for k, v in best_full['weights'].items()})
+
+            if verbose:
+                metric_str = f"{monitor}: {best_full['best_metric']:.4f}"
+
+                # Build message showing which streams are frozen
+                frozen_streams = []
+                if stream_early_stopping_state['stream1']['frozen']:
+                    frozen_streams.append(f"Stream1 at epoch {stream_early_stopping_state['stream1']['best_epoch'] + 1}")
+                if stream_early_stopping_state['stream2']['frozen']:
+                    frozen_streams.append(f"Stream2 at epoch {stream_early_stopping_state['stream2']['best_epoch'] + 1}")
+
+                if frozen_streams:
+                    frozen_info = ", ".join(frozen_streams)
+                    print(f"🔄 Restored full model from epoch {best_full['epoch'] + 1} "
+                          f"({metric_str}, preserved {frozen_info})")
+                else:
+                    print(f"🔄 Restored full model from epoch {best_full['epoch'] + 1} ({metric_str})")
+
+    def _check_stream_early_stopping(self, stream_early_stopping_state: dict,
+                                     stream_stats: dict, epoch: int, monitor: str,
+                                     min_delta: float, verbose: bool,
+                                     val_acc: float, val_loss: float) -> bool:
+        """
+        Check stream-specific early stopping and freeze streams when they plateau.
+
+        This is the main orchestrator that:
+        1. Updates best full model checkpoint
+        2. Checks each stream for improvement
+        3. Freezes streams when patience is exhausted
+        4. Restores best model when all streams are frozen
+
+        Returns:
+            True if all streams are frozen, False otherwise
+        """
+        if not stream_early_stopping_state['enabled']:
+            return False
+
+        # Update best full model checkpoint
+        self._update_best_full_model(stream_early_stopping_state, val_loss, val_acc,
+                                     monitor, min_delta, epoch)
+
+        # Check Stream1
+        if not stream_early_stopping_state['stream1']['frozen']:
+            # Get current metric
+            if monitor == 'val_loss':
+                stream1_metric = stream_stats.get('stream1_val_loss', float('inf'))
+            else:
+                stream1_metric = stream_stats.get('stream1_val_acc', 0.0)
+
+            stream1_state = stream_early_stopping_state['stream1']
+
+            # Check for improvement
+            improved = self._check_stream_improvement(stream1_state, stream1_metric,
+                                                      monitor, min_delta, epoch, 'stream1')
+
+            # Freeze if patience exhausted
+            if not improved and stream1_state['patience_counter'] > stream1_state['patience']:
+                self._freeze_stream(stream1_state, 'stream1', epoch, monitor, verbose)
+
+        # Check Stream2
+        if not stream_early_stopping_state['stream2']['frozen']:
+            # Get current metric
+            if monitor == 'val_loss':
+                stream2_metric = stream_stats.get('stream2_val_loss', float('inf'))
+            else:
+                stream2_metric = stream_stats.get('stream2_val_acc', 0.0)
+
+            stream2_state = stream_early_stopping_state['stream2']
+
+            # Check for improvement
+            improved = self._check_stream_improvement(stream2_state, stream2_metric,
+                                                      monitor, min_delta, epoch, 'stream2')
+
+            # Freeze if patience exhausted
+            if not improved and stream2_state['patience_counter'] > stream2_state['patience']:
+                self._freeze_stream(stream2_state, 'stream2', epoch, monitor, verbose)
+
+        # Check if all streams are frozen
+        all_frozen = (stream_early_stopping_state['stream1']['frozen'] and
+                     stream_early_stopping_state['stream2']['frozen'])
+
+        # If all streams just became frozen, restore best full model
+        if all_frozen and not stream_early_stopping_state['all_frozen']:
+            self._restore_best_full_model(stream_early_stopping_state, monitor, verbose)
+
+        stream_early_stopping_state['all_frozen'] = all_frozen
+
+        return all_frozen
+
+    # ==================== End Early Stopping Helpers ====================
+
     def fit(
         self,
         train_loader: torch.utils.data.DataLoader,
@@ -377,10 +703,12 @@ class LINet(BaseModel):
         callbacks = callbacks or []
 
         # Early stopping setup
-        early_stopping_state = setup_early_stopping(early_stopping, val_loader, monitor, patience, min_delta, verbose)
+        early_stopping_state = self._setup_early_stopping(
+            early_stopping, val_loader, monitor, patience, min_delta, verbose
+        )
 
         # Stream-specific early stopping setup (uses same monitor as main early stopping)
-        stream_early_stopping_state = setup_stream_early_stopping(
+        stream_early_stopping_state = self._setup_stream_early_stopping(
             stream_early_stopping, monitor, stream1_patience, stream2_patience, stream_min_delta, verbose
         )
 
@@ -516,50 +844,47 @@ class LINet(BaseModel):
                     )
                 
                 # Check for early stopping
-                if early_stopping_initiated(
-                    self.state_dict(), early_stopping_state, val_loss, val_acc, epoch, monitor, min_delta, pbar, verbose, restore_best_weights
-                ):
-                    # Restore best weights if requested
-                    if restore_best_weights and early_stopping_state['best_weights'] is not None:
-                        # Check if stream early stopping is enabled and which streams are frozen
-                        stream_es_enabled = stream_early_stopping_state['enabled']
-                        stream1_frozen = stream_es_enabled and stream_early_stopping_state.get('stream1', {}).get('frozen', False)
-                        stream2_frozen = stream_es_enabled and stream_early_stopping_state.get('stream2', {}).get('frozen', False)
+                if early_stopping_state['enabled']:
 
-                        # Save frozen stream weights before restoring (to preserve them)
-                        frozen_stream_weights = {}
-                        if stream1_frozen and stream_early_stopping_state['stream1']['best_weights'] is not None:
-                            frozen_stream_weights.update({
-                                k: v.clone() for k, v in stream_early_stopping_state['stream1']['best_weights'].items()
-                            })
-                        if stream2_frozen and stream_early_stopping_state['stream2']['best_weights'] is not None:
-                            frozen_stream_weights.update({
-                                k: v.clone() for k, v in stream_early_stopping_state['stream2']['best_weights'].items()
-                            })
+                    current_metric = val_loss if monitor == 'val_loss' else val_acc
 
-                        # Restore best weights from main early stopping (includes all unfrozen streams)
-                        self.load_state_dict({
-                            k: v.to(self.device) for k, v in early_stopping_state['best_weights'].items()
-                        })
+                    # Check if we should update checkpoint
+                    if self._should_update_checkpoint(current_metric, early_stopping_state['best_metric'],
+                                                        monitor, min_delta):
+                        # New best! Save checkpoint
+                        early_stopping_state['best_metric'] = current_metric
+                        early_stopping_state['best_epoch'] = epoch
+                        early_stopping_state['patience_counter'] = 0
 
-                        # Restore frozen stream weights back (they keep their best weights, not main epoch weights)
-                        if frozen_stream_weights:
-                            for name, param in self.named_parameters():
-                                if name in frozen_stream_weights:
-                                    param.data.copy_(frozen_stream_weights[name].to(self.device))
+                        if restore_best_weights:
+                            # Save checkpoint
+                            early_stopping_state['best_weights'] = self._save_checkpoint()
 
-                        # Print appropriate message
-                        if verbose:
-                            if stream1_frozen or stream2_frozen:
-                                preserved_streams = []
-                                if stream1_frozen:
-                                    preserved_streams.append("Stream1")
-                                if stream2_frozen:
-                                    preserved_streams.append("Stream2")
-                                print(f"🔄 Restored best model weights (preserved frozen {', '.join(preserved_streams)})")
-                            else:
-                                print("🔄 Restored best model weights")
-                    break
+                            # Update frozen stream weights in checkpoint
+                            if stream_early_stopping_state['enabled']:
+                                self._update_frozen_stream_weights_in_checkpoint(
+                                    early_stopping_state['best_weights'],
+                                    stream_early_stopping_state
+                                )
+
+                        if verbose and pbar is None:
+                            print(f"✅ New best {monitor}: {current_metric:.4f}")
+                    else:
+                        # No improvement
+                        early_stopping_state['patience_counter'] += 1
+
+                        # Check if we should stop
+                        if self._should_stop_early(early_stopping_state['patience_counter'],
+                                                   early_stopping_state['patience']):
+                            if verbose:
+                                print(f"🛑 Early stopping triggered after {epoch + 1} epochs")
+                                print(f"   Best {monitor}: {early_stopping_state['best_metric']:.4f} at epoch {early_stopping_state['best_epoch'] + 1}")
+
+                            # Restore best weights
+                            if restore_best_weights and early_stopping_state['best_weights'] is not None:
+                                self._restore_checkpoint(early_stopping_state['best_weights'], verbose,
+                                                        stream_early_stopping_state)
+                            break
             
             # Step epoch-based schedulers at epoch end
             # Skip OneCycleLR (steps per batch) and schedulers with _step_per_batch=True
@@ -629,27 +954,64 @@ class LINet(BaseModel):
                 prev_stream1_frozen = stream_early_stopping_state['stream1']['frozen']
                 prev_stream2_frozen = stream_early_stopping_state['stream2']['frozen']
 
-                # Check for stream early stopping
-                all_streams_frozen = check_stream_early_stopping(
+                # Check for stream early stopping using our new method
+                all_streams_frozen = self._check_stream_early_stopping(
                     stream_early_stopping_state=stream_early_stopping_state,
                     stream_stats=stream_stats,
-                    model=self,
                     epoch=epoch,
                     monitor=monitor,
                     min_delta=stream_min_delta,
                     verbose=verbose,
-                    val_acc=val_acc,  # Pass full model validation accuracy
-                    val_loss=val_loss  # Pass full model validation loss
+                    val_acc=val_acc,
+                    val_loss=val_loss
                 )
 
-                # Record freezing events in history
+                # Record freezing events and update checkpoints
                 if not prev_stream1_frozen and stream_early_stopping_state['stream1']['frozen']:
                     history['stream1_frozen_epoch'] = epoch + 1
                     history['streams_frozen'].append((epoch + 1, 'Stream1'))
 
+                    # Update main early stopping checkpoint with frozen Stream1 weights
+                    if early_stopping_state['enabled'] and restore_best_weights:
+                        # Create checkpoint if it doesn't exist yet
+                        if early_stopping_state.get('best_weights') is None:
+                            early_stopping_state['best_weights'] = self._save_checkpoint()
+
+                        # Update with frozen stream weights
+                        self._update_frozen_stream_weights_in_checkpoint(
+                            early_stopping_state['best_weights'],
+                            stream_early_stopping_state
+                        )
+
+                    # Also update stream ES checkpoint (used when all streams freeze)
+                    if stream_early_stopping_state['best_full_model']['weights'] is not None:
+                        self._update_frozen_stream_weights_in_checkpoint(
+                            stream_early_stopping_state['best_full_model']['weights'],
+                            stream_early_stopping_state
+                        )
+
                 if not prev_stream2_frozen and stream_early_stopping_state['stream2']['frozen']:
                     history['stream2_frozen_epoch'] = epoch + 1
                     history['streams_frozen'].append((epoch + 1, 'Stream2'))
+
+                    # Update main early stopping checkpoint with frozen Stream2 weights
+                    if early_stopping_state['enabled'] and restore_best_weights:
+                        # Create checkpoint if it doesn't exist yet
+                        if early_stopping_state.get('best_weights') is None:
+                            early_stopping_state['best_weights'] = self._save_checkpoint()
+
+                        # Update with frozen stream weights
+                        self._update_frozen_stream_weights_in_checkpoint(
+                            early_stopping_state['best_weights'],
+                            stream_early_stopping_state
+                        )
+
+                    # Also update stream ES checkpoint (used when all streams freeze)
+                    if stream_early_stopping_state['best_full_model']['weights'] is not None:
+                        self._update_frozen_stream_weights_in_checkpoint(
+                            stream_early_stopping_state['best_full_model']['weights'],
+                            stream_early_stopping_state
+                        )
 
                 # Stop training if all streams are frozen
                 if all_streams_frozen:
@@ -709,12 +1071,13 @@ class LINet(BaseModel):
 
         return history
 
-    def evaluate(self, data_loader: torch.utils.data.DataLoader) -> dict:
+    def evaluate(self, data_loader: torch.utils.data.DataLoader, stream_monitoring: bool = True) -> dict:
         """
         Evaluate the model on the given data.
 
         Args:
             data_loader: DataLoader containing dual-channel input data and targets
+            stream_monitoring: Whether to calculate stream-specific metrics (default: True)
 
         Returns:
             Dictionary containing evaluation metrics
@@ -722,7 +1085,9 @@ class LINet(BaseModel):
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before evaluate().")
 
-        loss, accuracy, stream1_val_acc, stream2_val_acc, stream1_val_loss, stream2_val_loss = self._validate(data_loader)
+        loss, accuracy, stream1_val_acc, stream2_val_acc, stream1_val_loss, stream2_val_loss = self._validate(
+            data_loader, stream_monitoring=stream_monitoring
+        )
 
         return {
             'loss': loss,
