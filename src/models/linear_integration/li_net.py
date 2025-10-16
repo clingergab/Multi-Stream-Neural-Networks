@@ -631,8 +631,8 @@ class LINet(BaseModel):
 
     def fit(
         self,
-        train_loader: torch.utils.data.DataLoader,
-        val_loader: Optional[torch.utils.data.DataLoader] = None,
+        train_loader: DataLoader,
+        val_loader: Optional[DataLoader] = None,
         epochs: int = 10,
         callbacks: Optional[list] = None,
         verbose: bool = True,
@@ -1071,7 +1071,7 @@ class LINet(BaseModel):
 
         return history
 
-    def evaluate(self, data_loader: torch.utils.data.DataLoader, stream_monitoring: bool = True) -> dict:
+    def evaluate(self, data_loader: DataLoader, stream_monitoring: bool = True) -> dict:
         """
         Evaluate the model on the given data.
 
@@ -1097,7 +1097,7 @@ class LINet(BaseModel):
             'stream1_loss': stream1_val_loss,
             'stream2_loss': stream2_val_loss
         }
-    def predict(self, data_loader: torch.utils.data.DataLoader) -> torch.Tensor:
+    def predict(self, data_loader: DataLoader) -> torch.Tensor:
         """
         Generate predictions for the input data.
 
@@ -1126,7 +1126,7 @@ class LINet(BaseModel):
 
         return torch.cat(all_predictions, dim=0)
     
-    def predict_proba(self, data_loader: torch.utils.data.DataLoader) -> np.ndarray:
+    def predict_proba(self, data_loader: DataLoader) -> np.ndarray:
         """
         Generate probability predictions for the input data.
 
@@ -1664,7 +1664,7 @@ class LINet(BaseModel):
 
         return integrated_features
 
-    def analyze_pathways(self, data_loader: torch.utils.data.DataLoader) -> dict:
+    def analyze_pathways(self, data_loader: DataLoader) -> dict:
         """
         Analyze the contribution and performance of individual pathways.
 
@@ -1897,7 +1897,7 @@ class LINet(BaseModel):
         }
     
     def get_pathway_importance(self,
-                              data_loader: torch.utils.data.DataLoader,
+                              data_loader: DataLoader,
                               method: str = 'gradient') -> dict:
         """
         Calculate pathway importance using different methods.
@@ -1983,7 +1983,7 @@ class LINet(BaseModel):
             'note': 'Integrated stream importance is implicit in how gradients flow through integration weights'
         }
 
-    def calculate_stream_contributions_to_integration(self, data_loader: torch.utils.data.DataLoader = None):
+    def calculate_stream_contributions_to_integration(self, data_loader: DataLoader = None):
         """
         Calculate how much each input stream contributes to the integrated stream.
 
@@ -2035,7 +2035,7 @@ class LINet(BaseModel):
                    'Reflects how the trained model structurally combines the two input streams.'
         }
 
-    def calculate_stream_contributions(self, data_loader: torch.utils.data.DataLoader):
+    def calculate_stream_contributions(self, data_loader: DataLoader):
         """
         DEPRECATED: Calculate hypothetical classification ability of each stream.
 
