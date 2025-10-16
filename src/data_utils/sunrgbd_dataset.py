@@ -141,19 +141,20 @@ class SUNRGBDDataset(Dataset):
                 )
                 rgb = color_jitter(rgb)
 
-            # 4. RGB-Only: Gaussian Blur (25% probability)
+            # 4. RGB-Only: Gaussian Blur (35% probability)
             # Reduces reliance on fine textures/edges, forces focus on spatial structure
             # Critical for reducing RGB overfitting - used in SimCLR, MoCo, BYOL
-            if np.random.random() < 0.25:
+            # Increased to 35% to further combat RGB overfitting
+            if np.random.random() < 0.35:
                 # Kernel size: random odd number between 3 and 7
                 # Sigma: random between 0.1 and 2.0 (controls blur strength)
                 kernel_size = int(np.random.choice([3, 5, 7]))
                 sigma = float(np.random.uniform(0.1, 2.0))
                 rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
 
-            # 5. RGB-Only: Occasional Grayscale (20% - increased for robustness)
-            # Further increased to help RGB stream generalize better
-            if np.random.random() < 0.2:
+            # 5. RGB-Only: Occasional Grayscale (28% - increased for robustness)
+            # Further increased to help RGB stream generalize better and reduce color reliance
+            if np.random.random() < 0.28:
                 rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
             # 6. Depth-Only: Combined Appearance Augmentation (50% probability)
