@@ -129,25 +129,35 @@ class SUNRGBDDataset(Dataset):
                 rgb = transforms.functional.resize(rgb, self.target_size)
                 depth = transforms.functional.resize(depth, self.target_size)
 
-            # 3. RGB-Only: Color Jitter (50% probability)
+            # 3. RGB-Only: Color Jitter (60% probability)
             # Applies brightness, contrast, saturation, hue adjustments
-            # Increased strength to reduce RGB overfitting
-            if np.random.random() < 0.5:
+            # Increased strength and probability to reduce RGB overfitting
+            if np.random.random() < 0.6:
                 color_jitter = transforms.ColorJitter(
-                    brightness=0.3,  # ±30% (increased from 0.2)
-                    contrast=0.3,    # ±30% (increased from 0.2)
-                    saturation=0.3,  # ±30% (increased from 0.2)
-                    hue=0.08         # ±8% (increased from 0.05)
+                    brightness=0.4,  # ±40% (increased from 0.3)
+                    contrast=0.4,    # ±40% (increased from 0.3)
+                    saturation=0.4,  # ±40% (increased from 0.3)
+                    hue=0.1          # ±10% (increased from 0.08)
                 )
                 rgb = color_jitter(rgb)
 
-            # 4. RGB-Only: Occasional Grayscale (15% - increased for robustness)
-            # Doubled from 5% to help RGB stream generalize better
-            if np.random.random() < 0.15:
+            # 4. RGB-Only: Gaussian Blur (25% probability)
+            # Reduces reliance on fine textures/edges, forces focus on spatial structure
+            # Critical for reducing RGB overfitting - used in SimCLR, MoCo, BYOL
+            if np.random.random() < 0.25:
+                # Kernel size: random odd number between 3 and 7
+                # Sigma: random between 0.1 and 2.0 (controls blur strength)
+                kernel_size = np.random.choice([3, 5, 7])
+                sigma = np.random.uniform(0.1, 2.0)
+                rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
+
+            # 5. RGB-Only: Occasional Grayscale (20% - increased for robustness)
+            # Further increased to help RGB stream generalize better
+            if np.random.random() < 0.2:
                 rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
-            # 5. Depth-Only: Combined Appearance Augmentation (50% probability)
-            # IMPORTANT: Matches RGB's 50% color jitter - single augmentation block
+            # 6. Depth-Only: Combined Appearance Augmentation (50% probability)
+            # IMPORTANT: Matches RGB's color jitter - single augmentation block
             # Applies brightness + contrast + noise together (like RGB does color jitter)
             if np.random.random() < 0.5:
                 depth_array = np.array(depth, dtype=np.float32)
@@ -191,11 +201,11 @@ class SUNRGBDDataset(Dataset):
         # 7. Post-normalization Random Erasing
         # Applied after normalization for both modalities
         if self.train:
-            # RGB random erasing (15% - increased to reduce overfitting)
-            if np.random.random() < 0.15:
+            # RGB random erasing (20% - increased to reduce overfitting)
+            if np.random.random() < 0.2:
                 erasing = transforms.RandomErasing(
                     p=1.0,
-                    scale=(0.02, 0.1),     # Small patches (2-10% of image)
+                    scale=(0.02, 0.12),    # Small patches (2-12% of image, increased from 0.1)
                     ratio=(0.5, 2.0)       # Reasonable aspect ratios
                 )
                 rgb = erasing(rgb)

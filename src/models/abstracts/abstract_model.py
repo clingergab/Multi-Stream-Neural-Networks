@@ -491,27 +491,16 @@ class BaseModel(nn.Module, ABC):
         pass
     
     @abstractmethod
-    def evaluate(self, stream1_data: Union[np.ndarray, torch.Tensor] = None, 
-                stream2_data: Union[np.ndarray, torch.Tensor] = None, 
-                labels: Union[np.ndarray, torch.Tensor] = None,
-                data_loader: DataLoader = None,
-                batch_size: int = 32) -> Dict[str, float]:
+    def evaluate(self, data_loader: DataLoader, stream_monitoring: bool = True) -> Dict[str, float]:
         """
-        Evaluate the model on test data.
-        
-        This method supports two input modes:
-        1. Direct data arrays: stream1_data, stream2_data, and labels
-        2. DataLoader: data_loader (containing color, brightness, and labels)
-        
+        Evaluate the model on the given data.
+
         Args:
-            stream1_data: Color/RGB test data (if not using data_loader)
-            stream2_data: Brightness test data (if not using data_loader)
-            labels: Test labels (if not using data_loader)
-            data_loader: DataLoader containing test data (alternative to direct arrays)
-            batch_size: Batch size for evaluation (used only when passing direct data arrays)
-            
+            data_loader: DataLoader containing dual-channel input data and targets
+            stream_monitoring: Whether to calculate stream-specific metrics (default: True)
+
         Returns:
-            Dictionary with evaluation metrics (e.g., accuracy, loss)
+            Dictionary containing evaluation metrics (e.g., accuracy, loss, stream accuracies)
         """
         pass
     
