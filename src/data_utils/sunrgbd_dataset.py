@@ -141,9 +141,9 @@ class SUNRGBDDataset(Dataset):
                 )
                 rgb = color_jitter(rgb)
 
-            # 4. RGB-Only: Occasional Grayscale (10% - increased for robustness)
+            # 4. RGB-Only: Occasional Grayscale (15% - increased for robustness)
             # Doubled from 5% to help RGB stream generalize better
-            if np.random.random() < 0.1:
+            if np.random.random() < 0.15:
                 rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
             # 5. Depth-Only: Combined Appearance Augmentation (50% probability)

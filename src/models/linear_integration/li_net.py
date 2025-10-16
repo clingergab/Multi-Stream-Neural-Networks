@@ -1379,7 +1379,7 @@ class LINet(BaseModel):
         return avg_train_loss, train_accuracy, stream1_train_acc, stream2_train_acc
     
     def _validate(self, data_loader: DataLoader,
-                  pbar: Optional['TqdmType'] = None, stream_monitoring: bool = False) -> tuple:
+                  pbar: Optional['TqdmType'] = None, stream_monitoring: bool = True) -> tuple:
         """
         Validate the model on the given data with GPU optimizations and reduced progress updates.
 
