@@ -160,11 +160,11 @@ def create_dataloader_from_tensors(X: torch.Tensor,
             prefetch_factor=prefetch_factor if num_workers > 0 else None
         )
 
-def setup_early_stopping(early_stopping: bool, val_loader, monitor: str, 
+def setup_early_stopping(early_stopping: bool, val_loader, monitor: str,
                        patience: int, min_delta: float, verbose: bool) -> Dict[str, Any]:
     """
     Set up early stopping configuration and state.
-    
+
     Args:
         early_stopping: Whether to enable early stopping
         val_loader: Validation data loader
@@ -172,37 +172,32 @@ def setup_early_stopping(early_stopping: bool, val_loader, monitor: str,
         patience: Number of epochs to wait for improvement
         min_delta: Minimum change to qualify as improvement
         verbose: Whether to print early stopping info
-    
+
     Returns:
-        Dictionary containing early stopping state and configuration
+        Dictionary containing early stopping state (monitor is NOT stored, pass it to functions)
     """
     if early_stopping and val_loader is None:
         if verbose:
             print("⚠️  Early stopping requested but no validation data provided. Disabling early stopping.")
         early_stopping = False
-    
+
     if not early_stopping:
         return {'enabled': False}
-    
+
     if monitor == 'val_loss':
         best_metric = float('inf')
-        is_better = lambda current, best: current < (best - min_delta)
     elif monitor == 'val_accuracy':
         best_metric = 0.0
-        is_better = lambda current, best: current > (best + min_delta)
     else:
         raise ValueError(f"Unsupported monitor metric: {monitor}. Use 'val_loss' or 'val_accuracy'.")
-    
+
     if verbose:
         print(f"🛑 Early stopping enabled: monitoring {monitor} with patience={patience}, min_delta={min_delta}")
-    
+
     return {
         'enabled': True,
-        'monitor': monitor,
         'patience': patience,
-        'min_delta': min_delta,
         'best_metric': best_metric,
-        'is_better': is_better,
         'patience_counter': 0,
         'best_epoch': 0,
         'best_weights': None
@@ -227,20 +222,20 @@ def setup_stream_early_stopping(stream_early_stopping: bool, stream_monitor: str
         verbose: Whether to print setup messages
 
     Returns:
-        Dictionary containing stream early stopping state
+        Dictionary containing stream early stopping state (monitor is NOT stored, pass it to functions)
     """
     if not stream_early_stopping:
         return {'enabled': False}
 
-    # Set up comparison logic based on monitor type
+    # Validate monitor type
+    if stream_monitor not in ('val_loss', 'val_accuracy'):
+        raise ValueError(f"Invalid stream_monitor: {stream_monitor}. Must be 'val_loss' or 'val_accuracy'")
+
+    # Set initial best metric based on monitor type
     if stream_monitor == 'val_loss':
         best_metric = float('inf')
-        is_better = lambda current, best: current < (best - stream_min_delta)
-    elif stream_monitor == 'val_accuracy':
+    else:  # val_accuracy
         best_metric = 0.0
-        is_better = lambda current, best: current > (best + stream_min_delta)
-    else:
-        raise ValueError(f"Invalid stream_monitor: {stream_monitor}. Must be 'val_loss' or 'val_accuracy'")
 
     if verbose:
         print(f"❄️  Stream-specific early stopping enabled:")
@@ -251,8 +246,6 @@ def setup_stream_early_stopping(stream_early_stopping: bool, stream_monitor: str
 
     return {
         'enabled': True,
-        'monitor': stream_monitor,
-        'is_better': is_better,
         'stream1': {
             'best_metric': best_metric,
             'patience': stream1_patience,
@@ -269,11 +262,10 @@ def setup_stream_early_stopping(stream_early_stopping: bool, stream_monitor: str
             'frozen': False,
             'best_weights': None  # Will store stream-specific weights
         },
-        'min_delta': stream_min_delta,
         'all_frozen': False,
         # Full model state tracking (for when all streams freeze)
         'best_full_model': {
-            'val_acc': 0.0,
+            'best_metric': best_metric,
             'epoch': 0,
             'weights': None  # Will store full model state_dict
         }
@@ -284,6 +276,7 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
                                 model,
                                 epoch: int,
                                 monitor: str,
+                                min_delta: float,
                                 verbose: bool,
                                 val_acc: float = 0.0,
                                 val_loss: float = 0.0) -> bool:
@@ -302,6 +295,8 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
                      stream1_val_loss, stream2_val_loss)
         model: The model (to access stream1 and stream2 parameters)
         epoch: Current epoch number
+        monitor: Metric to monitor ('val_loss' or 'val_accuracy')
+        min_delta: Minimum improvement threshold
         verbose: Whether to print freeze messages
         val_acc: Full model validation accuracy (for tracking best overall performance)
         val_loss: Full model validation loss (for tracking best overall performance)
@@ -312,8 +307,11 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
     if not stream_early_stopping_state['enabled']:
         return False
 
-    monitor = stream_early_stopping_state['monitor']
-    is_better = stream_early_stopping_state['is_better']
+    # Compute is_better based on monitor type
+    if monitor == 'val_loss':
+        is_better = lambda current, best: current < (best - min_delta)
+    else:  # val_accuracy
+        is_better = lambda current, best: current > (best + min_delta)
 
     # Track best full model performance (for restoration when all streams freeze)
     # Use the same monitor metric as stream early stopping
@@ -482,31 +480,50 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
     return all_frozen
 
 def early_stopping_initiated(model_state_dict: Dict[str, torch.Tensor], early_stopping_state: Dict[str, Any],
-                           val_loss: float, val_acc: float, epoch: int, pbar, verbose: bool,
-                           restore_best_weights: bool) -> bool:
+                           val_loss: float, val_acc: float, epoch: int, monitor: str, min_delta: float,
+                           pbar, verbose: bool, restore_best_weights: bool) -> bool:
     """
     Handle early stopping logic and return whether training should stop.
-    
+
     Args:
         model_state_dict: The model's current state dictionary
         early_stopping_state: Early stopping state dictionary
         val_loss: Current validation loss
         val_acc: Current validation accuracy
         epoch: Current epoch number
+        monitor: Metric to monitor ('val_loss' or 'val_accuracy')
+        min_delta: Minimum improvement threshold
         pbar: Progress bar object
         verbose: Whether to print progress
         restore_best_weights: Whether to save best weights for restoration
-    
+
     Returns:
         True if training should stop, False otherwise
     """
     if not early_stopping_state['enabled']:
         return False
-        
-    monitor = early_stopping_state['monitor']
+
     current_metric = val_loss if monitor == 'val_loss' else val_acc
-    
-    if early_stopping_state['is_better'](current_metric, early_stopping_state['best_metric']):
+
+    # Check for NaN/Inf in validation loss (indicates numerical instability)
+    # If val_loss is NaN, the model has corrupted weights and metrics are invalid
+    # Skip early stopping update to avoid treating corrupted metrics as "no improvement"
+    import math
+    if math.isnan(val_loss) or math.isinf(val_loss):
+        if verbose and pbar is None:
+            print(f"\n⚠️  Warning: Validation loss is {'NaN' if math.isnan(val_loss) else 'Inf'} at epoch {epoch + 1}")
+            print(f"   This indicates numerical instability (likely from high learning rates)")
+            print(f"   Skipping early stopping update - training will continue")
+        # Don't update patience counter - let training continue to see if it recovers
+        return False
+
+    # Compute is_better based on monitor type
+    if monitor == 'val_loss':
+        is_better = current_metric < (early_stopping_state['best_metric'] - min_delta)
+    else:  # val_accuracy
+        is_better = current_metric > (early_stopping_state['best_metric'] + min_delta)
+
+    if is_better:
         early_stopping_state['best_metric'] = current_metric
         early_stopping_state['best_epoch'] = epoch
         early_stopping_state['patience_counter'] = 0

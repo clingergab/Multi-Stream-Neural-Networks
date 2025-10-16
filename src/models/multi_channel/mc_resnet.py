@@ -497,7 +497,7 @@ class MCResNet(BaseModel):
                 
                 # Check for early stopping
                 if early_stopping_initiated(
-                    self.state_dict(), early_stopping_state, val_loss, val_acc, epoch, pbar, verbose, restore_best_weights
+                    self.state_dict(), early_stopping_state, val_loss, val_acc, epoch, monitor, min_delta, pbar, verbose, restore_best_weights
                 ):
                     # Restore best weights if requested
                     if restore_best_weights and early_stopping_state['best_weights'] is not None:
@@ -602,6 +602,7 @@ class MCResNet(BaseModel):
                     model=self,
                     epoch=epoch,
                     monitor=monitor,
+                    min_delta=stream_min_delta,
                     verbose=verbose,
                     val_acc=val_acc,  # Pass full model validation accuracy
                     val_loss=val_loss  # Pass full model validation loss
@@ -638,9 +639,9 @@ class MCResNet(BaseModel):
                 'stopped_early': stopped_early,
                 'best_epoch': early_stopping_state['best_epoch'] + 1,
                 'best_metric': early_stopping_state['best_metric'],
-                'monitor': early_stopping_state['monitor'],
+                'monitor': monitor,  # Use parameter instead of state
                 'patience': early_stopping_state['patience'],
-                'min_delta': early_stopping_state['min_delta']
+                'min_delta': min_delta  # Use parameter instead of state
             }
 
         # Stream early stopping summary

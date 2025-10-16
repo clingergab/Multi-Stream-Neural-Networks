@@ -517,7 +517,7 @@ class LINet(BaseModel):
                 
                 # Check for early stopping
                 if early_stopping_initiated(
-                    self.state_dict(), early_stopping_state, val_loss, val_acc, epoch, pbar, verbose, restore_best_weights
+                    self.state_dict(), early_stopping_state, val_loss, val_acc, epoch, monitor, min_delta, pbar, verbose, restore_best_weights
                 ):
                     # Restore best weights if requested
                     if restore_best_weights and early_stopping_state['best_weights'] is not None:
@@ -636,6 +636,7 @@ class LINet(BaseModel):
                     model=self,
                     epoch=epoch,
                     monitor=monitor,
+                    min_delta=stream_min_delta,
                     verbose=verbose,
                     val_acc=val_acc,  # Pass full model validation accuracy
                     val_loss=val_loss  # Pass full model validation loss
@@ -672,16 +673,16 @@ class LINet(BaseModel):
                 'stopped_early': stopped_early,
                 'best_epoch': early_stopping_state['best_epoch'] + 1,
                 'best_metric': early_stopping_state['best_metric'],
-                'monitor': early_stopping_state['monitor'],
+                'monitor': monitor,  # Use parameter instead of state
                 'patience': early_stopping_state['patience'],
-                'min_delta': early_stopping_state['min_delta']
+                'min_delta': min_delta  # Use parameter instead of state
             }
 
         # Stream early stopping summary
         if stream_early_stopping_state['enabled']:
-            stream_monitor = stream_early_stopping_state['monitor']
+            # Use monitor parameter (monitor is shared between main and stream early stopping)
             history['stream_early_stopping'] = {
-                'monitor': stream_monitor,
+                'monitor': monitor,
                 'stream1_frozen': stream_early_stopping_state['stream1']['frozen'],
                 'stream1_frozen_epoch': history['stream1_frozen_epoch'],
                 'stream1_best_metric': stream_early_stopping_state['stream1']['best_metric'],
@@ -693,18 +694,18 @@ class LINet(BaseModel):
 
             if verbose:
                 print("\n❄️  Stream Early Stopping Summary:")
-                print(f"   Monitor: {stream_monitor}")
+                print(f"   Monitor: {monitor}")
                 if stream_early_stopping_state['stream1']['frozen']:
                     print(f"   Stream1: Frozen at epoch {history['stream1_frozen_epoch']} "
-                          f"(best {stream_monitor}: {stream_early_stopping_state['stream1']['best_metric']:.4f})")
+                          f"(best {monitor}: {stream_early_stopping_state['stream1']['best_metric']:.4f})")
                 else:
-                    print(f"   Stream1: Not frozen (final {stream_monitor}: {stream_early_stopping_state['stream1']['best_metric']:.4f})")
+                    print(f"   Stream1: Not frozen (final {monitor}: {stream_early_stopping_state['stream1']['best_metric']:.4f})")
 
                 if stream_early_stopping_state['stream2']['frozen']:
                     print(f"   Stream2: Frozen at epoch {history['stream2_frozen_epoch']} "
-                          f"(best {stream_monitor}: {stream_early_stopping_state['stream2']['best_metric']:.4f})")
+                          f"(best {monitor}: {stream_early_stopping_state['stream2']['best_metric']:.4f})")
                 else:
-                    print(f"   Stream2: Not frozen (final {stream_monitor}: {stream_early_stopping_state['stream2']['best_metric']:.4f})")
+                    print(f"   Stream2: Not frozen (final {monitor}: {stream_early_stopping_state['stream2']['best_metric']:.4f})")
 
         return history
 

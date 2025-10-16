@@ -475,7 +475,7 @@ class ResNet(nn.Module):
                 
                 # Check for early stopping
                 if early_stopping_initiated(
-                    self.state_dict(), early_stopping_state, val_loss, val_acc, epoch, pbar, verbose, restore_best_weights
+                    self.state_dict(), early_stopping_state, val_loss, val_acc, epoch, monitor, min_delta, pbar, verbose, restore_best_weights
                 ):
                     # Restore best weights if requested
                     if restore_best_weights and early_stopping_state['best_weights'] is not None:
@@ -512,13 +512,13 @@ class ResNet(nn.Module):
                 'stopped_early': early_stopping_state['patience_counter'] > early_stopping_state['patience'],
                 'best_epoch': early_stopping_state['best_epoch'] + 1,
                 'best_metric': early_stopping_state['best_metric'],
-                'monitor': early_stopping_state['monitor'],
+                'monitor': monitor,  # Use parameter instead of state
                 'patience': early_stopping_state['patience'],
-                'min_delta': early_stopping_state['min_delta']
+                'min_delta': min_delta  # Use parameter instead of state
             }
 
             if verbose and early_stopping_state['patience_counter'] <= early_stopping_state['patience']:
-                print(f"🏁 Training completed without early stopping. Best {early_stopping_state['monitor']}: {early_stopping_state['best_metric']:.4f} at epoch {early_stopping_state['best_epoch'] + 1}")
+                print(f"🏁 Training completed without early stopping. Best {monitor}: {early_stopping_state['best_metric']:.4f} at epoch {early_stopping_state['best_epoch'] + 1}")
         
         return history
     

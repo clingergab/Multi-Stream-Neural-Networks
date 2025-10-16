@@ -41,19 +41,16 @@ class SUNRGBDDataset(Dataset):
         self,
         data_root='data/sunrgbd_15',
         train=True,
-        rgb_transform=None,
-        depth_transform=None,
-        shared_transform=None,
         target_size=(224, 224),
     ):
         """
         Args:
             data_root: Root directory of preprocessed dataset
             train: If True, load training set; else load validation set
-            rgb_transform: Transforms for RGB images (applied after shared)
-            depth_transform: Transforms for depth images (applied after shared)
-            shared_transform: Transforms applied to both RGB and depth (before individual)
             target_size: Target image size (H, W)
+
+        Note: All augmentation is performed in __getitem__() to enable synchronized
+        transforms between RGB and depth modalities.
         """
         self.data_root = data_root
         self.train = train
@@ -77,35 +74,6 @@ class SUNRGBDDataset(Dataset):
         # Verify directories exist
         assert os.path.exists(self.rgb_dir), f"RGB directory not found: {self.rgb_dir}"
         assert os.path.exists(self.depth_dir), f"Depth directory not found: {self.depth_dir}"
-
-        # Set up transforms
-        self.rgb_transform = rgb_transform
-        self.depth_transform = depth_transform
-        self.shared_transform = shared_transform
-
-        # Default transforms if not provided
-        # IMPORTANT: RandomHorizontalFlip must be applied BEFORE individual transforms
-        # to ensure RGB and Depth are flipped together
-        if self.rgb_transform is None:
-            # REMOVED ColorJitter - RGB and Depth now have same augmentation difficulty
-            # Only difference is normalization (ImageNet stats for RGB)
-            self.rgb_transform = transforms.Compose([
-                transforms.Resize(target_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-
-        if self.depth_transform is None:
-            # Depth-specific transforms (applied AFTER shared flip)
-            # Normalize to same scale as RGB for balanced gradient flow
-            self.depth_transform = transforms.Compose([
-                transforms.Resize(target_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5027], std=[0.2197])  # SUN RGB-D dataset stats
-            ])
-
-        # Store whether we're in training mode (for synchronized flipping)
-        self.train = train
 
         print(f"Loaded SUN RGB-D {split} set: {self.num_samples} samples, 15 classes")
 
@@ -163,17 +131,19 @@ class SUNRGBDDataset(Dataset):
 
             # 3. RGB-Only: Color Jitter (50% probability)
             # Applies brightness, contrast, saturation, hue adjustments
+            # Increased strength to reduce RGB overfitting
             if np.random.random() < 0.5:
                 color_jitter = transforms.ColorJitter(
-                    brightness=0.2,  # ±20%
-                    contrast=0.2,    # ±20%
-                    saturation=0.2,  # ±20%
-                    hue=0.05         # ±5% (small hue shift)
+                    brightness=0.3,  # ±30% (increased from 0.2)
+                    contrast=0.3,    # ±30% (increased from 0.2)
+                    saturation=0.3,  # ±30% (increased from 0.2)
+                    hue=0.08         # ±8% (increased from 0.05)
                 )
                 rgb = color_jitter(rgb)
 
-            # 4. RGB-Only: Occasional Grayscale (5% - rare, for robustness)
-            if np.random.random() < 0.05:
+            # 4. RGB-Only: Occasional Grayscale (10% - increased for robustness)
+            # Doubled from 5% to help RGB stream generalize better
+            if np.random.random() < 0.1:
                 rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
             # 5. Depth-Only: Combined Appearance Augmentation (50% probability)
@@ -218,11 +188,11 @@ class SUNRGBDDataset(Dataset):
             depth, mean=[0.5027], std=[0.2197]
         )
 
-        # 7. Post-normalization Random Erasing (10% each - balanced)
+        # 7. Post-normalization Random Erasing
         # Applied after normalization for both modalities
         if self.train:
-            # RGB random erasing (10%)
-            if np.random.random() < 0.1:
+            # RGB random erasing (15% - increased to reduce overfitting)
+            if np.random.random() < 0.15:
                 erasing = transforms.RandomErasing(
                     p=1.0,
                     scale=(0.02, 0.1),     # Small patches (2-10% of image)

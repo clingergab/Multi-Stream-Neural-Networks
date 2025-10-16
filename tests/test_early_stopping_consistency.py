@@ -208,7 +208,9 @@ def test_patience_counter_increments_correctly():
 
     assert main_state['patience'] == 5
     assert main_state['patience_counter'] == 0
-    assert main_state['monitor'] == 'val_loss'
+    # monitor is no longer stored in state (passed as parameter to functions)
+    assert 'monitor' not in main_state
+    assert 'min_delta' not in main_state
 
     # Test stream early stopping setup
     stream_state = setup_stream_early_stopping(
@@ -224,36 +226,61 @@ def test_patience_counter_increments_correctly():
     assert stream_state['stream2']['patience'] == 7
     assert stream_state['stream1']['patience_counter'] == 0
     assert stream_state['stream2']['patience_counter'] == 0
-    assert stream_state['monitor'] == 'val_accuracy'
+    # monitor is no longer stored in state (passed as parameter to functions)
+    assert 'monitor' not in stream_state
+    assert 'min_delta' not in stream_state
 
 
 def test_is_better_logic_consistency():
-    """Verify is_better logic is identical for both mechanisms."""
-    from src.models.common.model_helpers import setup_early_stopping, setup_stream_early_stopping
+    """Verify is_better logic works correctly in early_stopping_initiated (no longer stored in state)."""
+    from src.models.common.model_helpers import setup_early_stopping, early_stopping_initiated
 
     # Test val_loss (lower is better)
-    main_loss = setup_early_stopping(True, torch.utils.data.DataLoader(create_dummy_data(10)), 'val_loss', 5, 0.001, False)
-    stream_loss = setup_stream_early_stopping(True, 'val_loss', 5, 5, 0.001, False)
+    state_loss = setup_early_stopping(True, torch.utils.data.DataLoader(create_dummy_data(10)), 'val_loss', 5, 0.001, False)
+    model_state = {'param': torch.randn(5, 5)}
 
-    # Both should say 0.5 is better than 1.0
-    assert main_loss['is_better'](0.5, 1.0) == stream_loss['is_better'](0.5, 1.0)
-    assert main_loss['is_better'](0.5, 1.0) is True
+    # Verify is_better is NOT stored in state (refactored to parameter-based)
+    assert 'is_better' not in state_loss
 
-    # Both should say 1.5 is NOT better than 1.0
-    assert main_loss['is_better'](1.5, 1.0) == stream_loss['is_better'](1.5, 1.0)
-    assert main_loss['is_better'](1.5, 1.0) is False
+    # Test that 0.5 is better than 1.0 (for val_loss)
+    state_loss['best_metric'] = 1.0
+    early_stopping_initiated(model_state, state_loss, val_loss=0.5, val_acc=0.5,
+                           epoch=1, monitor='val_loss', min_delta=0.001,
+                           pbar=None, verbose=False, restore_best_weights=False)
+    assert state_loss['best_metric'] == 0.5  # Should update to better metric
+    assert state_loss['patience_counter'] == 0  # Should reset patience
+
+    # Test that 1.5 is NOT better than 1.0 (for val_loss)
+    state_loss['best_metric'] = 1.0
+    state_loss['patience_counter'] = 0
+    early_stopping_initiated(model_state, state_loss, val_loss=1.5, val_acc=0.5,
+                           epoch=2, monitor='val_loss', min_delta=0.001,
+                           pbar=None, verbose=False, restore_best_weights=False)
+    assert state_loss['best_metric'] == 1.0  # Should NOT update
+    assert state_loss['patience_counter'] == 1  # Should increment patience
 
     # Test val_accuracy (higher is better)
-    main_acc = setup_early_stopping(True, torch.utils.data.DataLoader(create_dummy_data(10)), 'val_accuracy', 5, 0.001, False)
-    stream_acc = setup_stream_early_stopping(True, 'val_accuracy', 5, 5, 0.001, False)
+    state_acc = setup_early_stopping(True, torch.utils.data.DataLoader(create_dummy_data(10)), 'val_accuracy', 5, 0.001, False)
 
-    # Both should say 0.9 is better than 0.8
-    assert main_acc['is_better'](0.9, 0.8) == stream_acc['is_better'](0.9, 0.8)
-    assert main_acc['is_better'](0.9, 0.8) is True
+    # Verify is_better is NOT stored in state
+    assert 'is_better' not in state_acc
 
-    # Both should say 0.7 is NOT better than 0.8
-    assert main_acc['is_better'](0.7, 0.8) == stream_acc['is_better'](0.7, 0.8)
-    assert main_acc['is_better'](0.7, 0.8) is False
+    # Test that 0.9 is better than 0.8 (for val_accuracy)
+    state_acc['best_metric'] = 0.8
+    early_stopping_initiated(model_state, state_acc, val_loss=1.0, val_acc=0.9,
+                           epoch=1, monitor='val_accuracy', min_delta=0.001,
+                           pbar=None, verbose=False, restore_best_weights=False)
+    assert state_acc['best_metric'] == 0.9  # Should update to better metric
+    assert state_acc['patience_counter'] == 0  # Should reset patience
+
+    # Test that 0.7 is NOT better than 0.8 (for val_accuracy)
+    state_acc['best_metric'] = 0.8
+    state_acc['patience_counter'] = 0
+    early_stopping_initiated(model_state, state_acc, val_loss=1.0, val_acc=0.7,
+                           epoch=2, monitor='val_accuracy', min_delta=0.001,
+                           pbar=None, verbose=False, restore_best_weights=False)
+    assert state_acc['best_metric'] == 0.8  # Should NOT update
+    assert state_acc['patience_counter'] == 1  # Should increment patience
 
 
 def test_invalid_monitor_raises_error():
