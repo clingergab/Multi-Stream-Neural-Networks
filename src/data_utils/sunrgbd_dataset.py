@@ -147,8 +147,8 @@ class SUNRGBDDataset(Dataset):
             if np.random.random() < 0.25:
                 # Kernel size: random odd number between 3 and 7
                 # Sigma: random between 0.1 and 2.0 (controls blur strength)
-                kernel_size = np.random.choice([3, 5, 7])
-                sigma = np.random.uniform(0.1, 2.0)
+                kernel_size = int(np.random.choice([3, 5, 7]))
+                sigma = float(np.random.uniform(0.1, 2.0))
                 rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
 
             # 5. RGB-Only: Occasional Grayscale (20% - increased for robustness)
