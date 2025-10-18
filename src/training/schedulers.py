@@ -29,7 +29,7 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         train_loader_len: Length of the training data loader
         **scheduler_kwargs: Additional arguments for the scheduler
             - For 'cosine': t_max (epochs), eta_min (min LR)
-            - For 'decaying_cosine': t_max (epochs), eta_min (min LR), restart_decay (default=0.8)
+            - For 'decaying_cosine': t_max (epochs), eta_min (min LR), max_factor (default=1.0), min_factor (default=1.0)
             - For 'cosine_restarts': t_0 (cycle length in epochs), t_mult (cycle multiplier),
               eta_min (min LR), step_per_batch (bool, default=False - whether to step per batch instead of per epoch)
             - For 'decaying_cosine_restarts': t_0 (cycle length in epochs), t_mult (cycle multiplier),
@@ -52,11 +52,18 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         eta_min = scheduler_kwargs.get('eta_min', 0)
         return CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
     elif scheduler_type == 'decaying_cosine':
-        # DecayingCosineAnnealingLR - cosine annealing with decaying restarts
+        # DecayingCosineAnnealingLR - cosine annealing with dual decay (max and min)
         t_max = scheduler_kwargs.get('t_max', epochs)
         eta_min = scheduler_kwargs.get('eta_min', 0)
-        restart_decay = scheduler_kwargs.get('restart_decay', 0.8)
-        return DecayingCosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min, restart_decay=restart_decay)
+        max_factor = scheduler_kwargs.get('max_factor', 1.0)
+        min_factor = scheduler_kwargs.get('min_factor', 1.0) 
+        return DecayingCosineAnnealingLR(
+            optimizer,
+            T_max=t_max,
+            eta_min=eta_min,
+            max_factor=max_factor,
+            min_factor=min_factor
+        )
     elif scheduler_type == 'cosine_restarts':
         # CosineAnnealingWarmRestarts - multiple cycles with warm restarts
         # User always specifies t_0 in EPOCHS (intuitive)
