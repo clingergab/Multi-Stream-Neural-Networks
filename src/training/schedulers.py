@@ -468,48 +468,60 @@ class DecayingCosineAnnealingLR(torch.optim.lr_scheduler.LRScheduler):
     """
     CosineAnnealingLR with decaying restart peaks.
 
-    Uses the EXACT same math as PyTorch's CosineAnnealingLR, but applies a decay
-    multiplier to base_lrs after each T_max cycle is completed.
+    Uses the EXACT same math as PyTorch's CosineAnnealingLR, but applies decay
+    multipliers to BOTH base_lrs (max) and eta_min (min) after each T_max cycle.
 
-    Similar to CosineAnnealingLR, but after reaching T_max, instead of restarting
-    to the original peak learning rate, it restarts to a decayed peak (multiplied
-    by restart_decay).
+    This creates a decaying envelope for the cosine oscillations, where both the
+    peaks and valleys decrease over time. Allows fine control over the narrowing
+    or widening of LR oscillations across training.
 
     Pattern:
-        Cycle 1: high = base_lr,                  low = eta_min  (epochs 0 to T_max)
-        Cycle 2: high = base_lr * restart_decay,  low = eta_min  (epochs T_max+1 to 2*T_max)
-        Cycle 3: high = base_lr * restart_decay², low = eta_min  (epochs 2*T_max+1 to 3*T_max)
+        Cycle 1: high = base_lr,                  low = eta_min
+        Cycle 2: high = base_lr * max_factor,     low = eta_min * min_factor
+        Cycle 3: high = base_lr * max_factor²,    low = eta_min * min_factor²
         ...
 
-    Example with restart_decay=0.8, T_max=20:
+    Example with max_factor=0.8, min_factor=0.9, T_max=20, base_lr=0.1, eta_min=1e-3:
         Epochs 0-20:   0.100 → 0.001 (cosine)
-        Epochs 21-40:  0.080 → 0.001 (cosine, starts at 80% of original)
-        Epochs 41-60:  0.064 → 0.001 (cosine, starts at 64% of original)
-        Epochs 61-80:  0.051 → 0.001 (cosine, starts at 51% of original)
+        Epochs 21-40:  0.080 → 0.0009 (cosine, both ends decayed)
+        Epochs 41-60:  0.064 → 0.00081 (cosine, continues decaying)
+        Epochs 61-80:  0.051 → 0.00073 (cosine, overall downward trend)
+
+    Oscillation behavior:
+        - If max_factor == min_factor: Maintains constant oscillation ratio
+        - If max_factor < min_factor: Oscillations narrow over time (more stable)
+        - If max_factor > min_factor: Oscillations widen over time (more exploration)
 
     Args:
         optimizer: Wrapped optimizer
         T_max: Number of epochs for each cycle (constant cycle length)
-        eta_min: Minimum learning rate. Default: 0
-        restart_decay: Multiply peak LR by this after each cycle. Default: 1.0 (no decay)
+        eta_min: Initial minimum learning rate. Default: 0
+        max_factor: Multiply peak LR by this after each cycle. Default: 1.0 (no decay)
+        min_factor: Multiply eta_min by this after each cycle. Default: None (uses max_factor)
         last_epoch: The index of last epoch. Default: -1
 
-    Example:
-        >>> optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    Example 1 (Constant ratio - recommended):
         >>> scheduler = DecayingCosineAnnealingLR(
-        ...     optimizer,
-        ...     T_max=20,
-        ...     restart_decay=0.8,
-        ...     eta_min=1e-6
+        ...     optimizer, T_max=20, max_factor=0.85, eta_min=1e-5
         ... )
-        >>> for epoch in range(100):
-        ...     train(...)
-        ...     scheduler.step()
+        # Both max and min decay by 15% each cycle, maintaining oscillation amplitude ratio
+
+    Example 2 (Narrowing oscillations):
+        >>> scheduler = DecayingCosineAnnealingLR(
+        ...     optimizer, T_max=20, max_factor=0.8, min_factor=0.9, eta_min=1e-5
+        ... )
+        # Max decays faster (20%) than min (10%), oscillations narrow for stability
+
+    Example 3 (Widening oscillations):
+        >>> scheduler = DecayingCosineAnnealingLR(
+        ...     optimizer, T_max=20, max_factor=0.9, min_factor=0.8, eta_min=1e-5
+        ... )
+        # Max decays slower (10%) than min (20%), oscillations widen for exploration
 
     Note:
-        - restart_decay=1.0 behaves identically to CosineAnnealingLR (no decay)
-        - restart_decay=0.8 reduces peak by 20% each cycle (recommended)
-        - restart_decay=0.5 reduces peak by 50% each cycle (aggressive)
+        - If min_factor not specified, defaults to max_factor (constant ratio)
+        - max_factor=1.0 and min_factor=1.0 behaves like CosineAnnealingLR
+        - Very aggressive factors (e.g., 0.5) can cause LRs to become too small quickly
         - T_max is constant (unlike CosineAnnealingWarmRestarts with T_mult)
     """
 
@@ -518,17 +530,23 @@ class DecayingCosineAnnealingLR(torch.optim.lr_scheduler.LRScheduler):
         optimizer: torch.optim.Optimizer,
         T_max: int,
         eta_min: float = 0,
-        restart_decay: float = 1.0,
+        max_factor: float = 1.0,
+        min_factor: float = 1.0,
         last_epoch: int = -1
     ):
         if T_max <= 0 or not isinstance(T_max, int):
             raise ValueError(f"T_max must be a positive integer, got {T_max}")
-        if not 0.0 <= restart_decay <= 1.0:
-            raise ValueError(f"restart_decay must be in [0, 1], got {restart_decay}")
+        if not 0.0 <= max_factor <= 1.0:
+            raise ValueError(f"max_factor must be in [0, 1], got {max_factor}")
+
+        if not 0.0 <= min_factor <= 1.0:
+                    raise ValueError(f"min_factor must be in [0, 1], got {min_factor}")
 
         self.T_max = T_max
         self.eta_min = eta_min
-        self.restart_decay = restart_decay
+        self.eta_min_initial = eta_min  # Store initial eta_min for tracking
+        self.max_factor = max_factor
+        self.min_factor = min_factor
 
         # Track which cycle we're in (0-indexed)
         self.cycle_count = 0
@@ -539,15 +557,18 @@ class DecayingCosineAnnealingLR(torch.optim.lr_scheduler.LRScheduler):
     def get_lr(self):
         """Retrieve the learning rate of each parameter group."""
 
-        # Apply decay at bottom of curve (T_max, 3*T_max, 5*T_max, ...)
-        # This is when the curve reaches eta_min and is about to go back up
+        # Apply decay at multiples of T_max
         if self.last_epoch > 0 and self.last_epoch % self.T_max == 0:
-            # Check if we're at an odd multiple of T_max (bottom of curve)
             cycle_position = self.last_epoch // self.T_max
-            if cycle_position % 2 == 1:  # Odd multiple: T_max, 3*T_max, 5*T_max...
-                # Multiply base_lrs by restart_decay
-                self.base_lrs = [base_lr * self.restart_decay for base_lr in self.base_lrs]
+
+            # At valleys (odd multiples: T_max, 3*T_max, 5*T_max...): decay base_lrs (max LR)
+            if cycle_position % 2 == 1:
+                self.base_lrs = [base_lr * self.max_factor for base_lr in self.base_lrs]
                 self.cycle_count += 1
+
+            # At peaks (even multiples: 2*T_max, 4*T_max, 6*T_max...): decay eta_min (min LR)
+            elif cycle_position % 2 == 0:
+                self.eta_min = self.eta_min * self.min_factor
 
         if self.last_epoch == 0:
             return [group["lr"] for group in self.optimizer.param_groups]
