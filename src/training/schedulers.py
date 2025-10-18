@@ -633,7 +633,10 @@ class DecayingCosineAnnealingLR(torch.optim.lr_scheduler.LRScheduler):
             Dictionary containing scheduler state
         """
         state = super().state_dict()
-        state['restart_decay'] = self.restart_decay
+        state['max_factor'] = self.max_factor
+        state['min_factor'] = self.min_factor
+        state['eta_min'] = self.eta_min
+        state['eta_min_initial'] = self.eta_min_initial
         state['cycle_count'] = self.cycle_count
         return state
 
@@ -645,12 +648,18 @@ class DecayingCosineAnnealingLR(torch.optim.lr_scheduler.LRScheduler):
             state_dict: Scheduler state dict from state_dict()
         """
         # Extract our custom state before calling parent
-        self.restart_decay = state_dict.get('restart_decay', 1.0)
+        self.max_factor = state_dict.get('max_factor', 1.0)
+        self.min_factor = state_dict.get('min_factor', 1.0)
+        self.eta_min = state_dict.get('eta_min', 0)
+        self.eta_min_initial = state_dict.get('eta_min_initial', 0)
         self.cycle_count = state_dict.get('cycle_count', 0)
 
         # Remove our custom keys so parent doesn't complain
         state_dict_copy = state_dict.copy()
-        state_dict_copy.pop('restart_decay', None)
+        state_dict_copy.pop('max_factor', None)
+        state_dict_copy.pop('min_factor', None)
+        state_dict_copy.pop('eta_min', None)
+        state_dict_copy.pop('eta_min_initial', None)
         state_dict_copy.pop('cycle_count', None)
 
         # Call parent load_state_dict
@@ -662,7 +671,8 @@ class DecayingCosineAnnealingLR(torch.optim.lr_scheduler.LRScheduler):
             f"{self.__class__.__name__}("
             f"T_max={self.T_max}, "
             f"eta_min={self.eta_min}, "
-            f"restart_decay={self.restart_decay}, "
+            f"max_factor={self.max_factor}, "
+            f"min_factor={self.min_factor}, "
             f"cycles={self.cycle_count})"
         )
 
