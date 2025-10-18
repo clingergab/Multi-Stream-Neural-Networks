@@ -563,7 +563,11 @@ class DecayingCosineAnnealingLR(torch.optim.lr_scheduler.LRScheduler):
 
             # At valleys (odd multiples: T_max, 3*T_max, 5*T_max...): decay base_lrs (max LR)
             if cycle_position % 2 == 1:
-                self.base_lrs = [base_lr * self.max_factor for base_lr in self.base_lrs]
+                # Decay base_lrs but prevent them from dropping below eta_min
+                self.base_lrs = [
+                    max(base_lr * self.max_factor, self.eta_min)
+                    for base_lr in self.base_lrs
+                ]
                 self.cycle_count += 1
 
             # At peaks (even multiples: 2*T_max, 4*T_max, 6*T_max...): decay eta_min (min LR)

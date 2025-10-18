@@ -19,18 +19,18 @@ def test_dual_decay_strategies():
 
     strategies = [
         {
-            'name': 'Proposed: Narrowing (0.5, 0.8)',
-            'params': {'max_factor': 0.5, 'min_factor': 0.8},
+            'name': 'Original Proposal: (0.4, 0.6) - With Safety',
+            'params': {'max_factor': 0.4, 'min_factor': 0.6},
             'color': 'blue'
         },
         {
-            'name': 'Alternative: Constant (0.65, 0.65)',
-            'params': {'max_factor': 0.65, 'min_factor': 0.65},
+            'name': 'Constant: (0.5, 0.5)',
+            'params': {'max_factor': 0.5, 'min_factor': 0.5},
             'color': 'green'
         },
         {
-            'name': 'Conservative: (0.7, 0.8)',
-            'params': {'max_factor': 0.7, 'min_factor': 0.8},
+            'name': 'Narrowing: (0.45, 0.5)',
+            'params': {'max_factor': 0.45, 'min_factor': 0.5},
             'color': 'orange'
         }
     ]
@@ -42,8 +42,8 @@ def test_dual_decay_strategies():
 
         scheduler = DecayingCosineAnnealingLR(
             optimizer,
-            T_max=20,
-            eta_min=8e-6,  # Match your proposed eta_min
+            T_max=10,  # Shorter cycles (10 epochs instead of 20)
+            eta_min=1e-5,  # Higher min LR (20% of base instead of 16%)
             **strategy['params']
         )
 
@@ -72,9 +72,9 @@ def test_dual_decay_strategies():
         # Format y-axis with scientific notation
         ax.ticklabel_format(style='scientific', axis='y', scilimits=(0,0))
 
-        # Add vertical lines at cycle boundaries
-        for cycle in range(1, 6):
-            ax.axvline(x=cycle*20, color='red', linestyle='--', alpha=0.3, linewidth=1)
+        # Add vertical lines at cycle boundaries (every 10 epochs now)
+        for cycle in range(1, 11):
+            ax.axvline(x=cycle*10, color='red', linestyle='--', alpha=0.3, linewidth=1)
 
         # Annotate decay values
         decay_text = f"Max factor: {strategy['params']['max_factor']}\n"
@@ -106,7 +106,7 @@ def test_dual_decay_strategies():
     for strategy in strategies:
         optimizer = torch.optim.SGD(model.parameters(), lr=5e-5)
         scheduler = DecayingCosineAnnealingLR(
-            optimizer, T_max=20, eta_min=8e-6, **strategy['params']
+            optimizer, T_max=10, eta_min=1e-5, **strategy['params']
         )
 
         print(f"\n{strategy['name']}:")
