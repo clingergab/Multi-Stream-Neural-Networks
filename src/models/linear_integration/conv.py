@@ -260,19 +260,8 @@ class _LIConvNd(nn.Module):
                 init.uniform_(self.integrated_bias, -bound, bound)
 
         # Initialize integration weights (1x1 convolutions for stream mixing)
-        # CRITICAL: Use variance-preserving initialization for deep networks (ResNet50+)
-        # The integrated stream combines 3 independent contributions:
-        #   integrated_out = integrated_from_prev + integrated_from_s1 + integrated_from_s2
-        # When summing N independent variables, output variance = N * input variance
-        # To maintain unit variance, scale each contribution by 1/sqrt(N)
-        # This prevents FP16 overflow in AMP and ensures stable training in deep networks
         init.kaiming_uniform_(self.integration_from_stream1, a=math.sqrt(5))
-        self.integration_from_stream1.data /= math.sqrt(3.0)
         init.kaiming_uniform_(self.integration_from_stream2, a=math.sqrt(5))
-        self.integration_from_stream2.data /= math.sqrt(3.0)
-        # Also scale the integrated pathway weight for consistency
-        init.kaiming_uniform_(self.integrated_weight, a=math.sqrt(5))
-        self.integrated_weight.data /= math.sqrt(3.0)
     
     def extra_repr(self):
         """String representation exactly like _ConvNd."""
