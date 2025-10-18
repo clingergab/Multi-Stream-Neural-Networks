@@ -22,12 +22,14 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
 
     Args:
         optimizer: The optimizer instance
-        scheduler_type: Type of scheduler ('cosine', 'cosine_restarts', 'decaying_cosine_restarts',
-                        'quadratic_inout', 'cubic_inout', 'onecycle', 'step', 'plateau', or None)
+        scheduler_type: Type of scheduler ('cosine', 'decaying_cosine', 'cosine_restarts',
+                        'decaying_cosine_restarts', 'quadratic_inout', 'cubic_inout',
+                        'onecycle', 'step', 'plateau', or None)
         epochs: Number of training epochs
         train_loader_len: Length of the training data loader
         **scheduler_kwargs: Additional arguments for the scheduler
             - For 'cosine': t_max (epochs), eta_min (min LR)
+            - For 'decaying_cosine': t_max (epochs), eta_min (min LR), restart_decay (default=0.8)
             - For 'cosine_restarts': t_0 (cycle length in epochs), t_mult (cycle multiplier),
               eta_min (min LR), step_per_batch (bool, default=False - whether to step per batch instead of per epoch)
             - For 'decaying_cosine_restarts': t_0 (cycle length in epochs), t_mult (cycle multiplier),
@@ -49,6 +51,12 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         t_max = scheduler_kwargs.get('t_max', epochs)
         eta_min = scheduler_kwargs.get('eta_min', 0)
         return CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
+    elif scheduler_type == 'decaying_cosine':
+        # DecayingCosineAnnealingLR - cosine annealing with decaying restarts
+        t_max = scheduler_kwargs.get('t_max', epochs)
+        eta_min = scheduler_kwargs.get('eta_min', 0)
+        restart_decay = scheduler_kwargs.get('restart_decay', 0.8)
+        return DecayingCosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min, restart_decay=restart_decay)
     elif scheduler_type == 'cosine_restarts':
         # CosineAnnealingWarmRestarts - multiple cycles with warm restarts
         # User always specifies t_0 in EPOCHS (intuitive)
@@ -453,6 +461,177 @@ class DecayingCosineAnnealingWarmRestarts:
             f"eta_min={self.eta_min}, "
             f"restart_decay={self.restart_decay}, "
             f"restarts={self.restart_count})"
+        )
+
+
+class DecayingCosineAnnealingLR(torch.optim.lr_scheduler.LRScheduler):
+    """
+    CosineAnnealingLR with decaying restart peaks.
+
+    Uses the EXACT same math as PyTorch's CosineAnnealingLR, but applies a decay
+    multiplier to base_lrs after each T_max cycle is completed.
+
+    Similar to CosineAnnealingLR, but after reaching T_max, instead of restarting
+    to the original peak learning rate, it restarts to a decayed peak (multiplied
+    by restart_decay).
+
+    Pattern:
+        Cycle 1: high = base_lr,                  low = eta_min  (epochs 0 to T_max)
+        Cycle 2: high = base_lr * restart_decay,  low = eta_min  (epochs T_max+1 to 2*T_max)
+        Cycle 3: high = base_lr * restart_decay², low = eta_min  (epochs 2*T_max+1 to 3*T_max)
+        ...
+
+    Example with restart_decay=0.8, T_max=20:
+        Epochs 0-20:   0.100 → 0.001 (cosine)
+        Epochs 21-40:  0.080 → 0.001 (cosine, starts at 80% of original)
+        Epochs 41-60:  0.064 → 0.001 (cosine, starts at 64% of original)
+        Epochs 61-80:  0.051 → 0.001 (cosine, starts at 51% of original)
+
+    Args:
+        optimizer: Wrapped optimizer
+        T_max: Number of epochs for each cycle (constant cycle length)
+        eta_min: Minimum learning rate. Default: 0
+        restart_decay: Multiply peak LR by this after each cycle. Default: 1.0 (no decay)
+        last_epoch: The index of last epoch. Default: -1
+
+    Example:
+        >>> optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        >>> scheduler = DecayingCosineAnnealingLR(
+        ...     optimizer,
+        ...     T_max=20,
+        ...     restart_decay=0.8,
+        ...     eta_min=1e-6
+        ... )
+        >>> for epoch in range(100):
+        ...     train(...)
+        ...     scheduler.step()
+
+    Note:
+        - restart_decay=1.0 behaves identically to CosineAnnealingLR (no decay)
+        - restart_decay=0.8 reduces peak by 20% each cycle (recommended)
+        - restart_decay=0.5 reduces peak by 50% each cycle (aggressive)
+        - T_max is constant (unlike CosineAnnealingWarmRestarts with T_mult)
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        T_max: int,
+        eta_min: float = 0,
+        restart_decay: float = 1.0,
+        last_epoch: int = -1
+    ):
+        if T_max <= 0 or not isinstance(T_max, int):
+            raise ValueError(f"T_max must be a positive integer, got {T_max}")
+        if not 0.0 <= restart_decay <= 1.0:
+            raise ValueError(f"restart_decay must be in [0, 1], got {restart_decay}")
+
+        self.T_max = T_max
+        self.eta_min = eta_min
+        self.restart_decay = restart_decay
+
+        # Track which cycle we're in (0-indexed)
+        self.cycle_count = 0
+
+        # Call parent __init__ which will call step(0) if last_epoch == -1
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        """Retrieve the learning rate of each parameter group."""
+
+        # Apply decay at bottom of curve (T_max, 3*T_max, 5*T_max, ...)
+        # This is when the curve reaches eta_min and is about to go back up
+        if self.last_epoch > 0 and self.last_epoch % self.T_max == 0:
+            # Check if we're at an odd multiple of T_max (bottom of curve)
+            cycle_position = self.last_epoch // self.T_max
+            if cycle_position % 2 == 1:  # Odd multiple: T_max, 3*T_max, 5*T_max...
+                # Multiply base_lrs by restart_decay
+                self.base_lrs = [base_lr * self.restart_decay for base_lr in self.base_lrs]
+                self.cycle_count += 1
+
+        if self.last_epoch == 0:
+            return [group["lr"] for group in self.optimizer.param_groups]
+        elif self._step_count == 1 and self.last_epoch > 0:
+            return [
+                self.eta_min
+                + (base_lr - self.eta_min)
+                * (1 + math.cos((self.last_epoch) * math.pi / self.T_max))
+                / 2
+                for base_lr, group in zip(self.base_lrs, self.optimizer.param_groups)
+            ]
+        elif (self.last_epoch - 1 - self.T_max) % (2 * self.T_max) == 0:
+            return [
+                group["lr"]
+                + (base_lr - self.eta_min) * (1 - math.cos(math.pi / self.T_max)) / 2
+                for base_lr, group in zip(self.base_lrs, self.optimizer.param_groups)
+            ]
+        return [
+            (1 + math.cos(math.pi * self.last_epoch / self.T_max))
+            / (1 + math.cos(math.pi * (self.last_epoch - 1) / self.T_max))
+            * (group["lr"] - self.eta_min)
+            + self.eta_min
+            for group in self.optimizer.param_groups
+        ]
+
+    def _get_closed_form_lr(self):
+        return [
+            self.eta_min
+            + (base_lr - self.eta_min)
+            * (1 + math.cos(math.pi * self.last_epoch / self.T_max))
+            / 2
+            for base_lr in self.base_lrs
+        ]
+    
+
+    @property
+    def current_peak_lrs(self):
+        """
+        Return current peak learning rates (after decay).
+
+        Returns:
+            List of current peak LRs for each parameter group
+        """
+        return self.base_lrs.copy()
+
+    def state_dict(self):
+        """
+        Returns the state of the scheduler as a dict.
+
+        Returns:
+            Dictionary containing scheduler state
+        """
+        state = super().state_dict()
+        state['restart_decay'] = self.restart_decay
+        state['cycle_count'] = self.cycle_count
+        return state
+
+    def load_state_dict(self, state_dict):
+        """
+        Loads the scheduler state.
+
+        Args:
+            state_dict: Scheduler state dict from state_dict()
+        """
+        # Extract our custom state before calling parent
+        self.restart_decay = state_dict.get('restart_decay', 1.0)
+        self.cycle_count = state_dict.get('cycle_count', 0)
+
+        # Remove our custom keys so parent doesn't complain
+        state_dict_copy = state_dict.copy()
+        state_dict_copy.pop('restart_decay', None)
+        state_dict_copy.pop('cycle_count', None)
+
+        # Call parent load_state_dict
+        super().load_state_dict(state_dict_copy)
+
+    def __repr__(self):
+        """String representation of the scheduler."""
+        return (
+            f"{self.__class__.__name__}("
+            f"T_max={self.T_max}, "
+            f"eta_min={self.eta_min}, "
+            f"restart_decay={self.restart_decay}, "
+            f"cycles={self.cycle_count})"
         )
 
 
