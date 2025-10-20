@@ -537,23 +537,36 @@ class DecayingCosineAnnealingLR(torch.optim.lr_scheduler.LRScheduler):
         optimizer: torch.optim.Optimizer,
         T_max: int,
         eta_min: float = 0,
-        max_factor: float = 1.0,
-        min_factor: float = 1.0,
+        max_factor = 1.0,  # Can be float or callable
+        min_factor = 1.0,  # Can be float or callable
         last_epoch: int = -1
     ):
         if T_max <= 0 or not isinstance(T_max, int):
             raise ValueError(f"T_max must be a positive integer, got {T_max}")
-        if not 0.0 <= max_factor <= 1.0:
-            raise ValueError(f"max_factor must be in [0, 1], got {max_factor}")
-
-        if not 0.0 <= min_factor <= 1.0:
-                    raise ValueError(f"min_factor must be in [0, 1], got {min_factor}")
 
         self.T_max = T_max
         self.eta_min = eta_min
         self.eta_min_initial = eta_min  # Store initial eta_min for tracking
-        self.max_factor = max_factor
-        self.min_factor = min_factor
+
+        # Handle max_factor (can be constant or callable)
+        if callable(max_factor):
+            self.max_factor_fn = max_factor
+            self.max_factor = None  # Will be computed dynamically
+        else:
+            if not 0.0 <= max_factor <= 1.0:
+                raise ValueError(f"max_factor must be in [0, 1], got {max_factor}")
+            self.max_factor = max_factor
+            self.max_factor_fn = None
+
+        # Handle min_factor (can be constant or callable)
+        if callable(min_factor):
+            self.min_factor_fn = min_factor
+            self.min_factor = None  # Will be computed dynamically
+        else:
+            if not 0.0 <= min_factor <= 1.0:
+                raise ValueError(f"min_factor must be in [0, 1], got {min_factor}")
+            self.min_factor = min_factor
+            self.min_factor_fn = None
 
         # Track which cycle we're in (0-indexed)
         self.cycle_count = 0
@@ -570,16 +583,28 @@ class DecayingCosineAnnealingLR(torch.optim.lr_scheduler.LRScheduler):
 
             # At valleys (odd multiples: T_max, 3*T_max, 5*T_max...): decay base_lrs (max LR)
             if cycle_position % 2 == 1:
-                # Decay base_lrs but prevent them from dropping below eta_min
-                self.base_lrs = [
-                    max(base_lr * self.max_factor, self.eta_min)
-                    for base_lr in self.base_lrs
-                ]
+                if self.max_factor_fn:
+                    # Callable: apply function to current base_lrs
+                    self.base_lrs = [
+                        max(self.max_factor_fn(base_lr), self.eta_min)
+                        for base_lr in self.base_lrs
+                    ]
+                else:
+                    # Constant: multiply current base_lrs by factor
+                    self.base_lrs = [
+                        max(base_lr * self.max_factor, self.eta_min)
+                        for base_lr in self.base_lrs
+                    ]
                 self.cycle_count += 1
 
             # At peaks (even multiples: 2*T_max, 4*T_max, 6*T_max...): decay eta_min (min LR)
             elif cycle_position % 2 == 0:
-                self.eta_min = self.eta_min * self.min_factor
+                if self.min_factor_fn:
+                    # Callable: apply function to current eta_min
+                    self.eta_min = self.min_factor_fn(self.eta_min)
+                else:
+                    # Constant: multiply current eta_min by factor
+                    self.eta_min = self.eta_min * self.min_factor
 
         if self.last_epoch == 0:
             return [group["lr"] for group in self.optimizer.param_groups]
