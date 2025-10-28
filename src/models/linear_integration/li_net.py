@@ -804,8 +804,6 @@ class LINet(BaseModel):
 
         # Set up scheduler
         self.scheduler = setup_scheduler(self.optimizer, self.scheduler_type, epochs, len(train_loader), **scheduler_kwargs)
-        print(f"Scheduler base_lrs = {self.scheduler.base_lrs}")
-        print(f"Scheduler eta_min = {self.scheduler.eta_min}")
 
         for epoch in range(epochs):
             # Calculate total steps for this epoch (training + validation)
