@@ -650,8 +650,7 @@ class LINet(BaseModel):
         stream_early_stopping: bool = False,  # Enable stream-specific early stopping (freezes streams when they plateau)
         stream1_patience: int = 10,  # Patience for Stream1 (RGB) before freezing
         stream2_patience: int = 10,  # Patience for Stream2 (Depth) before freezing
-        stream_min_delta: float = 0.001,  # Minimum improvement for stream early stopping
-        **scheduler_kwargs
+        stream_min_delta: float = 0.001  # Minimum improvement for stream early stopping
     ) -> dict:
         """
         Train the model with optional early stopping.
@@ -685,15 +684,6 @@ class LINet(BaseModel):
             stream1_patience: Number of epochs to wait before freezing Stream1 (RGB) if no improvement
             stream2_patience: Number of epochs to wait before freezing Stream2 (Depth) if no improvement
             stream_min_delta: Minimum improvement for stream metrics to count as progress
-            **scheduler_kwargs: Additional arguments for the scheduler:
-                - For 'step' scheduler: step_size, gamma
-                - For 'cosine' scheduler: t_max, eta_min
-                - For 'cosine_restarts' scheduler: t_0 (cycle length in epochs), t_mult (cycle multiplier),
-                  eta_min (min LR), step_per_batch (bool, default=False - step per batch instead of per epoch)
-                - For 'plateau' scheduler: scheduler_patience (or patience), factor
-                  Note: Use 'scheduler_patience' to avoid conflict with early stopping patience
-                - For 'onecycle' scheduler: steps_per_epoch (required), max_lr, pct_start,
-                  anneal_strategy, div_factor, final_div_factor
 
         Returns:
             Training history dictionary
@@ -788,7 +778,6 @@ class LINet(BaseModel):
             'train_accuracy': [],
             'val_accuracy': [],
             'learning_rates': [],
-            'scheduler_kwargs': scheduler_kwargs,  # Save scheduler parameters for reproducibility
             # Stream-specific metrics (populated if stream_monitoring=True)
             'stream1_train_acc': [],
             'stream1_val_acc': [],
@@ -802,8 +791,7 @@ class LINet(BaseModel):
             'streams_frozen': []  # List of (epoch, stream_name) tuples
         }
 
-        # Set up scheduler
-        self.scheduler = setup_scheduler(self.optimizer, self.scheduler_type, epochs, len(train_loader), **scheduler_kwargs)
+        # Scheduler is already set by compile(), no need to create it here
 
         for epoch in range(epochs):
             # Calculate total steps for this epoch (training + validation)

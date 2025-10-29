@@ -2,7 +2,8 @@
 Custom learning rate schedulers for multi-stream neural networks.
 
 This module provides custom schedulers that extend PyTorch's built-in schedulers
-with additional functionality useful for multi-stream learning.
+with additional functionality useful for multi-stream learning, including warmup
+support.
 """
 
 import math
@@ -12,13 +13,17 @@ from torch.optim.lr_scheduler import (
     CosineAnnealingWarmRestarts,
     OneCycleLR,
     StepLR,
-    ReduceLROnPlateau
+    ReduceLROnPlateau,
+    SequentialLR,
+    LinearLR
 )
 
 
 def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_len: int, **scheduler_kwargs):
     """
     Set up and return the learning rate scheduler based on the scheduler type.
+
+    Supports warmup for all scheduler types via the 'warmup_epochs' parameter.
 
     Args:
         optimizer: The optimizer instance
@@ -28,6 +33,8 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         epochs: Number of training epochs
         train_loader_len: Length of the training data loader
         **scheduler_kwargs: Additional arguments for the scheduler
+            - warmup_epochs (int): Number of warmup epochs (0 = no warmup). Default: 0
+            - warmup_start_factor (float): Initial LR multiplier during warmup. Default: 0.1
             - For 'cosine': t_max (epochs), eta_min (min LR)
             - For 'decaying_cosine': t_max (epochs), eta_min (min LR), max_factor (default=1.0), min_factor (default=1.0)
             - For 'cosine_restarts': t_0 (cycle length in epochs), t_mult (cycle multiplier),
@@ -42,22 +49,34 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
 
     Returns:
         Scheduler instance or None if no scheduler requested
+
+    Example with warmup:
+        >>> # 5 epochs of warmup, then cosine annealing
+        >>> scheduler = setup_scheduler(
+        ...     optimizer, 'cosine', epochs=80, train_loader_len=40,
+        ...     warmup_epochs=5, warmup_start_factor=0.1, t_max=80
+        ... )
     """
     if not scheduler_type:
         return None
+
+    # Extract warmup parameters
+    warmup_epochs = scheduler_kwargs.pop('warmup_epochs', 0)
+    warmup_start_factor = scheduler_kwargs.pop('warmup_start_factor', 0.1)
         
+    # Create the main scheduler based on type
     if scheduler_type == 'cosine':
         # T_max is in epochs (scheduler steps per epoch, not per batch)
         t_max = scheduler_kwargs.get('t_max', epochs)
         eta_min = scheduler_kwargs.get('eta_min', 0)
-        return CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
+        main_scheduler = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
     elif scheduler_type == 'decaying_cosine':
         # DecayingCosineAnnealingLR - cosine annealing with dual decay (max and min)
         t_max = scheduler_kwargs.get('t_max', epochs)
         eta_min = scheduler_kwargs.get('eta_min', 0)
         max_factor = scheduler_kwargs.get('max_factor', 1.0)
-        min_factor = scheduler_kwargs.get('min_factor', 1.0) 
-        return DecayingCosineAnnealingLR(
+        min_factor = scheduler_kwargs.get('min_factor', 1.0)
+        main_scheduler = DecayingCosineAnnealingLR(
             optimizer,
             T_max=t_max,
             eta_min=eta_min,
@@ -80,10 +99,9 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
             # Keep in epochs for per-epoch stepping (default)
             t_0 = t_0_epochs
 
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=t_0, T_mult=t_mult, eta_min=eta_min)
+        main_scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=t_0, T_mult=t_mult, eta_min=eta_min)
         # Add metadata so mc_resnet.py knows whether to step per batch or per epoch
-        scheduler._step_per_batch = step_per_batch
-        return scheduler
+        main_scheduler._step_per_batch = step_per_batch
     elif scheduler_type == 'decaying_cosine_restarts':
         # DecayingCosineAnnealingWarmRestarts - warm restarts with decaying peak LR
         # User always specifies t_0 in EPOCHS (intuitive)
@@ -101,12 +119,11 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
             # Keep in epochs for per-epoch stepping (default)
             t_0 = t_0_epochs
 
-        scheduler = DecayingCosineAnnealingWarmRestarts(
+        main_scheduler = DecayingCosineAnnealingWarmRestarts(
             optimizer, T_0=t_0, T_mult=t_mult, eta_min=eta_min, restart_decay=restart_decay
         )
         # Add metadata so mc_resnet.py knows whether to step per batch or per epoch
-        scheduler._step_per_batch = step_per_batch
-        return scheduler
+        main_scheduler._step_per_batch = step_per_batch
     elif scheduler_type == 'onecycle':
         # For OneCycleLR, we need total number of steps (epochs * steps_per_epoch)
         steps_per_epoch = scheduler_kwargs.get('steps_per_epoch', train_loader_len)
@@ -120,7 +137,7 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         final_div_factor = scheduler_kwargs.get('final_div_factor', 1e4)
 
         # Create the OneCycleLR scheduler with calculated total_steps
-        return OneCycleLR(
+        main_scheduler = OneCycleLR(
             optimizer,
             max_lr=max_lr,
             total_steps=epochs * steps_per_epoch,
@@ -133,16 +150,16 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         # Quadratic InOut easing - smooth S-curve with quadratic acceleration/deceleration
         t_max = scheduler_kwargs.get('t_max', epochs)
         eta_min = scheduler_kwargs.get('eta_min', 0)
-        return QuadraticInOutLR(optimizer, T_max=t_max, eta_min=eta_min)
+        main_scheduler = QuadraticInOutLR(optimizer, T_max=t_max, eta_min=eta_min)
     elif scheduler_type == 'cubic_inout':
         # Cubic InOut easing - very smooth S-curve with cubic acceleration/deceleration
         t_max = scheduler_kwargs.get('t_max', epochs)
         eta_min = scheduler_kwargs.get('eta_min', 0)
-        return CubicInOutLR(optimizer, T_max=t_max, eta_min=eta_min)
+        main_scheduler = CubicInOutLR(optimizer, T_max=t_max, eta_min=eta_min)
     elif scheduler_type == 'step':
         step_size = scheduler_kwargs.get('step_size', 30)
         gamma = scheduler_kwargs.get('gamma', 0.1)
-        return StepLR(optimizer, step_size=step_size, gamma=gamma)
+        main_scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
     elif scheduler_type == 'plateau':
         # Use scheduler_patience if provided, otherwise fall back to patience from scheduler_kwargs
         scheduler_patience = scheduler_kwargs.get('scheduler_patience', scheduler_kwargs.get('patience', 5))
@@ -152,11 +169,35 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         threshold = scheduler_kwargs.get('threshold', 1e-4)  # Minimum change to qualify as improvement
         cooldown = scheduler_kwargs.get('cooldown', 0)  # Cooldown period after LR reduction
         eps = scheduler_kwargs.get('eps', 1e-8)  # Minimal decay applied to lr
-        return ReduceLROnPlateau(
+        main_scheduler = ReduceLROnPlateau(
             optimizer, mode=mode, patience=scheduler_patience, factor=factor, min_lr=min_lr, threshold=threshold, cooldown=cooldown, eps=eps
         )
     else:
         raise ValueError(f"Unsupported scheduler type: {scheduler_type}")
+
+    # Apply warmup if requested
+    if warmup_epochs > 0:
+        # Create warmup scheduler using LinearLR
+        # LinearLR interpolates from start_factor to 1.0 over total_iters
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=warmup_start_factor,
+            end_factor=1.0,
+            total_iters=warmup_epochs
+        )
+
+        # Use SequentialLR to chain warmup + main scheduler
+        # Milestones specify when to switch schedulers (in epochs)
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[warmup_epochs]
+        )
+
+        return scheduler
+    else:
+        # No warmup, return main scheduler directly
+        return main_scheduler
 
 def update_scheduler(scheduler, val_loss: float) -> None:
     """

@@ -124,8 +124,89 @@ class BaseModel(nn.Module, ABC):
         self.optimizer = None
         self.criterion = None
         self.scheduler = None
-        self.scheduler_type = None
-    
+
+    def get_stream_parameter_groups(self,
+                                     stream1_lr: float,
+                                     stream2_lr: float,
+                                     shared_lr: float,
+                                     stream1_weight_decay: float = 0.0,
+                                     stream2_weight_decay: float = 0.0,
+                                     shared_weight_decay: float = 0.0):
+        """
+        Helper method to create stream-specific parameter groups for multi-stream models.
+
+        This is useful when you want different learning rates or weight decay for different
+        streams in your model. Use this to create parameter groups, then pass them to your
+        optimizer.
+
+        Args:
+            stream1_lr: Learning rate for stream1 (RGB/color) parameters
+            stream2_lr: Learning rate for stream2 (depth/brightness) parameters
+            shared_lr: Learning rate for shared/fusion parameters
+            stream1_weight_decay: Weight decay for stream1 parameters (default: 0.0)
+            stream2_weight_decay: Weight decay for stream2 parameters (default: 0.0)
+            shared_weight_decay: Weight decay for shared/fusion parameters (default: 0.0)
+
+        Returns:
+            List of parameter group dictionaries that can be passed to PyTorch optimizers
+
+        Example:
+            >>> # Get stream-specific parameter groups
+            >>> param_groups = model.get_stream_parameter_groups(
+            ...     stream1_lr=2e-4, stream2_lr=7e-4, shared_lr=5e-4,
+            ...     stream1_weight_decay=1e-4, stream2_weight_decay=2e-4, shared_weight_decay=1.5e-4
+            ... )
+            >>>
+            >>> # Create optimizer with these groups
+            >>> optimizer = torch.optim.AdamW(param_groups)
+            >>>
+            >>> # Create scheduler
+            >>> from src.training.schedulers import setup_scheduler
+            >>> scheduler = setup_scheduler(optimizer, 'decaying_cosine', epochs=80, train_loader_len=40)
+            >>>
+            >>> # Compile and train
+            >>> model.compile(optimizer=optimizer, scheduler=scheduler, loss='cross_entropy')
+            >>> model.fit(train_loader, val_loader, epochs=80)
+        """
+        # Separate parameters by stream based on naming convention
+        stream1_params = []
+        stream2_params = []
+        shared_params = []
+
+        for name, param in self.named_parameters():
+            if 'stream1' in name:
+                stream1_params.append(param)
+            elif 'stream2' in name:
+                stream2_params.append(param)
+            else:
+                shared_params.append(param)
+
+        # Create parameter groups (only include groups that have parameters)
+        param_groups = []
+
+        if stream1_params:
+            param_groups.append({
+                'params': stream1_params,
+                'lr': stream1_lr,
+                'weight_decay': stream1_weight_decay
+            })
+
+        if stream2_params:
+            param_groups.append({
+                'params': stream2_params,
+                'lr': stream2_lr,
+                'weight_decay': stream2_weight_decay
+            })
+
+        if shared_params:
+            param_groups.append({
+                'params': shared_params,
+                'lr': shared_lr,
+                'weight_decay': shared_weight_decay
+            })
+
+        return param_groups
+
     @abstractmethod
     def _build_network(self, block: type, layers: list[int], replace_stride_with_dilation: list[bool]):
         """
@@ -190,169 +271,84 @@ class BaseModel(nn.Module, ABC):
         """
         pass
 
-    def compile(self, optimizer: str = 'adam', learning_rate: float = None,
-                weight_decay: float = None, loss: str = 'cross_entropy',
-                metrics: List[str] = None, scheduler: str = None,
-                min_lr: float = 1e-6,
-                # Stream-specific optimization parameters
-                stream1_lr: float = None,
-                stream2_lr: float = None,
-                stream1_weight_decay: float = None,
-                stream2_weight_decay: float = None,
+    def compile(self,
+                optimizer: torch.optim.Optimizer,
+                loss: str = 'cross_entropy',
+                scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+                metrics: Optional[List[str]] = None,
                 **kwargs):
         """
-        Compile the model with the specified optimization parameters.
+        Compile the model with optimizer, loss, and scheduler (Keras-style API).
+
+        Following the Keras philosophy:
+        - compile() = Configuration (what to optimize)
+        - fit() = Execution (how to train)
 
         Args:
-            optimizer: Optimizer name ('adam', 'adamw', 'sgd', 'rmsprop')
-            learning_rate: Learning rate (uses class default if None)
-            weight_decay: Weight decay for regularization (uses class default if None)
+            optimizer: PyTorch optimizer instance (e.g., torch.optim.AdamW(...))
+                      Users must create the optimizer with desired parameters before calling compile()
             loss: Loss function name ('cross_entropy', 'focal')
-            metrics: List of metrics to track
-            scheduler: Learning rate scheduler (uses class default if None)
-            min_lr: Minimum learning rate for schedulers
-            stream1_lr: Learning rate for stream1 pathway (if None, uses learning_rate)
-            stream2_lr: Learning rate for stream2 pathway (if None, uses learning_rate)
-            stream1_weight_decay: Weight decay for stream1 pathway (if None, uses weight_decay)
-            stream2_weight_decay: Weight decay for stream2 pathway (if None, uses weight_decay)
-            device: Device to use for computation ('cpu', 'cuda', 'mps', etc.)
-            use_amp: Whether to use automatic mixed precision training (only for CUDA)
-            **kwargs: Additional arguments for optimizers and loss functions
+            scheduler: Optional PyTorch LR scheduler instance (e.g., from setup_scheduler())
+                      If None, no learning rate scheduling is applied
+            metrics: List of metrics to track during training (default: ['accuracy'])
+            **kwargs: Additional arguments for loss functions (e.g., label_smoothing, alpha, gamma)
+
+        Example:
+            >>> # Option 1: Simple optimizer (single learning rate for all parameters)
+            >>> optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+            >>>
+            >>> # Option 2: Stream-specific learning rates using helper method
+            >>> param_groups = model.get_stream_parameter_groups(
+            ...     stream1_lr=2e-4, stream2_lr=7e-4, shared_lr=5e-4,
+            ...     stream1_weight_decay=1e-4, stream2_weight_decay=2e-4, shared_weight_decay=1.5e-4
+            ... )
+            >>> optimizer = torch.optim.AdamW(param_groups)
+            >>>
+            >>> # Create scheduler using public setup_scheduler() function
+            >>> from src.training.schedulers import setup_scheduler
+            >>> scheduler = setup_scheduler(
+            ...     optimizer, 'decaying_cosine', epochs=80, train_loader_len=40,
+            ...     t_max=10, eta_min=6e-5, max_factor=0.6, min_factor=0.6
+            ... )
+            >>>
+            >>> # Compile model with optimizer and scheduler objects
+            >>> model.compile(optimizer=optimizer, scheduler=scheduler, loss='cross_entropy')
+            >>>
+            >>> # Train model
+            >>> model.fit(train_loader, val_loader, epochs=80)
+
+        Returns:
+            self (for method chaining)
         """
-        # Use architecture-specific defaults if not specified
-        config = self.DEFAULT_COMPILE_CONFIG.copy()
-        
-        # Set defaults for unspecified parameters
-        if learning_rate is None:
-            learning_rate = config['learning_rate']
-        if weight_decay is None:
-            weight_decay = config['weight_decay']
-        if scheduler is None:
-            scheduler = config['scheduler']
-        
+        # Validate optimizer
+        if not isinstance(optimizer, torch.optim.Optimizer):
+            raise TypeError(
+                f"optimizer must be a torch.optim.Optimizer instance, got {type(optimizer)}. "
+                "Create your optimizer before calling compile(). Example:\n"
+                "  optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)"
+            )
+
+        # Store optimizer
+        self.optimizer = optimizer
+
+        # Store scheduler (can be None)
+        if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler._LRScheduler):
+            # Also check for custom schedulers that don't inherit from _LRScheduler
+            if not hasattr(scheduler, 'step'):
+                raise TypeError(
+                    f"scheduler must be a PyTorch LRScheduler instance or have a step() method, "
+                    f"got {type(scheduler)}. Create your scheduler before calling compile(). Example:\n"
+                    "  from src.training.schedulers import setup_scheduler\n"
+                    "  scheduler = setup_scheduler(optimizer, 'cosine', epochs=80, train_loader_len=40)"
+                )
+        self.scheduler = scheduler
+
         # Set default metrics if not provided
         if metrics is None:
             metrics = ['accuracy']
-        
-        # Note: Device and mixed precision are already set in constructor
-        
-        # Store scheduler type for use in fit method
-        self.scheduler_type = scheduler
-        
-        # Filter optimizer-specific kwargs using whitelist approach
-        # Define allowed parameters for each optimizer
-        common_optimizer_params = {'eps', 'amsgrad', 'maximize'}
-        adam_params = common_optimizer_params | {'betas'}
-        # Note: For SGD, 'momentum', 'dampening', and 'nesterov' are handled explicitly
-        # to provide sensible defaults and enforce PyTorch constraints
-        sgd_params = common_optimizer_params
-        adamw_params = adam_params  # AdamW uses same params as Adam
-        
-        # Get allowed parameters based on optimizer
-        if optimizer.lower() == 'adam':
-            allowed_params = adam_params
-        elif optimizer.lower() == 'sgd':
-            allowed_params = sgd_params
-        elif optimizer.lower() == 'adamw':
-            allowed_params = adamw_params
-        else:
-            allowed_params = common_optimizer_params
-        
-        # Filter kwargs to only include allowed optimizer parameters
-        optimizer_kwargs = {k: v for k, v in kwargs.items() if k in allowed_params}
 
-        # Extract eps from optimizer_kwargs to avoid duplicate keyword argument error
-        # (we set default eps=1e-8 explicitly, but user might pass custom eps)
-        eps = optimizer_kwargs.pop('eps', 1e-8)
-
-        # Check if stream-specific optimization is requested
-        use_stream_specific = any([stream1_lr is not None, stream2_lr is not None,
-                                   stream1_weight_decay is not None, stream2_weight_decay is not None])
-
-        if use_stream_specific:
-            # Set defaults for stream-specific parameters
-            stream1_lr = stream1_lr if stream1_lr is not None else learning_rate
-            stream2_lr = stream2_lr if stream2_lr is not None else learning_rate
-            stream1_weight_decay = stream1_weight_decay if stream1_weight_decay is not None else weight_decay
-            stream2_weight_decay = stream2_weight_decay if stream2_weight_decay is not None else weight_decay
-
-            # Separate parameters by stream
-            stream1_params = []
-            stream2_params = []
-            shared_params = []
-
-            for name, param in self.named_parameters():
-                if 'stream1' in name:
-                    stream1_params.append(param)
-                elif 'stream2' in name:
-                    stream2_params.append(param)
-                else:
-                    shared_params.append(param)
-
-            # Create parameter groups
-            param_groups = []
-            if stream1_params:
-                param_groups.append({'params': stream1_params, 'lr': stream1_lr, 'weight_decay': stream1_weight_decay})
-            if stream2_params:
-                param_groups.append({'params': stream2_params, 'lr': stream2_lr, 'weight_decay': stream2_weight_decay})
-            if shared_params:
-                param_groups.append({'params': shared_params, 'lr': learning_rate, 'weight_decay': weight_decay})
-
-            # Configure optimizer with parameter groups
-            if optimizer.lower() == 'adam':
-                self.optimizer = torch.optim.Adam(param_groups, eps=eps, **optimizer_kwargs)
-            elif optimizer.lower() == 'adamw':
-                self.optimizer = torch.optim.AdamW(param_groups, eps=eps, **optimizer_kwargs)
-            elif optimizer.lower() == 'sgd':
-                momentum = kwargs.get('momentum', 0.9)
-                nesterov = kwargs.get('nesterov', True)
-                dampening = kwargs.get('dampening', 0)
-                if nesterov and dampening != 0:
-                    raise ValueError("Nesterov momentum requires zero dampening. Either disable nesterov or set dampening=0")
-                self.optimizer = torch.optim.SGD(
-                    param_groups,
-                    momentum=momentum,
-                    dampening=dampening,
-                    nesterov=nesterov,
-                    **optimizer_kwargs
-                )
-            elif optimizer.lower() == 'rmsprop':
-                self.optimizer = torch.optim.RMSprop(param_groups, momentum=0.9, **optimizer_kwargs)
-            else:
-                raise ValueError(f"Unsupported optimizer: {optimizer}")
-        else:
-            # Standard single-LR optimization
-            if optimizer.lower() == 'adam':
-                self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=eps, **optimizer_kwargs)
-            elif optimizer.lower() == 'adamw':
-                self.optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate, weight_decay=weight_decay, eps=eps, **optimizer_kwargs)
-            elif optimizer.lower() == 'sgd':
-                # Use SGD with Nesterov momentum (standard practice)
-                # momentum and nesterov are handled explicitly (not in optimizer_kwargs) to provide defaults
-                momentum = kwargs.get('momentum', 0.9)
-                nesterov = kwargs.get('nesterov', True)
-                # PyTorch constraint: Nesterov requires zero dampening
-                # If user wants custom dampening, they must disable nesterov
-                dampening = kwargs.get('dampening', 0)
-                if nesterov and dampening != 0:
-                    raise ValueError("Nesterov momentum requires zero dampening. Either disable nesterov or set dampening=0")
-                self.optimizer = torch.optim.SGD(
-                    self.parameters(),
-                    lr=learning_rate,
-                    momentum=momentum,
-                    dampening=dampening,
-                    weight_decay=weight_decay,
-                    nesterov=nesterov,
-                    **optimizer_kwargs
-                )
-            elif optimizer.lower() == 'rmsprop':
-                self.optimizer = torch.optim.RMSprop(self.parameters(), lr=learning_rate, weight_decay=weight_decay, momentum=0.9, **optimizer_kwargs)
-            else:
-                raise ValueError(f"Unsupported optimizer: {optimizer}")
-        
-        # Configure loss function - only standard losses supported
+        # Configure loss function
         if loss.lower() == 'cross_entropy':
-            # Add label smoothing for better regularization (prevents overconfident predictions)
             label_smoothing = kwargs.get('label_smoothing', 0.0)
             self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         elif loss.lower() == 'focal':
@@ -360,34 +356,45 @@ class BaseModel(nn.Module, ABC):
             gamma = kwargs.get('gamma', 2.0)
             self.criterion = FocalLoss(alpha=alpha, gamma=gamma)
         else:
-            raise ValueError(f"Unsupported loss function: {loss}. Supported losses: 'cross_entropy', 'focal'")
-        
-        # Store configuration in a centralized dictionary
+            raise ValueError(f"Unsupported loss function: {loss}. Supported: 'cross_entropy', 'focal'")
+
+        # Extract optimizer info for logging
+        optimizer_name = optimizer.__class__.__name__
+        base_lr = optimizer.param_groups[0]['lr'] if optimizer.param_groups else 'N/A'
+        scheduler_name = scheduler.__class__.__name__ if scheduler else 'None'
+
+        # Store configuration
         self.training_config = {
-            'optimizer': optimizer.lower(),
-            'learning_rate': learning_rate,
-            'weight_decay': weight_decay,
+            'optimizer': optimizer_name,
+            'base_lr': base_lr,
             'loss': loss.lower(),
-            'metrics': metrics or ['accuracy'],
-            'scheduler': scheduler.lower() if scheduler else 'none',
-            'min_lr': min_lr,
+            'metrics': metrics,
+            'scheduler': scheduler_name,
             'device': str(self.device),
-            'use_amp': self.use_amp  # Use the attribute set in constructor
+            'use_amp': self.use_amp,
+            'num_param_groups': len(optimizer.param_groups)
         }
-        
+
         # Set compilation flag
         self.is_compiled = True
-        
-        # Scheduler will be configured in fit() with actual training parameters
-        self.scheduler = None
-        
+
         # Log compilation details
         model_name = self.__class__.__name__
-        print(f"{model_name} compiled with {optimizer} optimizer, {loss} loss")
-        print(f"  Learning rate: {learning_rate}, Weight decay: {weight_decay}, Scheduler: {scheduler}")
-        print(f"  Device: {self.device}, AMP: {self.use_amp}, Groups: {self.groups}, Width per group: {self.base_width}")
-        print("  Using architecture-specific defaults where applicable")
-        
+        print(f"{model_name} compiled with {optimizer_name} optimizer, {loss} loss")
+
+        # Log parameter groups info
+        if len(optimizer.param_groups) > 1:
+            print(f"  Using {len(optimizer.param_groups)} parameter groups:")
+            for i, pg in enumerate(optimizer.param_groups):
+                lr = pg.get('lr', 'N/A')
+                wd = pg.get('weight_decay', 'N/A')
+                print(f"    Group {i+1}: lr={lr:.2e}, weight_decay={wd:.2e}")
+        else:
+            print(f"  Learning rate: {base_lr:.2e}")
+
+        print(f"  Scheduler: {scheduler_name}")
+        print(f"  Device: {self.device}, AMP: {self.use_amp}")
+
         return self
     
     @abstractmethod
@@ -409,15 +416,14 @@ class BaseModel(nn.Module, ABC):
             patience: int = 10,
             min_delta: float = 0.001,
             monitor: str = 'val_loss',
-            restore_best_weights: bool = True,
-            **scheduler_kwargs):
+            restore_best_weights: bool = True):
         """
         Train the model.
-        
+
         This method supports two input modes:
         1. Direct data arrays: stream1_data, stream2_data, labels
         2. DataLoader: train_loader (containing color, brightness, labels)
-        
+
         Args:
             train_loader: DataLoader for training data (if not using direct arrays)
             val_loader: DataLoader for validation data (if not using direct arrays)
@@ -437,8 +443,7 @@ class BaseModel(nn.Module, ABC):
             min_delta: Minimum change to qualify as an improvement
             monitor: Metric to monitor ('val_loss' or 'val_accuracy')
             restore_best_weights: Whether to restore best weights when early stopping
-            **scheduler_kwargs: Additional arguments for the scheduler
-            
+
         Returns:
             Training history or results
         """
