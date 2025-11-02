@@ -129,32 +129,32 @@ class SUNRGBDDataset(Dataset):
                 rgb = transforms.functional.resize(rgb, self.target_size)
                 depth = transforms.functional.resize(depth, self.target_size)
 
-            # 3. RGB-Only: Color Jitter (50% probability - REDUCED for stream balance)
+            # 3. RGB-Only: Color Jitter (43% probability - BALANCED for 1.5x ratio)
             # Applies brightness, contrast, saturation, hue adjustments
-            # Moderate augmentation to balance RGB/Depth performance (was 75%)
-            if np.random.random() < 0.50:
+            # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 75%)
+            if np.random.random() < 0.43:
                 color_jitter = transforms.ColorJitter(
-                    brightness=0.4,  # ±40% (reduced from ±50% for balance)
-                    contrast=0.4,    # ±40% (reduced from ±50% for balance)
-                    saturation=0.4,  # ±40% (reduced from ±50% for balance)
-                    hue=0.12         # ±12% (reduced from ±15% for balance)
+                    brightness=0.37,  # ±37% (balanced for 1.5x ratio)
+                    contrast=0.37,    # ±37% (balanced for 1.5x ratio)
+                    saturation=0.37,  # ±37% (balanced for 1.5x ratio)
+                    hue=0.11          # ±11% (balanced for 1.5x ratio)
                 )
                 rgb = color_jitter(rgb)
 
-            # 4. RGB-Only: Gaussian Blur (30% probability - REDUCED for stream balance)
+            # 4. RGB-Only: Gaussian Blur (25% probability - BALANCED for 1.5x ratio)
             # Reduces reliance on fine textures/edges, forces focus on spatial structure
-            # Moderate augmentation to balance RGB/Depth performance (was 50%)
-            if np.random.random() < 0.30:
-                # Kernel size: random odd number between 3 and 7 (reduced range for balance)
-                # Sigma: random between 0.1 and 2.0 (reduced strength for balance)
+            # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 50%)
+            if np.random.random() < 0.25:
+                # Kernel size: random odd number between 3, 5, and 7
+                # Sigma: random between 0.1 and 1.7 (balanced for 1.5x ratio)
                 kernel_size = int(np.random.choice([3, 5, 7]))
-                sigma = float(np.random.uniform(0.1, 2.0))
+                sigma = float(np.random.uniform(0.1, 1.7))
                 rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
 
-            # 5. RGB-Only: Occasional Grayscale (20% - REDUCED for stream balance)
+            # 5. RGB-Only: Occasional Grayscale (17% - BALANCED for 1.5x ratio)
             # Forces RGB stream to learn from structure, not just color
-            # Moderate augmentation to balance RGB/Depth performance (was 35%)
-            if np.random.random() < 0.20:
+            # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 35%)
+            if np.random.random() < 0.17:
                 rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
             # 6. Depth-Only: Combined Appearance Augmentation (50% probability)
@@ -202,11 +202,11 @@ class SUNRGBDDataset(Dataset):
         # 7. Post-normalization Random Erasing
         # Applied after normalization for both modalities
         if self.train:
-            # RGB random erasing (20% - REDUCED for stream balance)
-            if np.random.random() < 0.20:
+            # RGB random erasing (17% - BALANCED for 1.5x ratio)
+            if np.random.random() < 0.17:
                 erasing = transforms.RandomErasing(
                     p=1.0,
-                    scale=(0.02, 0.12),    # Small patches (2-12% of image, reduced from 0.15 for balance)
+                    scale=(0.02, 0.10),    # Small patches (2-10% of image, balanced for 1.5x ratio)
                     ratio=(0.5, 2.0)       # Reasonable aspect ratios
                 )
                 rgb = erasing(rgb)
