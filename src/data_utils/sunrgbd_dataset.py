@@ -129,33 +129,32 @@ class SUNRGBDDataset(Dataset):
                 rgb = transforms.functional.resize(rgb, self.target_size)
                 depth = transforms.functional.resize(depth, self.target_size)
 
-            # 3. RGB-Only: Color Jitter (75% probability - INCREASED for overfitting)
+            # 3. RGB-Only: Color Jitter (50% probability - REDUCED for stream balance)
             # Applies brightness, contrast, saturation, hue adjustments
-            # Stronger augmentation to combat RGB overfitting
-            if np.random.random() < 0.75:
+            # Moderate augmentation to balance RGB/Depth performance (was 75%)
+            if np.random.random() < 0.50:
                 color_jitter = transforms.ColorJitter(
-                    brightness=0.5,  # ±50% (increased from 0.4)
-                    contrast=0.5,    # ±50% (increased from 0.4)
-                    saturation=0.5,  # ±50% (increased from 0.4)
-                    hue=0.15         # ±15% (increased from 0.1)
+                    brightness=0.4,  # ±40% (reduced from ±50% for balance)
+                    contrast=0.4,    # ±40% (reduced from ±50% for balance)
+                    saturation=0.4,  # ±40% (reduced from ±50% for balance)
+                    hue=0.12         # ±12% (reduced from ±15% for balance)
                 )
                 rgb = color_jitter(rgb)
 
-            # 4. RGB-Only: Gaussian Blur (50% probability - INCREASED for overfitting)
+            # 4. RGB-Only: Gaussian Blur (30% probability - REDUCED for stream balance)
             # Reduces reliance on fine textures/edges, forces focus on spatial structure
-            # Critical for reducing RGB overfitting - used in SimCLR, MoCo, BYOL
-            # Increased to 50% to further combat RGB overfitting
-            if np.random.random() < 0.50:
-                # Kernel size: random odd number between 3 and 9 (increased range)
-                # Sigma: random between 0.1 and 2.5 (increased strength)
-                kernel_size = int(np.random.choice([3, 5, 7, 9]))
-                sigma = float(np.random.uniform(0.1, 2.5))
+            # Moderate augmentation to balance RGB/Depth performance (was 50%)
+            if np.random.random() < 0.30:
+                # Kernel size: random odd number between 3 and 7 (reduced range for balance)
+                # Sigma: random between 0.1 and 2.0 (reduced strength for balance)
+                kernel_size = int(np.random.choice([3, 5, 7]))
+                sigma = float(np.random.uniform(0.1, 2.0))
                 rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
 
-            # 5. RGB-Only: Occasional Grayscale (35% - INCREASED for overfitting)
+            # 5. RGB-Only: Occasional Grayscale (20% - REDUCED for stream balance)
             # Forces RGB stream to learn from structure, not just color
-            # Critical for reducing color-specific overfitting
-            if np.random.random() < 0.35:
+            # Moderate augmentation to balance RGB/Depth performance (was 35%)
+            if np.random.random() < 0.20:
                 rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
             # 6. Depth-Only: Combined Appearance Augmentation (50% probability)
@@ -203,11 +202,11 @@ class SUNRGBDDataset(Dataset):
         # 7. Post-normalization Random Erasing
         # Applied after normalization for both modalities
         if self.train:
-            # RGB random erasing (30% - INCREASED for overfitting)
-            if np.random.random() < 0.30:
+            # RGB random erasing (20% - REDUCED for stream balance)
+            if np.random.random() < 0.20:
                 erasing = transforms.RandomErasing(
                     p=1.0,
-                    scale=(0.02, 0.15),    # Small patches (2-15% of image, increased from 0.12)
+                    scale=(0.02, 0.12),    # Small patches (2-12% of image, reduced from 0.15 for balance)
                     ratio=(0.5, 2.0)       # Reasonable aspect ratios
                 )
                 rgb = erasing(rgb)
