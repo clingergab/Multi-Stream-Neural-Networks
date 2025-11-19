@@ -6,12 +6,14 @@ All functions are standalone utilities that don't require model instances, makin
 across different model implementations.
 """
 
+import math
 import os
+import re
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
-from typing import Optional, Union, Dict, Any, Callable
+from typing import Optional, Union, Any, Callable
 
 
 def print_epoch_progress(epoch: int, epochs: int, epoch_time: float, 
@@ -40,11 +42,11 @@ def print_epoch_progress(epoch: int, epochs: int, epoch_time: float,
     else:
         print("")
 
-def save_checkpoint(model_state_dict: Dict[str, torch.Tensor], 
-                   optimizer_state_dict: Optional[Dict[str, Any]] = None,
-                   scheduler_state_dict: Optional[Dict[str, Any]] = None,
+def save_checkpoint(model_state_dict: dict[str, torch.Tensor],
+                   optimizer_state_dict: Optional[dict[str, Any]] = None,
+                   scheduler_state_dict: Optional[dict[str, Any]] = None,
                    path: str = None, 
-                   history: Optional[Dict[str, Any]] = None) -> None:
+                   history: Optional[dict[str, Any]] = None) -> None:
     """
     Save model checkpoint.
     
@@ -161,7 +163,7 @@ def create_dataloader_from_tensors(X: torch.Tensor,
         )
 
 def setup_early_stopping(early_stopping: bool, val_loader, monitor: str,
-                       patience: int, min_delta: float, verbose: bool) -> Dict[str, Any]:
+                       patience: int, min_delta: float, verbose: bool) -> dict[str, Any]:
     """
     Set up early stopping configuration and state.
 
@@ -203,11 +205,14 @@ def setup_early_stopping(early_stopping: bool, val_loader, monitor: str,
         'best_weights': None
     }
 
-def setup_stream_early_stopping(stream_early_stopping: bool, stream_monitor: str,
-                               stream1_patience: int, stream2_patience: int,
-                               stream_min_delta: float, verbose: bool = True) -> Dict[str, Any]:
+def setup_stream_early_stopping(stream_early_stopping: bool,
+                               num_streams: int,
+                               stream_monitor: str = 'val_loss',
+                               stream_patience=10,
+                               stream_min_delta: float = 0.001,
+                               verbose: bool = True) -> dict[str, Any]:
     """
-    Set up stream-specific early stopping state.
+    Set up stream-specific early stopping state for N streams.
 
     When enabled, streams will freeze when they plateau and automatically restore
     their best weights before freezing. When all streams freeze, the full model's
@@ -215,9 +220,11 @@ def setup_stream_early_stopping(stream_early_stopping: bool, stream_monitor: str
 
     Args:
         stream_early_stopping: Whether to enable stream-specific early stopping
+        num_streams: Number of streams in the model
         stream_monitor: Metric to monitor ('val_loss' or 'val_accuracy')
-        stream1_patience: Patience for Stream1 (RGB)
-        stream2_patience: Patience for Stream2 (Depth)
+        stream_patience: Patience for each stream. Can be:
+                        - int: Same patience for all streams
+                        - list[int]: One patience value per stream (length must match num_streams)
         stream_min_delta: Minimum improvement to qualify as progress
         verbose: Whether to print setup messages
 
@@ -231,6 +238,14 @@ def setup_stream_early_stopping(stream_early_stopping: bool, stream_monitor: str
     if stream_monitor not in ('val_loss', 'val_accuracy'):
         raise ValueError(f"Invalid stream_monitor: {stream_monitor}. Must be 'val_loss' or 'val_accuracy'")
 
+    # Normalize stream_patience to list
+    if isinstance(stream_patience, list):
+        if len(stream_patience) != num_streams:
+            raise ValueError(f"stream_patience list length ({len(stream_patience)}) must match num_streams ({num_streams})")
+        patience_list = stream_patience
+    else:  # int
+        patience_list = [stream_patience] * num_streams
+
     # Set initial best metric based on monitor type
     if stream_monitor == 'val_loss':
         best_metric = float('inf')
@@ -240,28 +255,25 @@ def setup_stream_early_stopping(stream_early_stopping: bool, stream_monitor: str
     if verbose:
         print(f"❄️  Stream-specific early stopping enabled:")
         print(f"   Monitor: {stream_monitor}")
-        print(f"   Stream1 patience: {stream1_patience}, Stream2 patience: {stream2_patience}")
+        print(f"   Patience per stream: {patience_list}")
         print(f"   Min delta: {stream_min_delta}")
         print(f"   Restore best weights: Enabled (streams + full model when all frozen)")
 
+    # Create state for each stream
+    streams_state = []
+    for i in range(num_streams):
+        streams_state.append({
+            'best_metric': best_metric,
+            'patience': patience_list[i],
+            'patience_counter': 0,
+            'best_epoch': 0,
+            'frozen': False,
+            'best_weights': None  # Will store stream-specific weights
+        })
+
     return {
         'enabled': True,
-        'stream1': {
-            'best_metric': best_metric,
-            'patience': stream1_patience,
-            'patience_counter': 0,
-            'best_epoch': 0,
-            'frozen': False,
-            'best_weights': None  # Will store stream-specific weights
-        },
-        'stream2': {
-            'best_metric': best_metric,
-            'patience': stream2_patience,
-            'patience_counter': 0,
-            'best_epoch': 0,
-            'frozen': False,
-            'best_weights': None  # Will store stream-specific weights
-        },
+        'streams': streams_state,
         'all_frozen': False,
         # Full model state tracking (for when all streams freeze)
         'best_full_model': {
@@ -271,8 +283,8 @@ def setup_stream_early_stopping(stream_early_stopping: bool, stream_monitor: str
         }
     }
 
-def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
-                                stream_stats: Dict[str, float],
+def check_stream_early_stopping(stream_early_stopping_state: dict[str, Any],
+                                stream_stats: dict[str, float],
                                 model,
                                 epoch: int,
                                 monitor: str,
@@ -281,19 +293,19 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
                                 val_acc: float = 0.0,
                                 val_loss: float = 0.0) -> bool:
     """
-    Check stream-specific early stopping and freeze streams when they plateau.
+    Check stream-specific early stopping and freeze streams when they plateau (N-stream support).
 
     When a stream plateaus (no improvement for patience epochs), its best weights
     are restored and then its parameters are frozen, while integration weights remain
-    trainable, allowing the model to continue learning from the other stream.
+    trainable, allowing the model to continue learning from other streams.
 
     When all streams freeze, training stops and the full model's best weights are restored.
 
     Args:
         stream_early_stopping_state: Stream early stopping state dictionary
-        stream_stats: Dictionary with stream metrics (stream1_val_acc, stream2_val_acc,
-                     stream1_val_loss, stream2_val_loss)
-        model: The model (to access stream1 and stream2 parameters)
+        stream_stats: Dictionary with stream metrics (stream_0_val_acc, stream_1_val_acc, ...,
+                     stream_0_val_loss, stream_1_val_loss, ...)
+        model: The model (to access stream parameters)
         epoch: Current epoch number
         monitor: Metric to monitor ('val_loss' or 'val_accuracy')
         min_delta: Minimum improvement threshold
@@ -336,105 +348,63 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
             k: v.cpu().clone() for k, v in model.state_dict().items()
         }
 
-    # Check Stream1
-    if not stream_early_stopping_state['stream1']['frozen']:
-        # Get current metric based on monitor type
-        if monitor == 'val_loss':
-            stream1_metric = stream_stats.get('stream1_val_loss', float('inf'))
-        else:  # val_accuracy
-            stream1_metric = stream_stats.get('stream1_val_acc', 0.0)
+    # Check each stream
+    num_streams = len(stream_early_stopping_state['streams'])
+    for i in range(num_streams):
+        stream_state = stream_early_stopping_state['streams'][i]
 
-        stream1_state = stream_early_stopping_state['stream1']
+        if not stream_state['frozen']:
+            # Get current metric based on monitor type
+            if monitor == 'val_loss':
+                stream_metric = stream_stats.get(f'stream_{i}_val_loss', float('inf'))
+            else:  # val_accuracy
+                stream_metric = stream_stats.get(f'stream_{i}_val_acc', 0.0)
 
-        if is_better(stream1_metric, stream1_state['best_metric']):
-            # Improvement detected
-            stream1_state['best_metric'] = stream1_metric
-            stream1_state['best_epoch'] = epoch
-            stream1_state['patience_counter'] = 0
+            if is_better(stream_metric, stream_state['best_metric']):
+                # Improvement detected
+                stream_state['best_metric'] = stream_metric
+                stream_state['best_epoch'] = epoch
+                stream_state['patience_counter'] = 0
 
-            # Always save best stream1 weights
-            stream1_state['best_weights'] = {
-                name: param.data.cpu().clone()
-                for name, param in model.named_parameters()
-                if '.stream1_' in name
-            }
-        else:
-            # No improvement
-            stream1_state['patience_counter'] += 1
+                # Always save best stream weights
+                # Look for .stream_weights.{i} or .stream_biases.{i} pattern
+                # Use regex to match both .stream_weights.0 and .stream_weights.0.weight
+                stream_pattern = re.compile(rf'\.stream_(?:weights|biases)\.{i}(?:\.|$)')
+                stream_state['best_weights'] = {
+                    name: param.data.cpu().clone()
+                    for name, param in model.named_parameters()
+                    if stream_pattern.search(name)
+                }
+            else:
+                # No improvement
+                stream_state['patience_counter'] += 1
 
-            if stream1_state['patience_counter'] > stream1_state['patience']:
-                # Always restore best weights before freezing
-                if stream1_state['best_weights'] is not None:
+                if stream_state['patience_counter'] > stream_state['patience']:
+                    # Always restore best weights before freezing
+                    if stream_state['best_weights'] is not None:
+                        for name, param in model.named_parameters():
+                            if name in stream_state['best_weights']:
+                                param.data.copy_(stream_state['best_weights'][name].to(param.device))
+
+                    # Freeze Stream
+                    stream_state['frozen'] = True
+                    stream_state['freeze_epoch'] = epoch  # Track actual freeze epoch
+
+                    # Freeze stream parameters (stream-specific weights only)
+                    # Integration weights remain trainable to allow rebalancing
+                    # Use .stream_weights.{i} or .stream_biases.{i} pattern
+                    stream_pattern = re.compile(rf'\.stream_(?:weights|biases)\.{i}(?:\.|$)')
                     for name, param in model.named_parameters():
-                        if '.stream1_' in name and name in stream1_state['best_weights']:
-                            param.data.copy_(stream1_state['best_weights'][name].to(param.device))
+                        if stream_pattern.search(name):
+                            param.requires_grad = False
 
-                # Freeze Stream1
-                stream1_state['frozen'] = True
-                stream1_state['freeze_epoch'] = epoch  # Track actual freeze epoch
-
-                # Freeze stream1 parameters (stream-specific weights only)
-                # Integration weights remain trainable to allow rebalancing
-                for name, param in model.named_parameters():
-                    if '.stream1_' in name:
-                        param.requires_grad = False
-
-                if verbose:
-                    metric_str = f"{monitor}: {stream1_state['best_metric']:.4f}"
-                    print(f"❄️  Stream1 frozen (no improvement for {stream1_state['patience']} epochs, "
-                          f"best {metric_str} at epoch {stream1_state['best_epoch'] + 1})")
-
-    # Check Stream2
-    if not stream_early_stopping_state['stream2']['frozen']:
-        # Get current metric based on monitor type
-        if monitor == 'val_loss':
-            stream2_metric = stream_stats.get('stream2_val_loss', float('inf'))
-        else:  # val_accuracy
-            stream2_metric = stream_stats.get('stream2_val_acc', 0.0)
-
-        stream2_state = stream_early_stopping_state['stream2']
-
-        if is_better(stream2_metric, stream2_state['best_metric']):
-            # Improvement detected
-            stream2_state['best_metric'] = stream2_metric
-            stream2_state['best_epoch'] = epoch
-            stream2_state['patience_counter'] = 0
-
-            # Always save best stream2 weights
-            stream2_state['best_weights'] = {
-                name: param.data.cpu().clone()
-                for name, param in model.named_parameters()
-                if '.stream2_' in name
-            }
-        else:
-            # No improvement
-            stream2_state['patience_counter'] += 1
-
-            if stream2_state['patience_counter'] > stream2_state['patience']:
-                # Always restore best weights before freezing
-                if stream2_state['best_weights'] is not None:
-                    for name, param in model.named_parameters():
-                        if '.stream2_' in name and name in stream2_state['best_weights']:
-                            param.data.copy_(stream2_state['best_weights'][name].to(param.device))
-
-                # Freeze Stream2
-                stream2_state['frozen'] = True
-                stream2_state['freeze_epoch'] = epoch  # Track actual freeze epoch
-
-                # Freeze stream2 parameters (stream-specific weights only)
-                # Integration weights remain trainable to allow rebalancing
-                for name, param in model.named_parameters():
-                    if '.stream2_' in name:
-                        param.requires_grad = False
-
-                if verbose:
-                    metric_str = f"{monitor}: {stream2_state['best_metric']:.4f}"
-                    print(f"❄️  Stream2 frozen (no improvement for {stream2_state['patience']} epochs, "
-                          f"best {metric_str} at epoch {stream2_state['best_epoch'] + 1})")
+                    if verbose:
+                        metric_str = f"{monitor}: {stream_state['best_metric']:.4f}"
+                        print(f"❄️  Stream_{i} frozen (no improvement for {stream_state['patience']} epochs, "
+                              f"best {metric_str} at epoch {stream_state['best_epoch'] + 1})")
 
     # Check if all streams are frozen
-    all_frozen = (stream_early_stopping_state['stream1']['frozen'] and
-                  stream_early_stopping_state['stream2']['frozen'])
+    all_frozen = all(stream_state['frozen'] for stream_state in stream_early_stopping_state['streams'])
 
     # If all streams just became frozen, restore full model's best weights
     # BUT preserve the first frozen stream's weights (it stays at its best)
@@ -442,20 +412,21 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
         best_full = stream_early_stopping_state['best_full_model']
         if best_full['weights'] is not None:
             # Determine which stream was frozen first (to preserve its weights)
-            stream1_frozen_first = (stream_early_stopping_state['stream1'].get('freeze_epoch', float('inf')) <
-                                   stream_early_stopping_state['stream2'].get('freeze_epoch', float('inf')))
+            freeze_epochs = [(i, s.get('freeze_epoch', float('inf')))
+                           for i, s in enumerate(stream_early_stopping_state['streams'])]
+            freeze_epochs.sort(key=lambda x: x[1])
+            first_frozen_idx = freeze_epochs[0][0] if freeze_epochs else None
 
             # Get the first-frozen stream's best weights to preserve them
             first_frozen_weights = {}
             preserved_stream = None
-            if stream1_frozen_first and stream_early_stopping_state['stream1']['best_weights'] is not None:
-                first_frozen_weights = stream_early_stopping_state['stream1']['best_weights'].copy()
-                preserved_stream = "Stream1"
-            elif not stream1_frozen_first and stream_early_stopping_state['stream2']['best_weights'] is not None:
-                first_frozen_weights = stream_early_stopping_state['stream2']['best_weights'].copy()
-                preserved_stream = "Stream2"
+            if first_frozen_idx is not None:
+                first_frozen_state = stream_early_stopping_state['streams'][first_frozen_idx]
+                if first_frozen_state['best_weights'] is not None:
+                    first_frozen_weights = first_frozen_state['best_weights'].copy()
+                    preserved_stream = f"Stream_{first_frozen_idx}"
 
-            # Restore full model best weights (includes the second-frozen stream + integration)
+            # Restore full model best weights (includes other streams + integration)
             model.load_state_dict({
                 k: v.to(next(model.parameters()).device) for k, v in best_full['weights'].items()
             })
@@ -479,7 +450,7 @@ def check_stream_early_stopping(stream_early_stopping_state: Dict[str, Any],
 
     return all_frozen
 
-def early_stopping_initiated(model_state_dict: Dict[str, torch.Tensor], early_stopping_state: Dict[str, Any],
+def early_stopping_initiated(model_state_dict: dict[str, torch.Tensor], early_stopping_state: dict[str, Any],
                            val_loss: float, val_acc: float, epoch: int, monitor: str, min_delta: float,
                            pbar, verbose: bool, restore_best_weights: bool) -> bool:
     """
@@ -508,7 +479,6 @@ def early_stopping_initiated(model_state_dict: Dict[str, torch.Tensor], early_st
     # Check for NaN/Inf in validation loss (indicates numerical instability)
     # If val_loss is NaN, the model has corrupted weights and metrics are invalid
     # Skip early stopping update to avoid treating corrupted metrics as "no improvement"
-    import math
     if math.isnan(val_loss) or math.isinf(val_loss):
         if verbose and pbar is None:
             print(f"\n⚠️  Warning: Validation loss is {'NaN' if math.isnan(val_loss) else 'Inf'} at epoch {epoch + 1}")
@@ -577,7 +547,7 @@ def create_progress_bar(verbose: bool, epoch: int, epochs: int, total_steps: int
 
 def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
                         val_loader, val_loss: float, val_acc: float, 
-                        early_stopping_state: Dict[str, Any], current_lr: float) -> None:
+                        early_stopping_state: dict[str, Any], current_lr: float) -> None:
     """
     Update and close progress bar with final epoch metrics.
     
@@ -621,7 +591,7 @@ def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
     pbar.refresh()
     pbar.close()
 
-def update_history(history: Dict[str, Any], avg_train_loss: float, train_accuracy: float,
+def update_history(history: dict[str, Any], avg_train_loss: float, train_accuracy: float,
                   val_loss: float = 0.0, val_acc: float = 0.0, current_lr: float = 0.0,
                   has_validation: bool = False) -> None:
     """

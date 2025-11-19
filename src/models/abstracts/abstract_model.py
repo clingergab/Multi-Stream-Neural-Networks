@@ -1,8 +1,9 @@
+import re
 import torch
 import torch.nn as nn
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import Dict, List, Union, Optional, Any, Tuple, Callable
+from typing import Callable, Optional, Union
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
 import time
@@ -61,9 +62,9 @@ class BaseModel(nn.Module, ABC):
         # Norm layer setup
         self._norm_layer = norm_layer  # store as _norm_layer for ResNet compatibility
         
-        # Initialize internal parameters - always dual-channel tracking
-        self.stream1_inplanes = 64
-        self.stream2_inplanes = 64
+        # Initialize internal parameters - dynamic N-stream tracking
+        # num_streams will be set by subclasses based on their stream configuration
+        # self.num_streams and self.stream_inplanes will be initialized in subclass
         
         self.dilation = 1   # Standard ResNet starting dilation
         
@@ -126,77 +127,99 @@ class BaseModel(nn.Module, ABC):
         self.scheduler = None
 
     def get_stream_parameter_groups(self,
-                                     stream1_lr: float,
-                                     stream2_lr: float,
-                                     shared_lr: float,
-                                     stream1_weight_decay: float = 0.0,
-                                     stream2_weight_decay: float = 0.0,
+                                     stream_lrs: Union[float, list[float]],
+                                     stream_weight_decays: Union[float, list[float]] = 0.0,
+                                     shared_lr: Optional[float] = None,
                                      shared_weight_decay: float = 0.0):
         """
-        Helper method to create stream-specific parameter groups for multi-stream models.
+        Create parameter groups for stream-specific learning rates in N-stream models.
 
-        This is useful when you want different learning rates or weight decay for different
-        streams in your model. Use this to create parameter groups, then pass them to your
-        optimizer.
+        This method separates model parameters into N+1 groups:
+        - N stream-specific groups (one per stream): Contains ONLY stream_weights.i and stream_biases.i
+          (the stream's own feature extraction parameters)
+        - 1 shared group: Contains integration_from_streams.*, integrated_weight, integrated_bias,
+          fc layers, and other shared parameters (everything that builds/uses the integrated stream)
 
         Args:
-            stream1_lr: Learning rate for stream1 (RGB/color) parameters
-            stream2_lr: Learning rate for stream2 (depth/brightness) parameters
-            shared_lr: Learning rate for shared/fusion parameters
-            stream1_weight_decay: Weight decay for stream1 parameters (default: 0.0)
-            stream2_weight_decay: Weight decay for stream2 parameters (default: 0.0)
-            shared_weight_decay: Weight decay for shared/fusion parameters (default: 0.0)
+            stream_lrs: Learning rate(s) for stream-specific parameters.
+                       - float: Same LR for all streams
+                       - list[float]: Per-stream LRs (length must match number of streams)
+            stream_weight_decays: Weight decay for stream-specific parameters.
+                                 - float: Same weight decay for all streams
+                                 - list[float]: Per-stream weight decays (length must match number of streams)
+            shared_lr: Learning rate for shared/integrated parameters.
+                      If None, defaults to mean of stream_lrs.
+            shared_weight_decay: Weight decay for shared parameters. Default: 0.0.
 
         Returns:
-            List of parameter group dictionaries that can be passed to PyTorch optimizers
+            List of parameter group dicts that can be passed to PyTorch optimizers.
+            Format: [{'params': [...], 'lr': ..., 'weight_decay': ...}, ...]
+
+        Raises:
+            ValueError: If no streams detected or if list lengths don't match number of streams.
 
         Example:
-            >>> # Get stream-specific parameter groups
+            >>> # For a 3-stream model (RGB, Depth, HHA)
             >>> param_groups = model.get_stream_parameter_groups(
-            ...     stream1_lr=2e-4, stream2_lr=7e-4, shared_lr=5e-4,
-            ...     stream1_weight_decay=1e-4, stream2_weight_decay=2e-4, shared_weight_decay=1.5e-4
+            ...     stream_lrs=[2e-4, 7e-4, 5e-4],           # Different LR per stream
+            ...     stream_weight_decays=[1e-4, 2e-4, 1.5e-4],  # Different WD per stream
+            ...     shared_lr=5e-4,                          # Shared params LR
+            ...     shared_weight_decay=1e-4                 # Shared params WD
             ... )
-            >>>
-            >>> # Create optimizer with these groups
             >>> optimizer = torch.optim.AdamW(param_groups)
-            >>>
-            >>> # Create scheduler
-            >>> from src.training.schedulers import setup_scheduler
-            >>> scheduler = setup_scheduler(optimizer, 'decaying_cosine', epochs=80, train_loader_len=40)
-            >>>
-            >>> # Compile and train
-            >>> model.compile(optimizer=optimizer, scheduler=scheduler, loss='cross_entropy')
-            >>> model.fit(train_loader, val_loader, epochs=80)
         """
-        # Separate parameters by stream based on naming convention
-        stream1_params = []
-        stream2_params = []
+        # Detect number of streams
+        num_streams = 0
+        for name, _ in self.named_parameters():
+            if '.stream_weights.' in name:
+                match = re.search(r'\.stream_weights\.(\d+)(?:\.|$)', name)
+                if match:
+                    num_streams = max(num_streams, int(match.group(1)) + 1)
+
+        if num_streams == 0:
+            raise ValueError("No streams detected.")
+
+        # Convert to lists
+        if isinstance(stream_lrs, (int, float)):
+            stream_lrs = [stream_lrs] * num_streams
+        if isinstance(stream_weight_decays, (int, float)):
+            stream_weight_decays = [stream_weight_decays] * num_streams
+
+        if len(stream_lrs) != num_streams:
+            raise ValueError(f"stream_lrs length must match num_streams ({num_streams})")
+        if len(stream_weight_decays) != num_streams:
+            raise ValueError(f"stream_weight_decays length must match num_streams ({num_streams})")
+
+        if shared_lr is None:
+            shared_lr = sum(stream_lrs) / len(stream_lrs)
+
+        # Separate parameters
+        stream_params = [[] for _ in range(num_streams)]
         shared_params = []
 
         for name, param in self.named_parameters():
-            if 'stream1' in name:
-                stream1_params.append(param)
-            elif 'stream2' in name:
-                stream2_params.append(param)
-            else:
-                shared_params.append(param)
+            # Match stream-specific parameters: ONLY stream_weights.i and stream_biases.i
+            # integration_from_streams.i goes to shared group (it builds the integrated stream)
+            if '.stream_weights.' in name or '.stream_biases.' in name:
+                match = re.search(r'\.stream_(?:weights|biases)\.(\d+)(?:\.|$)', name)
+                if match:
+                    stream_params[int(match.group(1))].append(param)
+                    continue
+            # Everything else is shared:
+            # - integration_from_streams.* (builds integrated stream from all streams)
+            # - integrated_weight, integrated_bias (integrated stream's own processing)
+            # - fc (final classifier)
+            shared_params.append(param)
 
-        # Create parameter groups (only include groups that have parameters)
+        # Build groups
         param_groups = []
-
-        if stream1_params:
-            param_groups.append({
-                'params': stream1_params,
-                'lr': stream1_lr,
-                'weight_decay': stream1_weight_decay
-            })
-
-        if stream2_params:
-            param_groups.append({
-                'params': stream2_params,
-                'lr': stream2_lr,
-                'weight_decay': stream2_weight_decay
-            })
+        for i in range(num_streams):
+            if stream_params[i]:
+                param_groups.append({
+                    'params': stream_params[i],
+                    'lr': stream_lrs[i],
+                    'weight_decay': stream_weight_decays[i]
+                })
 
         if shared_params:
             param_groups.append({
@@ -232,42 +255,42 @@ class BaseModel(nn.Module, ABC):
         pass
     
     @abstractmethod
-    def forward(self, stream1_input: torch.Tensor, stream2_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, stream_inputs: list[torch.Tensor]) -> torch.Tensor:
         """
-        Forward pass through the multi-stream network.
-        
+        Forward pass through the N-stream network.
+
         Args:
-            stream1_input: Color/RGB input tensor
-            stream2_input: Brightness/luminance input tensor
-            
+            stream_inputs: List of input tensors, one per stream
+                          Each tensor has shape [batch_size, channels, height, width]
+                          Number of tensors in list should match the model's num_streams
+
         Returns:
             Single tensor for training/classification (not tuple)
+            Shape: [batch_size, num_classes]
+
+        Example:
+            >>> # For a 3-stream model (e.g., RGB, Depth, HHA)
+            >>> stream_inputs = [
+            ...     torch.randn(32, 3, 224, 224),  # stream 0: RGB
+            ...     torch.randn(32, 1, 224, 224),  # stream 1: Depth
+            ...     torch.randn(32, 3, 224, 224)   # stream 2: HHA
+            ... ]
+            >>> output = model(stream_inputs)
+            >>> # output shape: [32, num_classes]
         """
         pass
     
     @abstractmethod
-    def _forward_stream1_pathway(self, stream1_input: torch.Tensor) -> torch.Tensor:
+    def _forward_stream_pathway(self, stream_idx: int, stream_input: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through the stream1 pathway.
-        
+        Forward pass through a single stream pathway.
+
         Args:
-            stream1_input: The stream1 input tensor.
-            
+            stream_idx: Index of the stream (0, 1, 2, ...)
+            stream_input: The input tensor for this stream
+
         Returns:
-            The stream1 pathway output tensor.
-        """
-        pass
-    
-    @abstractmethod
-    def _forward_stream2_pathway(self, stream2_input: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the stream2 pathway.
-        
-        Args:
-            stream2_input: The stream2 input tensor.
-            
-        Returns:
-            The stream2 pathway output tensor.
+            The stream pathway output tensor
         """
         pass
 
@@ -275,7 +298,7 @@ class BaseModel(nn.Module, ABC):
                 optimizer: torch.optim.Optimizer,
                 loss: str = 'cross_entropy',
                 scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-                metrics: Optional[List[str]] = None,
+                metrics: Optional[list[str]] = None,
                 **kwargs):
         """
         Compile the model with optimizer, loss, and scheduler (Keras-style API).
@@ -297,10 +320,11 @@ class BaseModel(nn.Module, ABC):
             >>> # Option 1: Simple optimizer (single learning rate for all parameters)
             >>> optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
             >>>
-            >>> # Option 2: Stream-specific learning rates using helper method
+            >>> # Option 2: Stream-specific learning rates using helper method (3-stream example)
             >>> param_groups = model.get_stream_parameter_groups(
-            ...     stream1_lr=2e-4, stream2_lr=7e-4, shared_lr=5e-4,
-            ...     stream1_weight_decay=1e-4, stream2_weight_decay=2e-4, shared_weight_decay=1.5e-4
+            ...     stream_lrs=[2e-4, 7e-4, 5e-4],
+            ...     stream_weight_decays=[1e-4, 2e-4, 1.5e-4],
+            ...     shared_lr=5e-4
             ... )
             >>> optimizer = torch.optim.AdamW(param_groups)
             >>>
@@ -398,17 +422,10 @@ class BaseModel(nn.Module, ABC):
         return self
     
     @abstractmethod
-    def fit(self, 
-            train_loader: Optional[torch.utils.data.DataLoader] = None,
+    def fit(self,
+            train_loader: torch.utils.data.DataLoader,
             val_loader: Optional[torch.utils.data.DataLoader] = None,
-            train_stream1_data: Optional[torch.Tensor] = None,
-            train_stream2_data: Optional[torch.Tensor] = None,
-            train_targets: Optional[torch.Tensor] = None,
-            val_stream1_data: Optional[torch.Tensor] = None,
-            val_stream2_data: Optional[torch.Tensor] = None,
-            val_targets: Optional[torch.Tensor] = None,
             epochs: int = 10,
-            batch_size: int = 32,
             callbacks: Optional[list] = None,
             verbose: bool = True,
             save_path: Optional[str] = None,
@@ -416,25 +433,41 @@ class BaseModel(nn.Module, ABC):
             patience: int = 10,
             min_delta: float = 0.001,
             monitor: str = 'val_loss',
-            restore_best_weights: bool = True):
+            restore_best_weights: bool = True,
+            gradient_accumulation_steps: int = 1,
+            grad_clip_norm: Optional[float] = None,
+            clear_cache_per_epoch: bool = False,
+            stream_monitoring: bool = False,
+            stream_early_stopping: bool = False,
+            stream_patience: Union[int, list[int]] = 10,
+            stream_min_delta: float = 0.001) -> dict:
         """
         Train the model.
 
-        This method supports two input modes:
-        1. Direct data arrays: stream1_data, stream2_data, labels
-        2. DataLoader: train_loader (containing color, brightness, labels)
+        DataLoader format: Each batch from the DataLoader should be a dictionary with:
+            - 'streams': List of tensors (one per stream)
+            - 'labels': Target labels tensor
+
+        Example DataLoader setup:
+            >>> # For a 3-stream model (RGB, Depth, HHA)
+            >>> class MultiStreamDataset(Dataset):
+            ...     def __getitem__(self, idx):
+            ...         return {
+            ...             'streams': [
+            ...                 rgb_data[idx],    # stream 0
+            ...                 depth_data[idx],  # stream 1
+            ...                 hha_data[idx]     # stream 2
+            ...             ],
+            ...             'labels': labels[idx]
+            ...         }
+            >>>
+            >>> train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
+            >>> model.fit(train_loader, val_loader, epochs=80)
 
         Args:
-            train_loader: DataLoader for training data (if not using direct arrays)
-            val_loader: DataLoader for validation data (if not using direct arrays)
-            train_stream1_data: Training color/RGB data array (if not using train_loader)
-            train_stream2_data: Training brightness data array (if not using train_loader)
-            train_targets: Training labels (if not using train_loader)
-            val_stream1_data: Validation color/RGB data array (if not using val_loader)
-            val_stream2_data: Validation brightness data array (if not using val_loader)
-            val_targets: Validation labels (if not using val_loader)
+            train_loader: DataLoader for training data (required)
+            val_loader: DataLoader for validation data (optional)
             epochs: Number of epochs to train
-            batch_size: Batch size (used only when passing direct data arrays)
             callbacks: List of callbacks to apply during training
             verbose: Whether to print progress during training
             save_path: Path to save best model checkpoint
@@ -443,6 +476,13 @@ class BaseModel(nn.Module, ABC):
             min_delta: Minimum change to qualify as an improvement
             monitor: Metric to monitor ('val_loss' or 'val_accuracy')
             restore_best_weights: Whether to restore best weights when early stopping
+            gradient_accumulation_steps: Number of steps to accumulate gradients (default: 1)
+            grad_clip_norm: Maximum gradient norm for clipping (None = disabled)
+            clear_cache_per_epoch: Clear CUDA cache after each epoch (for OOM issues)
+            stream_monitoring: Enable stream-specific monitoring (LR, WD, accuracy per stream)
+            stream_early_stopping: Enable stream-specific early stopping (freezes streams when they plateau)
+            stream_patience: Patience per stream (int for all, or list[int] per stream)
+            stream_min_delta: Minimum improvement for stream early stopping
 
         Returns:
             Training history or results
@@ -450,121 +490,71 @@ class BaseModel(nn.Module, ABC):
         pass
     
     @abstractmethod
-    def predict(self, stream1_data: Optional[Union[np.ndarray, torch.Tensor]] = None, 
-                stream2_data: Optional[Union[np.ndarray, torch.Tensor]] = None, 
-                data_loader: Optional[DataLoader] = None,
-                batch_size: Optional[int] = None) -> np.ndarray:
+    def predict(self, data_loader: DataLoader) -> np.ndarray:
         """
         Generate predictions for the input data.
-        
-        This method supports two input modes:
-        1. Direct data arrays: stream1_data and stream2_data
-        2. DataLoader: data_loader (containing stream1 and stream2 data)
-        
+
+        DataLoader format: Each batch should be a dictionary with:
+            - 'streams': List of tensors (one per stream)
+            - 'labels': Target labels tensor (optional for prediction)
+
         Args:
-            stream1_data: Color/RGB input data (if not using data_loader)
-            stream2_data: Brightness input data (if not using data_loader)
-            data_loader: DataLoader containing both input modalities (alternative to direct arrays)
-            batch_size: Batch size for prediction (used only when passing direct data arrays)
-            
+            data_loader: DataLoader containing N-stream input data
+
         Returns:
             Predicted class labels as numpy array
+
+        Example:
+            >>> # For a 3-stream model
+            >>> predictions = model.predict(test_loader)
+            >>> # predictions shape: [num_samples]
         """
         pass
     
     @abstractmethod
-    def predict_proba(self, stream1_data: Optional[Union[np.ndarray, torch.Tensor]] = None, 
-                     stream2_data: Optional[Union[np.ndarray, torch.Tensor]] = None,
-                     data_loader: Optional[DataLoader] = None,
-                     batch_size: Optional[int] = None) -> np.ndarray:
+    def predict_proba(self, data_loader: DataLoader) -> np.ndarray:
         """
         Generate probability predictions for the input data.
-        
-        This method supports two input modes:
-        1. Direct data arrays: stream1_data and stream2_data
-        2. DataLoader: data_loader (containing stream1 and stream2 data)
-        
+
+        DataLoader format: Each batch should be a dictionary with:
+            - 'streams': List of tensors (one per stream)
+            - 'labels': Target labels tensor (optional for prediction)
+
         Args:
-            stream1_data: Color/RGB input data (if not using data_loader)
-            stream2_data: Brightness input data (if not using data_loader)
-            data_loader: DataLoader containing both input modalities (alternative to direct arrays)
-            batch_size: Batch size for prediction (used only when passing direct data arrays)
-            
+            data_loader: DataLoader containing N-stream input data
+
         Returns:
-            Predicted probabilities as numpy array
+            Predicted probabilities as numpy array [num_samples, num_classes]
+
+        Example:
+            >>> # For a 3-stream model
+            >>> probabilities = model.predict_proba(test_loader)
+            >>> # probabilities shape: [num_samples, num_classes]
         """
         pass
     
     @abstractmethod
-    def evaluate(self, data_loader: DataLoader, stream_monitoring: bool = True) -> Dict[str, float]:
+    def evaluate(self, data_loader: DataLoader, stream_monitoring: bool = True) -> dict[str, float]:
         """
         Evaluate the model on the given data.
 
+        DataLoader format: Each batch should be a dictionary with:
+            - 'streams': List of tensors (one per stream)
+            - 'labels': Target labels tensor
+
         Args:
-            data_loader: DataLoader containing dual-channel input data and targets
+            data_loader: DataLoader containing N-stream input data and targets
             stream_monitoring: Whether to calculate stream-specific metrics (default: True)
 
         Returns:
             Dictionary containing evaluation metrics (e.g., accuracy, loss, stream accuracies)
+
+        Example:
+            >>> # For a 3-stream model
+            >>> metrics = model.evaluate(test_loader, stream_monitoring=True)
+            >>> # metrics = {'loss': 0.25, 'accuracy': 0.92,
+            >>> #            'stream0_accuracy': 0.85, 'stream1_accuracy': 0.88, 'stream2_accuracy': 0.87}
         """
         pass
-    
-    # def _validate(self, val_loader: DataLoader) -> Tuple[float, float]:
-    #     """
-    #     Validate the model on a validation dataset loader.
-        
-    #     Args:
-    #         val_loader: Validation data loader
-            
-    #     Returns:
-    #         Tuple of (average_validation_loss, validation_accuracy)
-    #     """
-    #     self.eval()
-    #     total_loss = 0.0
-    #     correct = 0
-    #     total = 0
-        
-    #     with torch.no_grad():
-    #         for batch in val_loader:
-    #             if len(batch) == 3:
-    #                 stream1_data, stream2_data, targets = batch
-    #             elif isinstance(batch, dict) and all(k in batch for k in ['color', 'brightness', 'labels']):
-    #                 # Handle dictionary format
-    #                 stream1_data = batch['color']
-    #                 stream2_data = batch['brightness']
-    #                 targets = batch['labels']
-    #             else:
-    #                 # Handle default format
-    #                 stream1_data, stream2_data = batch[0], batch[1]
-    #                 targets = batch[2] if len(batch) > 2 else None
-                
-    #             # Move to device
-    #             stream1_data = stream1_data.to(self.device)
-    #             stream2_data = stream2_data.to(self.device)
-    #             if targets is not None:
-    #                 targets = targets.to(self.device)
-                
-    #             # Forward pass
-    #             outputs = self.forward(stream1_data, stream2_data)
-                
-    #             if targets is not None:
-    #                 # Calculate loss
-    #                 if not hasattr(self, 'criterion') or self.criterion is None:
-    #                     criterion = nn.CrossEntropyLoss()
-    #                 else:
-    #                     criterion = self.criterion
-                    
-    #                 loss = criterion(outputs, targets)
-    #                 total_loss += loss.item()
-                    
-    #                 # Calculate accuracy
-    #                 _, predicted = torch.max(outputs, 1)
-    #                 correct += (predicted == targets).sum().item()
-    #                 total += targets.size(0)
-        
-    #     val_loss = total_loss / len(val_loader) if len(val_loader) > 0 else 0
-    #     val_accuracy = correct / total if total > 0 else 0
-        
-    #     return val_loss, val_accuracy
 
 

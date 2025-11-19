@@ -1,7 +1,7 @@
 """
 Gradient monitoring utilities for Linear Integration Neural Networks (LINet).
 
-This module provides lightweight gradient analysis tools for 3-stream architectures
+This module provides lightweight gradient analysis tools for N-stream architectures
 to detect pathway collapse or gradient imbalance between streams.
 
 Usage:
@@ -9,19 +9,26 @@ Usage:
     stats = monitor.compute_pathway_stats()  # Call after loss.backward()
 """
 
+import re
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional
+from typing import Optional
 from collections import defaultdict
+
+# Optional matplotlib import for plotting
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
 
 
 class GradientMonitor:
     """
-    Gradient monitoring for 3-stream Linear Integration networks.
+    Gradient monitoring for N-stream Linear Integration networks.
 
     Tracks gradients for:
-    - Stream1 (RGB) pathway
-    - Stream2 (Depth) pathway
+    - Individual stream pathways (stream_0, stream_1, ..., streamN-1)
     - Integrated pathway
     - Shared parameters (classifier, etc.)
     """
@@ -34,30 +41,76 @@ class GradientMonitor:
             model: The LINet model to monitor
         """
         self.model = model
+        # Get num_streams directly from model if available, otherwise detect
+        self.num_streams = getattr(model, 'num_streams', self._detect_num_streams())
 
-    def compute_pathway_stats(self) -> Dict[str, float]:
+    def _detect_num_streams(self) -> int:
+        """
+        Detect the number of streams in the model by examining parameter names.
+
+        Returns:
+            Number of streams detected
+        """
+        stream_indices = set()
+        for name, _ in self.model.named_parameters():
+            # Match patterns like .stream_weights.0 or .stream_weights.0.weight
+            match = re.search(r'\.stream_weights\.(\d+)(?:\.|$)', name)
+            if match:
+                stream_indices.add(int(match.group(1)))
+            # Match patterns like .integration_from_streams.0 or .integration_from_streams.0.weight
+            match = re.search(r'\.integration_from_streams\.(\d+)(?:\.|$)', name)
+            if match:
+                stream_indices.add(int(match.group(1)))
+
+        if stream_indices:
+            return max(stream_indices) + 1
+
+        # Fallback: assume 2 streams if no stream_weights pattern found
+        return 2
+
+    def _get_stream_index(self, param_name: str) -> Optional[int]:
+        """
+        Extract stream index from parameter name.
+
+        Args:
+            param_name: Name of the parameter
+
+        Returns:
+            Stream index if found, None otherwise
+        """
+        # Match patterns like .stream_weights.0 or .stream_weights.0.weight
+        match = re.search(r'\.stream_weights\.(\d+)(?:\.|$)', param_name)
+        if match:
+            return int(match.group(1))
+
+        # Match patterns like .integration_from_streams.0 or .integration_from_streams.0.weight
+        match = re.search(r'\.integration_from_streams\.(\d+)(?:\.|$)', param_name)
+        if match:
+            return int(match.group(1))
+
+        return None
+
+    def compute_pathway_stats(self) -> dict[str, float]:
         """
         Compute gradient statistics for each pathway.
 
         Call this AFTER loss.backward() to analyze gradient magnitudes.
 
         Returns:
-            Dictionary with gradient statistics for all 3 streams:
-            - stream1_grad_norm: L2 norm of stream1 gradients
-            - stream2_grad_norm: L2 norm of stream2 gradients
+            Dictionary with gradient statistics for all streams:
+            - stream{i}_grad_norm: L2 norm of stream{i} gradients for each stream
             - integrated_grad_norm: L2 norm of integrated gradients
             - shared_grad_norm: L2 norm of shared gradients
-            - stream1_to_stream2_ratio: Gradient imbalance indicator
-            - stream1_to_integrated_ratio: Stream1 vs integrated balance
-            - stream2_to_integrated_ratio: Stream2 vs integrated balance
+            - stream{i}_to_stream0_ratio: Gradient ratio for each stream vs stream0
+            - stream{i}_to_integrated_ratio: Stream vs integrated balance
+            - stream{i}_mean: Mean gradient norm per parameter for each stream
+            - stream{i}_param_count: Number of parameters for each stream
         """
-        stream1_grad_norm = 0.0
-        stream2_grad_norm = 0.0
+        # Initialize accumulators for each stream
+        stream_grad_norms = [0.0] * self.num_streams
+        stream_counts = [0] * self.num_streams
         integrated_grad_norm = 0.0
         shared_grad_norm = 0.0
-
-        stream1_count = 0
-        stream2_count = 0
         integrated_count = 0
         shared_count = 0
 
@@ -65,13 +118,12 @@ class GradientMonitor:
             if param.grad is not None:
                 grad_norm_sq = param.grad.norm().item() ** 2
 
-                if 'stream1' in name:
-                    stream1_grad_norm += grad_norm_sq
-                    stream1_count += 1
-                elif 'stream2' in name:
-                    stream2_grad_norm += grad_norm_sq
-                    stream2_count += 1
-                elif 'integrated' in name or 'integration' in name:
+                # Check if this is a stream-specific parameter
+                stream_idx = self._get_stream_index(name)
+                if stream_idx is not None and stream_idx < self.num_streams:
+                    stream_grad_norms[stream_idx] += grad_norm_sq
+                    stream_counts[stream_idx] += 1
+                elif 'integrated' in name:
                     integrated_grad_norm += grad_norm_sq
                     integrated_count += 1
                 else:
@@ -80,33 +132,33 @@ class GradientMonitor:
                     shared_count += 1
 
         # Compute L2 norms
-        stream1_grad_norm = stream1_grad_norm ** 0.5
-        stream2_grad_norm = stream2_grad_norm ** 0.5
+        stream_grad_norms = [norm ** 0.5 for norm in stream_grad_norms]
         integrated_grad_norm = integrated_grad_norm ** 0.5
         shared_grad_norm = shared_grad_norm ** 0.5
 
-        # Compute ratios (add epsilon to avoid division by zero)
-        eps = 1e-8
-        s1_to_s2_ratio = stream1_grad_norm / (stream2_grad_norm + eps)
-        s1_to_int_ratio = stream1_grad_norm / (integrated_grad_norm + eps)
-        s2_to_int_ratio = stream2_grad_norm / (integrated_grad_norm + eps)
-
-        return {
-            'stream1_grad_norm': stream1_grad_norm,
-            'stream2_grad_norm': stream2_grad_norm,
+        # Build result dictionary
+        result = {
             'integrated_grad_norm': integrated_grad_norm,
             'shared_grad_norm': shared_grad_norm,
-            'stream1_to_stream2_ratio': s1_to_s2_ratio,
-            'stream1_to_integrated_ratio': s1_to_int_ratio,
-            'stream2_to_integrated_ratio': s2_to_int_ratio,
-            'stream1_mean': stream1_grad_norm / max(stream1_count, 1),
-            'stream2_mean': stream2_grad_norm / max(stream2_count, 1),
             'integrated_mean': integrated_grad_norm / max(integrated_count, 1),
-            'stream1_param_count': stream1_count,
-            'stream2_param_count': stream2_count,
             'integrated_param_count': integrated_count,
             'shared_param_count': shared_count,
         }
+
+        # Add per-stream statistics
+        eps = 1e-8
+        for i in range(self.num_streams):
+            result[f'stream_{i}_grad_norm'] = stream_grad_norms[i]
+            result[f'stream_{i}_mean'] = stream_grad_norms[i] / max(stream_counts[i], 1)
+            result[f'stream_{i}_param_count'] = stream_counts[i]
+
+        # Compute ratios (compare each stream to stream0 and integrated)
+        for i in range(self.num_streams):
+            if i > 0:
+                result[f'stream_{i}_to_stream0_ratio'] = stream_grad_norms[i] / (stream_grad_norms[0] + eps)
+            result[f'stream_{i}_to_integrated_ratio'] = stream_grad_norms[i] / (integrated_grad_norm + eps)
+
+        return result
 
     def detect_pathway_collapse(self, threshold: float = 10.0) -> tuple[bool, str]:
         """
@@ -120,49 +172,59 @@ class GradientMonitor:
         """
         stats = self.compute_pathway_stats()
 
-        s1_to_s2 = stats['stream1_to_stream2_ratio']
-        s1_to_int = stats['stream1_to_integrated_ratio']
-        s2_to_int = stats['stream2_to_integrated_ratio']
-
         warnings = []
         is_collapsed = False
 
-        # Check stream1 vs stream2
-        if s1_to_s2 > threshold:
-            warnings.append(f"⚠️  Stream1 dominates Stream2 (ratio: {s1_to_s2:.2f})")
-            is_collapsed = True
-        elif s1_to_s2 < 1.0 / threshold:
-            warnings.append(f"⚠️  Stream2 dominates Stream1 (ratio: {s1_to_s2:.2f})")
-            is_collapsed = True
+        # Check pairwise stream comparisons (compare each stream to stream0)
+        for i in range(1, self.num_streams):
+            ratio_key = f'stream_{i}_to_stream0_ratio'
+            if ratio_key in stats:
+                ratio = stats[ratio_key]
+                if ratio > threshold:
+                    warnings.append(f"Stream{i} dominates Stream0 (ratio: {ratio:.2f})")
+                    is_collapsed = True
+                elif ratio < 1.0 / threshold:
+                    warnings.append(f"Stream0 dominates Stream{i} (ratio: {ratio:.2f})")
+                    is_collapsed = True
 
-        # Check integrated stream
-        if s1_to_int > threshold:
-            warnings.append(f"⚠️  Stream1 dominates Integrated (ratio: {s1_to_int:.2f})")
-            is_collapsed = True
-        elif s1_to_int < 1.0 / threshold:
-            warnings.append(f"⚠️  Integrated dominates Stream1 (ratio: {s1_to_int:.2f})")
-            is_collapsed = True
-
-        if s2_to_int > threshold:
-            warnings.append(f"⚠️  Stream2 dominates Integrated (ratio: {s2_to_int:.2f})")
-            is_collapsed = True
-        elif s2_to_int < 1.0 / threshold:
-            warnings.append(f"⚠️  Integrated dominates Stream2 (ratio: {s2_to_int:.2f})")
-            is_collapsed = True
+        # Check each stream vs integrated
+        for i in range(self.num_streams):
+            ratio_key = f'stream_{i}_to_integrated_ratio'
+            if ratio_key in stats:
+                ratio = stats[ratio_key]
+                if ratio > threshold:
+                    warnings.append(f"Stream{i} dominates Integrated (ratio: {ratio:.2f})")
+                    is_collapsed = True
+                elif ratio < 1.0 / threshold:
+                    warnings.append(f"Integrated dominates Stream{i} (ratio: {ratio:.2f})")
+                    is_collapsed = True
 
         if is_collapsed:
             return True, "\n".join(warnings)
         else:
-            return False, f"✓ All pathways balanced (S1/S2: {s1_to_s2:.2f}, S1/Int: {s1_to_int:.2f}, S2/Int: {s2_to_int:.2f})"
+            # Build balance summary
+            balance_parts = []
+            for i in range(1, self.num_streams):
+                ratio_key = f'stream_{i}_to_stream0_ratio'
+                if ratio_key in stats:
+                    balance_parts.append(f"S{i}/S0: {stats[ratio_key]:.2f}")
 
-    def get_layer_wise_stats(self) -> Dict[str, Dict[str, float]]:
+            for i in range(self.num_streams):
+                ratio_key = f'stream_{i}_to_integrated_ratio'
+                if ratio_key in stats:
+                    balance_parts.append(f"S{i}/Int: {stats[ratio_key]:.2f}")
+
+            return False, f"All pathways balanced ({', '.join(balance_parts)})"
+
+    def get_layer_wise_stats(self) -> dict[str, dict[str, float]]:
         """
         Get gradient statistics grouped by layer.
 
         Returns:
             Dictionary mapping layer names to their gradient statistics
         """
-        layer_stats = defaultdict(lambda: {'stream1': 0.0, 'stream2': 0.0, 'integrated': 0.0})
+        # Initialize default dict with dynamic stream count
+        layer_stats = defaultdict(lambda: {f'stream_{i}': 0.0 for i in range(self.num_streams)} | {'integrated': 0.0})
 
         for name, param in self.model.named_parameters():
             if param.grad is not None:
@@ -170,29 +232,36 @@ class GradientMonitor:
                 layer_name = name.split('.')[0]
                 grad_norm_sq = param.grad.norm().item() ** 2
 
-                if 'stream1' in name:
-                    layer_stats[layer_name]['stream1'] += grad_norm_sq
-                elif 'stream2' in name:
-                    layer_stats[layer_name]['stream2'] += grad_norm_sq
-                elif 'integrated' in name or 'integration' in name:
+                # Check if this is a stream-specific parameter
+                stream_idx = self._get_stream_index(name)
+                if stream_idx is not None and stream_idx < self.num_streams:
+                    layer_stats[layer_name][f'stream{stream_idx}'] += grad_norm_sq
+                elif 'integrated' in name:
                     layer_stats[layer_name]['integrated'] += grad_norm_sq
 
         # Convert to L2 norms and compute ratios
         result = {}
+        eps = 1e-8
         for layer_name, stats in layer_stats.items():
-            s1_norm = stats['stream1'] ** 0.5
-            s2_norm = stats['stream2'] ** 0.5
+            layer_result = {}
+
+            # Get norms for all streams
+            stream_norms = [stats[f'stream_{i}'] ** 0.5 for i in range(self.num_streams)]
             int_norm = stats['integrated'] ** 0.5
 
-            eps = 1e-8
-            result[layer_name] = {
-                'stream1_grad_norm': s1_norm,
-                'stream2_grad_norm': s2_norm,
-                'integrated_grad_norm': int_norm,
-                's1_to_s2_ratio': s1_norm / (s2_norm + eps),
-                's1_to_int_ratio': s1_norm / (int_norm + eps),
-                's2_to_int_ratio': s2_norm / (int_norm + eps),
-            }
+            # Add per-stream norms
+            for i in range(self.num_streams):
+                layer_result[f'stream_{i}_grad_norm'] = stream_norms[i]
+
+            layer_result['integrated_grad_norm'] = int_norm
+
+            # Compute ratios (compare each stream to stream0 and integrated)
+            for i in range(self.num_streams):
+                if i > 0:
+                    layer_result[f's{i}_to_s0_ratio'] = stream_norms[i] / (stream_norms[0] + eps)
+                layer_result[f's{i}_to_int_ratio'] = stream_norms[i] / (int_norm + eps)
+
+            result[layer_name] = layer_result
 
         return result
 
@@ -203,16 +272,15 @@ class GradientMonitor:
         print("\n" + "="*70)
         print("LI-NET GRADIENT MONITORING SUMMARY")
         print("="*70)
-        print(f"Stream1 (RGB):")
-        print(f"  Total gradient norm: {stats['stream1_grad_norm']:.6f}")
-        print(f"  Mean gradient norm:  {stats['stream1_mean']:.6f}")
-        print(f"  Parameter count:     {stats['stream1_param_count']}")
-        print()
-        print(f"Stream2 (Depth):")
-        print(f"  Total gradient norm: {stats['stream2_grad_norm']:.6f}")
-        print(f"  Mean gradient norm:  {stats['stream2_mean']:.6f}")
-        print(f"  Parameter count:     {stats['stream2_param_count']}")
-        print()
+
+        # Print stats for each stream
+        for i in range(self.num_streams):
+            print(f"Stream{i}:")
+            print(f"  Total gradient norm: {stats[f'stream_{i}_grad_norm']:.6f}")
+            print(f"  Mean gradient norm:  {stats[f'stream_{i}_mean']:.6f}")
+            print(f"  Parameter count:     {stats[f'stream_{i}_param_count']}")
+            print()
+
         print(f"Integrated:")
         print(f"  Total gradient norm: {stats['integrated_grad_norm']:.6f}")
         print(f"  Mean gradient norm:  {stats['integrated_mean']:.6f}")
@@ -222,25 +290,46 @@ class GradientMonitor:
         print(f"  Total gradient norm: {stats['shared_grad_norm']:.6f}")
         print(f"  Parameter count:     {stats['shared_param_count']}")
         print()
+
         print(f"Ratios:")
-        print(f"  Stream1/Stream2:     {stats['stream1_to_stream2_ratio']:.4f}")
-        print(f"  Stream1/Integrated:  {stats['stream1_to_integrated_ratio']:.4f}")
-        print(f"  Stream2/Integrated:  {stats['stream2_to_integrated_ratio']:.4f}")
+        # Print stream-to-stream0 ratios
+        for i in range(1, self.num_streams):
+            ratio_key = f'stream_{i}_to_stream0_ratio'
+            if ratio_key in stats:
+                print(f"  Stream_{i}/Stream_0:    {stats[ratio_key]:.4f}")
+
+        # Print stream-to-integrated ratios
+        for i in range(self.num_streams):
+            ratio_key = f'stream_{i}_to_integrated_ratio'
+            if ratio_key in stats:
+                print(f"  Stream{i}/Integrated: {stats[ratio_key]:.4f}")
 
         # Provide interpretation
-        s1_to_s2 = stats['stream1_to_stream2_ratio']
-        s1_to_int = stats['stream1_to_integrated_ratio']
-        s2_to_int = stats['stream2_to_integrated_ratio']
-
         print()
-        if s1_to_s2 > 5.0 or s1_to_int > 5.0:
-            print("⚠️  WARNING: Stream1 appears to dominate training")
-        elif s1_to_s2 < 0.2 or s2_to_int > 5.0:
-            print("⚠️  WARNING: Stream2 appears to dominate training")
-        elif s1_to_int < 0.2 or s2_to_int < 0.2:
-            print("⚠️  WARNING: Integrated stream appears to dominate training")
+        warnings = []
+        for i in range(1, self.num_streams):
+            ratio_key = f'stream_{i}_to_stream0_ratio'
+            if ratio_key in stats:
+                ratio = stats[ratio_key]
+                if ratio > 5.0:
+                    warnings.append(f"Stream{i} appears to dominate Stream0")
+                elif ratio < 0.2:
+                    warnings.append(f"Stream0 appears to dominate Stream{i}")
+
+        for i in range(self.num_streams):
+            ratio_key = f'stream_{i}_to_integrated_ratio'
+            if ratio_key in stats:
+                ratio = stats[ratio_key]
+                if ratio > 5.0:
+                    warnings.append(f"Stream{i} appears to dominate Integrated")
+                elif ratio < 0.2:
+                    warnings.append(f"Integrated appears to dominate Stream{i}")
+
+        if warnings:
+            for warning in warnings:
+                print(f"WARNING: {warning}")
         else:
-            print("✓ All pathways appear balanced")
+            print("All pathways appear balanced")
         print("="*70 + "\n")
 
 
@@ -264,7 +353,7 @@ class GradientLogger:
         stats = self.monitor.compute_pathway_stats()
         self.history.append(stats)
 
-    def get_history(self) -> List[Dict[str, float]]:
+    def get_history(self) -> list[dict[str, float]]:
         """Get logged gradient history."""
         return self.history
 
@@ -279,9 +368,7 @@ class GradientLogger:
         Args:
             save_path: Optional path to save the plot
         """
-        try:
-            import matplotlib.pyplot as plt
-        except ImportError:
+        if not HAS_MATPLOTLIB:
             print("matplotlib not available for plotting")
             return
 
@@ -289,19 +376,38 @@ class GradientLogger:
             print("No history to plot")
             return
 
+        # Detect number of streams from first history entry
+        num_streams = self.monitor.num_streams
+
         steps = list(range(len(self.history)))
-        stream1_norms = [h['stream1_grad_norm'] for h in self.history]
-        stream2_norms = [h['stream2_grad_norm'] for h in self.history]
+
+        # Collect data for all streams
+        stream_norms = []
+        for i in range(num_streams):
+            stream_norms.append([h[f'stream_{i}_grad_norm'] for h in self.history])
+
         integrated_norms = [h['integrated_grad_norm'] for h in self.history]
-        s1_to_s2_ratios = [h['stream1_to_stream2_ratio'] for h in self.history]
-        s1_to_int_ratios = [h['stream1_to_integrated_ratio'] for h in self.history]
+
+        # Collect ratio data
+        stream_to_stream0_ratios = []
+        for i in range(1, num_streams):
+            ratio_key = f'stream_{i}_to_stream0_ratio'
+            if ratio_key in self.history[0]:
+                stream_to_stream0_ratios.append(([h[ratio_key] for h in self.history], f'Stream_{i}/Stream_0'))
+
+        stream_to_int_ratios = []
+        for i in range(num_streams):
+            ratio_key = f'stream_{i}_to_integrated_ratio'
+            if ratio_key in self.history[0]:
+                stream_to_int_ratios.append(([h[ratio_key] for h in self.history], f'Stream{i}/Integrated'))
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
 
         # Plot gradient norms
-        ax1.plot(steps, stream1_norms, label='Stream1 (RGB)', marker='o')
-        ax1.plot(steps, stream2_norms, label='Stream2 (Depth)', marker='s')
-        ax1.plot(steps, integrated_norms, label='Integrated', marker='^')
+        markers = ['o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h']
+        for i in range(num_streams):
+            ax1.plot(steps, stream_norms[i], label=f'Stream{i}', marker=markers[i % len(markers)])
+        ax1.plot(steps, integrated_norms, label='Integrated', marker=markers[num_streams % len(markers)])
         ax1.set_xlabel('Training Step')
         ax1.set_ylabel('Gradient Norm')
         ax1.set_title('Gradient Magnitudes by Stream (LINet)')
@@ -309,8 +415,15 @@ class GradientLogger:
         ax1.grid(True, alpha=0.3)
 
         # Plot ratios
-        ax2.plot(steps, s1_to_s2_ratios, label='Stream1/Stream2', marker='o', color='blue')
-        ax2.plot(steps, s1_to_int_ratios, label='Stream1/Integrated', marker='s', color='green')
+        colors = ['blue', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
+        color_idx = 0
+        for ratios, label in stream_to_stream0_ratios:
+            ax2.plot(steps, ratios, label=label, marker='o', color=colors[color_idx % len(colors)])
+            color_idx += 1
+        for ratios, label in stream_to_int_ratios:
+            ax2.plot(steps, ratios, label=label, marker='s', color=colors[color_idx % len(colors)])
+            color_idx += 1
+
         ax2.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label='Perfect Balance')
         ax2.axhline(y=5.0, color='red', linestyle='--', alpha=0.3, label='Warning Threshold')
         ax2.axhline(y=0.2, color='red', linestyle='--', alpha=0.3)

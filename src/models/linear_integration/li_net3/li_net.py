@@ -1,25 +1,24 @@
 """
 Linear Integration ResNet (LINet) implementations.
 
-Extends MCResNet from 2 streams to 3 streams with integrated pathway.
+Supports N input streams with a learned integrated pathway.
+Designed for flexibility - works with any number of streams (N=1, 2, 3, ...).
 """
 
-from sched import scheduler
-from typing import Any, Callable, Optional, Union, TYPE_CHECKING
 import time
+import warnings
 import numpy as np
-
-if TYPE_CHECKING:
-    from tqdm import tqdm as TqdmType
-
-from src.models.abstracts.abstract_model import BaseModel
 import torch
 import torch.nn as nn
+from sched import scheduler
+from typing import Any, Callable, Optional, Union, TYPE_CHECKING
 from torch import Tensor
 from torch.amp import autocast
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts
+
+from src.models.abstracts.abstract_model import BaseModel
 from src.training.schedulers import setup_scheduler
 from src.models.common import (
     save_checkpoint,
@@ -27,9 +26,11 @@ from src.models.common import (
     finalize_progress_bar,
     update_history
 )
-# StreamMonitor no longer needed - monitoring is done during main training/validation loops
 
 # Smart tqdm import - detect environment
+if TYPE_CHECKING:
+    from tqdm import tqdm as TqdmType
+
 try:
     from IPython import get_ipython
     if get_ipython() is not None and get_ipython().__class__.__name__ == 'ZMQInteractiveShell':
@@ -46,10 +47,10 @@ except:
     from tqdm import tqdm
 
 # Import the linear integration components
-from src.models.linear_integration.conv import LIConv2d, LIBatchNorm2d
-from src.models.linear_integration.blocks import LIBasicBlock, LIBottleneck
-from src.models.linear_integration.container import LISequential, LIReLU
-from src.models.linear_integration.pooling import LIMaxPool2d, LIAdaptiveAvgPool2d
+from .conv import LIConv2d, LIBatchNorm2d
+from .blocks import LIBasicBlock, LIBottleneck
+from .container import LISequential, LIReLU
+from .pooling import LIMaxPool2d, LIAdaptiveAvgPool2d
 # Note: LINet doesn't use fusion - it uses the integrated stream directly
 
 
@@ -57,13 +58,17 @@ class LINet(BaseModel):
     """
     Linear Integration ResNet (LINet) implementation.
 
-    Extends MCResNet from 2 streams to 3 streams:
-    - Stream1: RGB/Color pathway (independent processing)
-    - Stream2: Depth/Brightness pathway (independent processing)
+    Supports N input streams with a learned integrated pathway:
+    - N independent stream pathways (e.g., RGB, Depth, Orthogonal, etc.)
     - Integrated: Learned fusion pathway (combines stream outputs during convolution)
 
     Uses unified LIConv2d neurons where integration happens INSIDE the neuron.
     Final predictions come from the integrated stream (no separate fusion layer needed).
+
+    Designed for flexibility - works with any number of streams (N=1, 2, 3, ...):
+    - N=2: [RGB, Depth] (default for backward compatibility)
+    - N=3: [RGB, Depth, Orthogonal]
+    - N=4+: Arbitrary modalities
     """
 
     def __init__(
@@ -79,15 +84,14 @@ class LINet(BaseModel):
         device: Optional[str] = None,
         use_amp: bool = False,
         # LINet-specific parameters come AFTER all ResNet parameters
-        stream1_input_channels: int = 3,
-        stream2_input_channels: int = 1,
+        stream_input_channels: list[int] = [3, 1],  # Default: [RGB=3, Depth=1] for backward compatibility
         dropout_p: float = 0.0,  # Dropout probability (0.0 = no dropout, 0.5 = 50% dropout)
         **kwargs
     ) -> None:
         # Store LINet-specific parameters BEFORE calling super().__init__
         # because _build_network() (called by super()) needs these attributes
-        self.stream1_input_channels = stream1_input_channels
-        self.stream2_input_channels = stream2_input_channels
+        self.stream_input_channels = stream_input_channels
+        self.num_streams = len(stream_input_channels)
         self.dropout_p = dropout_p
 
         # Set LINet default norm layer if not specified
@@ -116,47 +120,52 @@ class LINet(BaseModel):
         replace_stride_with_dilation: list[bool]
     ):
         """Build the Linear Integration ResNet network architecture."""
-        # BaseModel already initialized self.stream1_inplanes and self.stream2_inplanes to 64
-        # Now add integrated_inplanes tracking for 3rd stream
+        # Initialize stream inplanes tracking for N streams
+        # All streams start at 64 channels (standard ResNet convention)
+        self.stream_inplanes = [64] * self.num_streams
         self.integrated_inplanes = 64
 
-        # Network architecture - exactly like ResNet but with 3-stream LI components
+        # Network architecture - exactly like ResNet but with N-stream LI components
         # First conv: no integrated input yet (integrated starts after first block)
         self.conv1 = LIConv2d(
-            self.stream1_input_channels, self.stream2_input_channels, 0,  # 0 for integrated_in (doesn't exist yet)
-            self.stream1_inplanes, self.stream2_inplanes, self.integrated_inplanes,
+            self.stream_input_channels,  # list[int] of input channels for each stream
+            self.stream_inplanes,  # list[int] of output channels for each stream (all 64)
+            0,  # integrated_in_channels (doesn't exist yet)
+            self.integrated_inplanes,  # integrated_out_channels (64)
             kernel_size=7, stride=2, padding=3, bias=False
         )
-        self.bn1 = self._norm_layer(self.stream1_inplanes, self.stream2_inplanes, self.integrated_inplanes)
+        self.bn1 = self._norm_layer(self.stream_inplanes, self.integrated_inplanes)
         self.relu = LIReLU(inplace=True)
         self.maxpool = LIMaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        # ResNet layers - equal scaling for all 3 streams
-        self.layer1 = self._make_layer(block, 64, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, 256, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
-        self.layer4 = self._make_layer(block, 512, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+        # ResNet layers - equal scaling for all N streams
+        # Integrated pathway follows standard ResNet channel progression: 64, 128, 256, 512
+        self.layer1 = self._make_layer(block, [64] * self.num_streams, 64, layers[0])
+        self.layer2 = self._make_layer(block, [128] * self.num_streams, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
+        self.layer3 = self._make_layer(block, [256] * self.num_streams, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
+        self.layer4 = self._make_layer(block, [512] * self.num_streams, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
 
         # Adaptive average pooling for integrated stream only
-        # (Stream1/Stream2 pooling happens in LIMaxPool2d layers)
+        # (Stream pooling happens in LIMaxPool2d layers)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
         # Add dropout for regularization (configurable, critical for small datasets)
         self.dropout = nn.Dropout(p=self.dropout_p) if self.dropout_p > 0.0 else nn.Identity()
 
         # Single classifier for integrated stream features
-        # No fusion needed - integrated stream is the final representation!
         feature_dim = 512 * block.expansion
-        self.fc = nn.Linear(feature_dim, self.num_classes)
+        self.fc = nn.Linear(512 * block.expansion, self.num_classes)
 
         # Auxiliary classifiers for stream monitoring (gradient-isolated)
         # These learn to classify from stream features but DON'T affect stream training via .detach()
         # Only used when stream_monitoring=True
-        self.fc_stream1 = nn.Linear(feature_dim, self.num_classes)
-        self.fc_stream2 = nn.Linear(feature_dim, self.num_classes)
+        self.fc_streams = nn.ModuleList([
+            nn.Linear(feature_dim, self.num_classes)
+            for _ in range(self.num_streams)
+        ])
     
     def _initialize_weights(self, zero_init_residual: bool):
-        """Initialize network weights for 3-stream architecture."""
+        """Initialize network weights for N-stream architecture."""
         # Weight initialization for LIConv2d (already handled in LIConv2d.reset_parameters())
         # But we can double-check or add custom initialization here if needed
         for m in self.modules():
@@ -184,15 +193,15 @@ class LINet(BaseModel):
     def _make_layer(
         self,
         block: type[Union[LIBasicBlock, LIBottleneck]],
-        stream1_planes: int,
-        stream2_planes: int,
+        stream_planes: list[int],  # Channel counts for N streams
+        integrated_planes: int,  # Channel count for integrated pathway
         blocks: int,
         stride: int = 1,
         dilate: bool = False,
     ) -> LISequential:
         """
-        Create a layer composed of multiple residual blocks with 3-stream support.
-        Fully compliant with ResNet implementation but using LI blocks with 3-stream channel tracking.
+        Create a layer composed of multiple residual blocks with N-stream support.
+        Fully compliant with ResNet implementation but using LI blocks with N-stream channel tracking.
         """
         norm_layer = self._norm_layer
         downsample = None
@@ -201,32 +210,27 @@ class LINet(BaseModel):
             self.dilation *= stride
             stride = 1
 
-        # Check if downsampling is needed for any stream
-        need_downsample = (stride != 1 or
-                          self.stream1_inplanes != stream1_planes * block.expansion or
-                          self.stream2_inplanes != stream2_planes * block.expansion or
-                          self.integrated_inplanes != stream1_planes * block.expansion)
-
-        if need_downsample:
-            # Downsample all 3 streams together using unified LI neurons
+        # Check if downsampling is needed (exactly like original ResNet)
+        if stride != 1 or self.stream_inplanes != [p * block.expansion for p in stream_planes] or self.integrated_inplanes != integrated_planes * block.expansion:
             downsample = LISequential(
                 LIConv2d(
-                    self.stream1_inplanes, self.stream2_inplanes, self.integrated_inplanes,
-                    stream1_planes * block.expansion, stream2_planes * block.expansion, stream1_planes * block.expansion,
+                    self.stream_inplanes,
+                    [p * block.expansion for p in stream_planes],
+                    self.integrated_inplanes,
+                    integrated_planes * block.expansion,
                     kernel_size=1, stride=stride, bias=False
                 ),
-                norm_layer(stream1_planes * block.expansion, stream2_planes * block.expansion, stream1_planes * block.expansion)
+                norm_layer([p * block.expansion for p in stream_planes], integrated_planes * block.expansion)
             )
 
         layers = []
         # First block with potential downsampling
         layers.append(
             block(
-                self.stream1_inplanes,
-                self.stream2_inplanes,
+                self.stream_inplanes,
+                stream_planes,
                 self.integrated_inplanes,
-                stream1_planes,
-                stream2_planes,
+                integrated_planes,
                 stride,
                 downsample,
                 self.groups,
@@ -236,20 +240,18 @@ class LINet(BaseModel):
             )
         )
 
-        # Update channel tracking for all 3 streams
-        self.stream1_inplanes = stream1_planes * block.expansion
-        self.stream2_inplanes = stream2_planes * block.expansion
-        self.integrated_inplanes = stream1_planes * block.expansion
+        # Update inplanes (exactly like original ResNet)
+        self.stream_inplanes = [p * block.expansion for p in stream_planes]
+        self.integrated_inplanes = integrated_planes * block.expansion
 
         # Remaining blocks
         for _ in range(1, blocks):
             layers.append(
                 block(
-                    self.stream1_inplanes,
-                    self.stream2_inplanes,
+                    self.stream_inplanes,
+                    stream_planes,
                     self.integrated_inplanes,
-                    stream1_planes,
-                    stream2_planes,
+                    integrated_planes,
                     groups=self.groups,
                     base_width=self.base_width,
                     dilation=self.dilation,
@@ -259,34 +261,35 @@ class LINet(BaseModel):
 
         return LISequential(*layers)
     
-    def forward(self, stream1_input: Tensor, stream2_input: Tensor) -> Tensor:
+    def forward(self, stream_inputs: list[Tensor]) -> Tensor:
         """
         Forward pass through the Linear Integration ResNet.
 
         Args:
-            stream1_input: RGB input tensor [batch_size, channels, height, width]
-            stream2_input: Depth input tensor [batch_size, channels, height, width]
+            stream_inputs: List of input tensors, one per stream [batch_size, channels, height, width]
+                          For N=2: [RGB, Depth]
+                          For N=3: [RGB, Depth, Orthogonal]
 
         Returns:
             Classification logits [batch_size, num_classes] from integrated stream
         """
-        # Initial convolution (creates integrated stream from stream1 + stream2)
-        s1, s2, ic = self.conv1(stream1_input, stream2_input, None)  # integrated_input=None for first layer
-        s1, s2, ic = self.bn1(s1, s2, ic)
-        s1, s2, ic = self.relu(s1, s2, ic)
+        # Initial convolution (creates integrated stream from all input streams)
+        stream_outputs, integrated = self.conv1(stream_inputs, None)  # integrated_input=None for first layer
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated)
 
-        # Max pooling (all 3 streams)
-        s1, s2, ic = self.maxpool(s1, s2, ic)
+        # Max pooling (all N streams + integrated)
+        stream_outputs, integrated = self.maxpool(stream_outputs, integrated)
 
-        # ResNet layers (all 3 streams, integration happens inside LIConv2d neurons!)
-        s1, s2, ic = self.layer1(s1, s2, ic)
-        s1, s2, ic = self.layer2(s1, s2, ic)
-        s1, s2, ic = self.layer3(s1, s2, ic)
-        s1, s2, ic = self.layer4(s1, s2, ic)
+        # ResNet layers (all N streams, integration happens inside LIConv2d neurons!)
+        stream_outputs, integrated = self.layer1(stream_outputs, integrated)
+        stream_outputs, integrated = self.layer2(stream_outputs, integrated)
+        stream_outputs, integrated = self.layer3(stream_outputs, integrated)
+        stream_outputs, integrated = self.layer4(stream_outputs, integrated)
 
         # Global average pooling for integrated stream only
         # (We only use integrated stream for final prediction)
-        integrated_pooled = self.avgpool(ic)
+        integrated_pooled = self.avgpool(integrated)
 
         # Flatten integrated features
         integrated_features = torch.flatten(integrated_pooled, 1)
@@ -342,10 +345,14 @@ class LINet(BaseModel):
         }
 
     def _setup_stream_early_stopping(self, enabled: bool, monitor: str,
-                                     stream1_patience: int, stream2_patience: int,
+                                     stream_patience: Union[int, list[int]],
                                      min_delta: float, verbose: bool) -> dict:
         """
-        Initialize stream-specific early stopping state.
+        Initialize stream-specific early stopping state for N streams.
+
+        Args:
+            stream_patience: Either a single int (same patience for all streams) or
+                           list[int] with patience value for each stream
 
         Returns a dictionary with per-stream state and a full model checkpoint
         for when all streams freeze.
@@ -357,33 +364,28 @@ class LINet(BaseModel):
         if monitor not in ('val_loss', 'val_accuracy'):
             raise ValueError(f"Invalid monitor: {monitor}. Use 'val_loss' or 'val_accuracy'.")
 
+        # Convert stream_patience to list if needed
+        if isinstance(stream_patience, int):
+            patience_list = [stream_patience] * self.num_streams
+        else:
+            patience_list = stream_patience
+            if len(patience_list) != self.num_streams:
+                raise ValueError(f"stream_patience list length ({len(patience_list)}) must match num_streams ({self.num_streams})")
+
         # Initialize best metric based on monitor type
         best_metric = float('inf') if monitor == 'val_loss' else 0.0
 
         if verbose:
             print(f"❄️  Stream-specific early stopping enabled:")
             print(f"   Monitor: {monitor}")
-            print(f"   Stream1 patience: {stream1_patience}, Stream2 patience: {stream2_patience}")
+            patience_str = ", ".join([f"Stream{i} patience: {p}" for i, p in enumerate(patience_list)])
+            print(f"   {patience_str}")
             print(f"   Min delta: {min_delta}")
 
-        return {
+        # Create state for each stream dynamically
+        state = {
             'enabled': True,
-            'stream1': {
-                'best_metric': best_metric,
-                'patience': stream1_patience,
-                'patience_counter': 0,
-                'best_epoch': 0,
-                'frozen': False,
-                'best_weights': None
-            },
-            'stream2': {
-                'best_metric': best_metric,
-                'patience': stream2_patience,
-                'patience_counter': 0,
-                'best_epoch': 0,
-                'frozen': False,
-                'best_weights': None
-            },
+            'streams': [],
             'all_frozen': False,
             'best_full_model': {
                 'best_metric': best_metric,
@@ -391,6 +393,19 @@ class LINet(BaseModel):
                 'weights': None
             }
         }
+
+        # Initialize state for each stream
+        for i in range(self.num_streams):
+            state['streams'].append({
+                'best_metric': best_metric,
+                'patience': patience_list[i],
+                'patience_counter': 0,
+                'best_epoch': 0,
+                'frozen': False,
+                'best_weights': None
+            })
+
+        return state
 
     def _should_update_checkpoint(self, current_metric: float, best_metric: float,
                                    monitor: str, min_delta: float) -> bool:
@@ -412,17 +427,12 @@ class LINet(BaseModel):
         This ensures that frozen streams stay at their best performance while
         the rest of the model is at the overall best epoch.
         """
-        if stream_early_stopping_state['stream1']['frozen']:
-            best_weights = stream_early_stopping_state['stream1']['best_weights']
-            if best_weights is not None:
-                for name, weight in best_weights.items():
-                    checkpoint[name] = weight.clone()
-
-        if stream_early_stopping_state['stream2']['frozen']:
-            best_weights = stream_early_stopping_state['stream2']['best_weights']
-            if best_weights is not None:
-                for name, weight in best_weights.items():
-                    checkpoint[name] = weight.clone()
+        for i, stream_state in enumerate(stream_early_stopping_state['streams']):
+            if stream_state['frozen']:
+                best_weights = stream_state['best_weights']
+                if best_weights is not None:
+                    for name, weight in best_weights.items():
+                        checkpoint[name] = weight.clone()
 
     def _restore_checkpoint(self, checkpoint: dict, verbose: bool = True,
                            stream_early_stopping_state: Optional[dict] = None) -> None:
@@ -432,10 +442,9 @@ class LINet(BaseModel):
         if verbose:
             if stream_early_stopping_state and stream_early_stopping_state['enabled']:
                 frozen_streams = []
-                if stream_early_stopping_state['stream1']['frozen']:
-                    frozen_streams.append("Stream1")
-                if stream_early_stopping_state['stream2']['frozen']:
-                    frozen_streams.append("Stream2")
+                for i, stream_state in enumerate(stream_early_stopping_state['streams']):
+                    if stream_state['frozen']:
+                        frozen_streams.append(f"Stream{i}")
 
                 if frozen_streams:
                     print(f"🔄 Restored best model weights (preserved frozen {', '.join(frozen_streams)})")
@@ -472,9 +481,12 @@ class LINet(BaseModel):
 
     def _check_stream_improvement(self, stream_state: dict, stream_metric: float,
                                   monitor: str, min_delta: float, epoch: int,
-                                  stream_name: str) -> bool:
+                                  stream_index: int) -> bool:
         """
         Check if a stream has improved and update its state accordingly.
+
+        Args:
+            stream_index: Index of the stream (0, 1, 2, ...)
 
         Returns:
             True if improvement detected, False otherwise
@@ -486,11 +498,12 @@ class LINet(BaseModel):
             stream_state['patience_counter'] = 0
 
             # Save best stream weights using state_dict
+            # Match parameters with .stream_weights.{stream_index}. pattern
             model_state = self.state_dict()
             stream_state['best_weights'] = {
                 name: weight.cpu().clone()
                 for name, weight in model_state.items()
-                if f'.{stream_name}_' in name
+                if f'.stream_weights.{stream_index}.' in name
             }
             return True
         else:
@@ -498,15 +511,20 @@ class LINet(BaseModel):
             stream_state['patience_counter'] += 1
             return False
 
-    def _freeze_stream(self, stream_state: dict, stream_name: str,
+    def _freeze_stream(self, stream_state: dict, stream_index: int,
                       epoch: int, monitor: str, verbose: bool) -> None:
         """
         Freeze a stream by restoring its best weights and setting requires_grad=False.
+
+        Args:
+            stream_index: Index of the stream to freeze (0, 1, 2, ...)
         """
         # Restore best weights before freezing
         if stream_state['best_weights'] is not None:
             for name, param in self.named_parameters():
-                if f'.{stream_name}_' in name and name in stream_state['best_weights']:
+                # Restore stream_weights and stream_biases (but not integration_from_streams)
+                if (f'.stream_weights.{stream_index}' in name or f'.stream_biases.{stream_index}' in name) \
+                   and name in stream_state['best_weights']:
                     param.data.copy_(stream_state['best_weights'][name].to(param.device))
 
         # Freeze stream
@@ -516,13 +534,12 @@ class LINet(BaseModel):
         # Set requires_grad = False for stream parameters
         # Integration weights remain trainable to allow rebalancing
         for name, param in self.named_parameters():
-            if f'.{stream_name}_' in name:
+            if f'.stream_weights.{stream_index}' in name or f'.stream_biases.{stream_index}' in name:
                 param.requires_grad = False
 
         if verbose:
             metric_str = f"{monitor}: {stream_state['best_metric']:.4f}"
-            stream_label = "Stream1 (RGB)" if stream_name == "stream1" else "Stream2 (Depth)"
-            print(f"❄️  {stream_label} frozen (no improvement for {stream_state['patience']} epochs, "
+            print(f"❄️  Stream{stream_index} frozen (no improvement for {stream_state['patience']} epochs, "
                   f"best {metric_str} at epoch {stream_state['best_epoch'] + 1})")
 
     def _restore_best_full_model(self, stream_early_stopping_state: dict,
@@ -545,10 +562,9 @@ class LINet(BaseModel):
 
                 # Build message showing which streams are frozen
                 frozen_streams = []
-                if stream_early_stopping_state['stream1']['frozen']:
-                    frozen_streams.append(f"Stream1 at epoch {stream_early_stopping_state['stream1']['best_epoch'] + 1}")
-                if stream_early_stopping_state['stream2']['frozen']:
-                    frozen_streams.append(f"Stream2 at epoch {stream_early_stopping_state['stream2']['best_epoch'] + 1}")
+                for i, stream_state in enumerate(stream_early_stopping_state['streams']):
+                    if stream_state['frozen']:
+                        frozen_streams.append(f"Stream{i} at epoch {stream_state['best_epoch'] + 1}")
 
                 if frozen_streams:
                     frozen_info = ", ".join(frozen_streams)
@@ -580,45 +596,25 @@ class LINet(BaseModel):
         self._update_best_full_model(stream_early_stopping_state, val_loss, val_acc,
                                      monitor, min_delta, epoch)
 
-        # Check Stream1
-        if not stream_early_stopping_state['stream1']['frozen']:
-            # Get current metric
-            if monitor == 'val_loss':
-                stream1_metric = stream_stats.get('stream1_val_loss', float('inf'))
-            else:
-                stream1_metric = stream_stats.get('stream1_val_acc', 0.0)
+        # Check each stream
+        for i, stream_state in enumerate(stream_early_stopping_state['streams']):
+            if not stream_state['frozen']:
+                # Get current metric for this stream
+                if monitor == 'val_loss':
+                    stream_metric = stream_stats.get(f'stream_{i}_val_loss', float('inf'))
+                else:
+                    stream_metric = stream_stats.get(f'stream_{i}_val_acc', 0.0)
 
-            stream1_state = stream_early_stopping_state['stream1']
+                # Check for improvement
+                improved = self._check_stream_improvement(stream_state, stream_metric,
+                                                          monitor, min_delta, epoch, i)
 
-            # Check for improvement
-            improved = self._check_stream_improvement(stream1_state, stream1_metric,
-                                                      monitor, min_delta, epoch, 'stream1')
-
-            # Freeze if patience exhausted
-            if not improved and stream1_state['patience_counter'] > stream1_state['patience']:
-                self._freeze_stream(stream1_state, 'stream1', epoch, monitor, verbose)
-
-        # Check Stream2
-        if not stream_early_stopping_state['stream2']['frozen']:
-            # Get current metric
-            if monitor == 'val_loss':
-                stream2_metric = stream_stats.get('stream2_val_loss', float('inf'))
-            else:
-                stream2_metric = stream_stats.get('stream2_val_acc', 0.0)
-
-            stream2_state = stream_early_stopping_state['stream2']
-
-            # Check for improvement
-            improved = self._check_stream_improvement(stream2_state, stream2_metric,
-                                                      monitor, min_delta, epoch, 'stream2')
-
-            # Freeze if patience exhausted
-            if not improved and stream2_state['patience_counter'] > stream2_state['patience']:
-                self._freeze_stream(stream2_state, 'stream2', epoch, monitor, verbose)
+                # Freeze if patience exhausted
+                if not improved and stream_state['patience_counter'] > stream_state['patience']:
+                    self._freeze_stream(stream_state, i, epoch, monitor, verbose)
 
         # Check if all streams are frozen
-        all_frozen = (stream_early_stopping_state['stream1']['frozen'] and
-                     stream_early_stopping_state['stream2']['frozen'])
+        all_frozen = all(stream_state['frozen'] for stream_state in stream_early_stopping_state['streams'])
 
         # If all streams just became frozen, restore best full model
         if all_frozen and not stream_early_stopping_state['all_frozen']:
@@ -648,8 +644,7 @@ class LINet(BaseModel):
         clear_cache_per_epoch: bool = False,  # Clear CUDA cache after each epoch (only if experiencing OOM)
         stream_monitoring: bool = False,  # Enable stream-specific monitoring (LR, WD, acc per stream)
         stream_early_stopping: bool = False,  # Enable stream-specific early stopping (freezes streams when they plateau)
-        stream1_patience: int = 10,  # Patience for Stream1 (RGB) before freezing
-        stream2_patience: int = 10,  # Patience for Stream2 (Depth) before freezing
+        stream_patience: Union[int, list[int]] = 10,  # Patience per stream (int for all, or list[int] per stream)
         stream_min_delta: float = 0.001  # Minimum improvement for stream early stopping
     ) -> dict:
         """
@@ -673,16 +668,17 @@ class LINet(BaseModel):
             grad_clip_norm: Maximum gradient norm for clipping (None to disable). Standard values: 1.0 or 5.0
             clear_cache_per_epoch: Whether to clear CUDA cache after each epoch (only enable if OOM issues)
             stream_monitoring: Enable stream-specific monitoring. Shows per-stream LR, WD, train/val acc.
-                            Auxiliary classifiers (fc_stream1, fc_stream2) learn to classify stream features
+                            Auxiliary classifiers (fc_streams[i] for i in 0..N-1) learn to classify stream features
                             but are gradient-isolated (use .detach()) so they DON'T affect stream weight training.
                             This provides accurate stream accuracy metrics without changing main training dynamics.
             stream_early_stopping: Enable stream-specific early stopping. When a stream plateaus, its
-                                 parameters (.stream1_weight/.stream2_weight) are frozen while integration
-                                 weights remain trainable, allowing the model to continue learning from the
-                                 other stream. Training stops when both streams are frozen. Uses same monitor
+                                 parameters (.stream_weights.{i}.) are frozen while integration
+                                 weights remain trainable, allowing the model to continue learning from
+                                 other streams. Training stops when all streams are frozen. Uses same monitor
                                  metric as main early stopping.
-            stream1_patience: Number of epochs to wait before freezing Stream1 (RGB) if no improvement
-            stream2_patience: Number of epochs to wait before freezing Stream2 (Depth) if no improvement
+            stream_patience: Patience for each stream before freezing. Can be:
+                           - int: same patience for all streams
+                           - list[int]: individual patience per stream
             stream_min_delta: Minimum improvement for stream metrics to count as progress
 
         Returns:
@@ -700,7 +696,7 @@ class LINet(BaseModel):
 
         # Stream-specific early stopping setup (uses same monitor as main early stopping)
         stream_early_stopping_state = self._setup_stream_early_stopping(
-            stream_early_stopping, monitor, stream1_patience, stream2_patience, stream_min_delta, verbose
+            stream_early_stopping, monitor, stream_patience, stream_min_delta, verbose
         )
 
         # Warn if stream_early_stopping enabled without stream_monitoring
@@ -712,10 +708,11 @@ class LINet(BaseModel):
         # This ensures auxiliary training doesn't affect main model's optimizer state
         aux_optimizer = None
         if stream_monitoring:
-            aux_params = [
-                self.fc_stream1.weight, self.fc_stream1.bias,
-                self.fc_stream2.weight, self.fc_stream2.bias
-            ]
+            # Collect all auxiliary classifier parameters from fc_streams ModuleList
+            aux_params = []
+            for fc_stream in self.fc_streams:
+                aux_params.extend([fc_stream.weight, fc_stream.bias])
+
             # Use same optimizer type and ALL hyperparameters as main optimizer
             # This ensures auxiliary classifiers train identically to main model
             main_group = self.optimizer.param_groups[0]
@@ -778,18 +775,17 @@ class LINet(BaseModel):
             'train_accuracy': [],
             'val_accuracy': [],
             'learning_rates': [],
-            # Stream-specific metrics (populated if stream_monitoring=True)
-            'stream1_train_acc': [],
-            'stream1_val_acc': [],
-            'stream2_train_acc': [],
-            'stream2_val_acc': [],
-            'stream1_lr': [],
-            'stream2_lr': [],
             # Stream freezing events (populated if stream_early_stopping=True)
-            'stream1_frozen_epoch': None,
-            'stream2_frozen_epoch': None,
-            'streams_frozen': []  # List of (epoch, stream_name) tuples
+            'streams_frozen': []  # List of (epoch, stream_index) tuples
         }
+
+        # Add stream-specific metrics dynamically (if stream_monitoring=True)
+        if stream_monitoring:
+            for i in range(self.num_streams):
+                history[f'stream_{i}_train_acc'] = []
+                history[f'stream_{i}_val_acc'] = []
+                history[f'stream_{i}_lr'] = []
+                history[f'stream_{i}_frozen_epoch'] = None
 
         # Scheduler is already set by compile(), no need to create it here
 
@@ -803,7 +799,7 @@ class LINet(BaseModel):
             pbar = create_progress_bar(verbose, epoch, epochs, total_steps)
             
             # Training phase - use helper method
-            avg_train_loss, train_accuracy, stream1_train_acc, stream2_train_acc = self._train_epoch(
+            avg_train_loss, train_accuracy, stream_train_accs = self._train_epoch(
                 train_loader, history, pbar, gradient_accumulation_steps, grad_clip_norm, clear_cache_per_epoch,
                 stream_monitoring=stream_monitoring, aux_optimizer=aux_optimizer
             )
@@ -811,13 +807,11 @@ class LINet(BaseModel):
             # Validation phase
             val_loss = 0.0
             val_acc = 0.0
-            stream1_val_acc = 0.0
-            stream2_val_acc = 0.0
-            stream1_val_loss = 0.0
-            stream2_val_loss = 0.0
+            stream_val_accs = [0.0] * self.num_streams
+            stream_val_losses = [0.0] * self.num_streams
 
             if val_loader:
-                val_loss, val_acc, stream1_val_acc, stream2_val_acc, stream1_val_loss, stream2_val_loss = self._validate(
+                val_loss, val_acc, stream_val_accs, stream_val_losses = self._validate(
                     val_loader, pbar=pbar, stream_monitoring=stream_monitoring
                 )
                 
@@ -906,42 +900,37 @@ class LINet(BaseModel):
             # Stream-specific monitoring (print immediately after progress bar, on same line continuation)
             stream_stats = {}
             if stream_monitoring:
-                # Always save stream accuracies to history (computed during training/validation)
-                history['stream1_train_acc'].append(stream1_train_acc)
-                history['stream1_val_acc'].append(stream1_val_acc)
-                history['stream2_train_acc'].append(stream2_train_acc)
-                history['stream2_val_acc'].append(stream2_val_acc)
+                # Always save stream accuracies to history (computed during training/validation) - N streams
+                for i in range(self.num_streams):
+                    history[f'stream_{i}_train_acc'].append(stream_train_accs[i])
+                    history[f'stream_{i}_val_acc'].append(stream_val_accs[i])
 
                 # Print detailed metrics only if using stream-specific parameter groups
-                if len(self.optimizer.param_groups) >= 3:
+                if len(self.optimizer.param_groups) >= self.num_streams + 1:
                     stream_stats = self._print_stream_monitoring(
-                        stream1_train_acc=stream1_train_acc,
-                        stream1_val_acc=stream1_val_acc,
-                        stream2_train_acc=stream2_train_acc,
-                        stream2_val_acc=stream2_val_acc,
-                        stream1_val_loss=stream1_val_loss,
-                        stream2_val_loss=stream2_val_loss
+                        stream_train_accs=stream_train_accs,
+                        stream_val_accs=stream_val_accs,
+                        stream_val_losses=stream_val_losses
                     )
                     # Save learning rates (only available with stream-specific param groups)
                     if stream_stats:
-                        history['stream1_lr'].append(stream_stats['stream1_lr'])
-                        history['stream2_lr'].append(stream_stats['stream2_lr'])
+                        for i in range(self.num_streams):
+                            history[f'stream_{i}_lr'].append(stream_stats[f'stream_{i}_lr'])
                 else:
                     # Create minimal stream_stats for compatibility
-                    stream_stats = {
-                        'stream1_train_acc': stream1_train_acc,
-                        'stream1_val_acc': stream1_val_acc,
-                        'stream1_val_loss': stream1_val_loss,
-                        'stream2_train_acc': stream2_train_acc,
-                        'stream2_val_acc': stream2_val_acc,
-                        'stream2_val_loss': stream2_val_loss
-                    }
+                    stream_stats = {}
+                    for i in range(self.num_streams):
+                        stream_stats[f'stream_{i}_train_acc'] = stream_train_accs[i]
+                        stream_stats[f'stream_{i}_val_acc'] = stream_val_accs[i]
+                        stream_stats[f'stream_{i}_val_loss'] = stream_val_losses[i]
 
             # Stream-specific early stopping (freeze streams when they plateau)
             if stream_early_stopping_state['enabled'] and stream_stats:
-                # Track previous frozen states
-                prev_stream1_frozen = stream_early_stopping_state['stream1']['frozen']
-                prev_stream2_frozen = stream_early_stopping_state['stream2']['frozen']
+                # Track previous frozen states for all N streams
+                prev_frozen_states = [
+                    stream_early_stopping_state['streams'][i]['frozen']
+                    for i in range(self.num_streams)
+                ]
 
                 # Check for stream early stopping using our new method
                 all_streams_frozen = self._check_stream_early_stopping(
@@ -955,52 +944,30 @@ class LINet(BaseModel):
                     val_loss=val_loss
                 )
 
-                # Record freezing events and update checkpoints
-                if not prev_stream1_frozen and stream_early_stopping_state['stream1']['frozen']:
-                    history['stream1_frozen_epoch'] = epoch + 1
-                    history['streams_frozen'].append((epoch + 1, 'Stream1'))
+                # Record freezing events and update checkpoints for each stream
+                for i in range(self.num_streams):
+                    if not prev_frozen_states[i] and stream_early_stopping_state['streams'][i]['frozen']:
+                        history[f'stream_{i}_frozen_epoch'] = epoch + 1
+                        history['streams_frozen'].append((epoch + 1, f'Stream_{i}'))
 
-                    # Update main early stopping checkpoint with frozen Stream1 weights
-                    if early_stopping_state['enabled'] and restore_best_weights:
-                        # Create checkpoint if it doesn't exist yet
-                        if early_stopping_state.get('best_weights') is None:
-                            early_stopping_state['best_weights'] = self._save_checkpoint()
+                        # Update main early stopping checkpoint with frozen stream weights
+                        if early_stopping_state['enabled'] and restore_best_weights:
+                            # Create checkpoint if it doesn't exist yet
+                            if early_stopping_state.get('best_weights') is None:
+                                early_stopping_state['best_weights'] = self._save_checkpoint()
 
-                        # Update with frozen stream weights
-                        self._update_frozen_stream_weights_in_checkpoint(
-                            early_stopping_state['best_weights'],
-                            stream_early_stopping_state
-                        )
+                            # Update with frozen stream weights
+                            self._update_frozen_stream_weights_in_checkpoint(
+                                early_stopping_state['best_weights'],
+                                stream_early_stopping_state
+                            )
 
-                    # Also update stream ES checkpoint (used when all streams freeze)
-                    if stream_early_stopping_state['best_full_model']['weights'] is not None:
-                        self._update_frozen_stream_weights_in_checkpoint(
-                            stream_early_stopping_state['best_full_model']['weights'],
-                            stream_early_stopping_state
-                        )
-
-                if not prev_stream2_frozen and stream_early_stopping_state['stream2']['frozen']:
-                    history['stream2_frozen_epoch'] = epoch + 1
-                    history['streams_frozen'].append((epoch + 1, 'Stream2'))
-
-                    # Update main early stopping checkpoint with frozen Stream2 weights
-                    if early_stopping_state['enabled'] and restore_best_weights:
-                        # Create checkpoint if it doesn't exist yet
-                        if early_stopping_state.get('best_weights') is None:
-                            early_stopping_state['best_weights'] = self._save_checkpoint()
-
-                        # Update with frozen stream weights
-                        self._update_frozen_stream_weights_in_checkpoint(
-                            early_stopping_state['best_weights'],
-                            stream_early_stopping_state
-                        )
-
-                    # Also update stream ES checkpoint (used when all streams freeze)
-                    if stream_early_stopping_state['best_full_model']['weights'] is not None:
-                        self._update_frozen_stream_weights_in_checkpoint(
-                            stream_early_stopping_state['best_full_model']['weights'],
-                            stream_early_stopping_state
-                        )
+                        # Also update stream ES checkpoint (used when all streams freeze)
+                        if stream_early_stopping_state['best_full_model']['weights'] is not None:
+                            self._update_frozen_stream_weights_in_checkpoint(
+                                stream_early_stopping_state['best_full_model']['weights'],
+                                stream_early_stopping_state
+                            )
 
                 # Stop training if all streams are frozen
                 if all_streams_frozen:
@@ -1034,67 +1001,74 @@ class LINet(BaseModel):
             # Use monitor parameter (monitor is shared between main and stream early stopping)
             history['stream_early_stopping'] = {
                 'monitor': monitor,
-                'stream1_frozen': stream_early_stopping_state['stream1']['frozen'],
-                'stream1_frozen_epoch': history['stream1_frozen_epoch'],
-                'stream1_best_metric': stream_early_stopping_state['stream1']['best_metric'],
-                'stream2_frozen': stream_early_stopping_state['stream2']['frozen'],
-                'stream2_frozen_epoch': history['stream2_frozen_epoch'],
-                'stream2_best_metric': stream_early_stopping_state['stream2']['best_metric'],
                 'all_frozen': stream_early_stopping_state['all_frozen']
             }
+
+            # Add per-stream data dynamically
+            for i in range(self.num_streams):
+                stream_key = f'stream_{i}'
+                history['stream_early_stopping'][f'{stream_key}_frozen'] = stream_early_stopping_state['streams'][i]['frozen']
+                history['stream_early_stopping'][f'{stream_key}_frozen_epoch'] = history[f'{stream_key}_frozen_epoch']
+                history['stream_early_stopping'][f'{stream_key}_best_metric'] = stream_early_stopping_state['streams'][i]['best_metric']
 
             if verbose:
                 print("\n❄️  Stream Early Stopping Summary:")
                 print(f"   Monitor: {monitor}")
-                if stream_early_stopping_state['stream1']['frozen']:
-                    print(f"   Stream1: Frozen at epoch {history['stream1_frozen_epoch']} "
-                          f"(best {monitor}: {stream_early_stopping_state['stream1']['best_metric']:.4f})")
-                else:
-                    print(f"   Stream1: Not frozen (final {monitor}: {stream_early_stopping_state['stream1']['best_metric']:.4f})")
-
-                if stream_early_stopping_state['stream2']['frozen']:
-                    print(f"   Stream2: Frozen at epoch {history['stream2_frozen_epoch']} "
-                          f"(best {monitor}: {stream_early_stopping_state['stream2']['best_metric']:.4f})")
-                else:
-                    print(f"   Stream2: Not frozen (final {monitor}: {stream_early_stopping_state['stream2']['best_metric']:.4f})")
+                for i in range(self.num_streams):
+                    stream_key = f'stream_{i}'
+                    if stream_early_stopping_state['streams'][i]['frozen']:
+                        print(f"   Stream_{i}: Frozen at epoch {history[f'{stream_key}_frozen_epoch']} "
+                              f"(best {monitor}: {stream_early_stopping_state['streams'][i]['best_metric']:.4f})")
+                    else:
+                        print(f"   Stream_{i}: Not frozen (final {monitor}: {stream_early_stopping_state['streams'][i]['best_metric']:.4f})")
 
         return history
 
-    def evaluate(self, data_loader: DataLoader, stream_monitoring: bool = True) -> dict:
+    def evaluate(self, data_loader: DataLoader, stream_monitoring: bool = True) -> dict[str, float]:
         """
         Evaluate the model on the given data.
 
+        DataLoader format: Tuple of (stream1, stream2, ..., streamN, labels)
+        Each stream is a tensor of shape [B, C, H, W]
+
         Args:
-            data_loader: DataLoader containing dual-channel input data and targets
+            data_loader: DataLoader containing N-stream input data and targets
             stream_monitoring: Whether to calculate stream-specific metrics (default: True)
 
         Returns:
-            Dictionary containing evaluation metrics
+            Dictionary containing evaluation metrics (e.g., accuracy, loss, stream accuracies)
         """
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before evaluate().")
 
-        loss, accuracy, stream1_val_acc, stream2_val_acc, stream1_val_loss, stream2_val_loss = self._validate(
+        loss, accuracy, stream_val_accs, stream_val_losses = self._validate(
             data_loader, stream_monitoring=stream_monitoring
         )
 
-        return {
+        # Build result dictionary with N streams
+        result = {
             'loss': loss,
             'accuracy': accuracy,
-            'stream1_accuracy': stream1_val_acc,
-            'stream2_accuracy': stream2_val_acc,
-            'stream1_loss': stream1_val_loss,
-            'stream2_loss': stream2_val_loss
         }
-    def predict(self, data_loader: DataLoader) -> torch.Tensor:
+
+        # Add stream-specific metrics
+        for i in range(self.num_streams):
+            result[f'stream{i}_accuracy'] = stream_val_accs[i]
+            result[f'stream{i}_loss'] = stream_val_losses[i]
+
+        return result
+    def predict(self, data_loader: DataLoader) -> np.ndarray:
         """
         Generate predictions for the input data.
 
+        DataLoader format: Tuple of (stream1, stream2, ..., streamN, labels)
+        Each stream is a tensor of shape [B, C, H, W]
+
         Args:
-            data_loader: DataLoader containing dual-channel input data
+            data_loader: DataLoader containing N-stream input data
 
         Returns:
-            Tensor of predicted classes
+            Predicted class labels as numpy array
         """
         if self.device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1104,26 +1078,32 @@ class LINet(BaseModel):
         all_predictions = []
 
         with torch.no_grad():
-            for stream1_batch, stream2_batch, targets in data_loader:
-                # GPU optimization: non-blocking transfer for dual-channel data
-                stream1_batch = stream1_batch.to(self.device, non_blocking=True)
-                stream2_batch = stream2_batch.to(self.device, non_blocking=True)
+            for batch_data in data_loader:
+                # Unpack N streams + labels from tuple format
+                # DataLoader returns: (stream1, stream2, ..., streamN, labels)
+                *stream_batches, _ = batch_data
 
-                outputs = self(stream1_batch, stream2_batch)
+                # GPU optimization: non-blocking transfer for N-stream data
+                stream_batches = [stream.to(self.device, non_blocking=True) for stream in stream_batches]
+
+                outputs = self(stream_batches)
                 _, predictions = torch.max(outputs, 1)
-                all_predictions.append(predictions.cpu())
+                all_predictions.append(predictions.cpu().numpy())
 
-        return torch.cat(all_predictions, dim=0)
+        return np.concatenate(all_predictions, axis=0)
     
     def predict_proba(self, data_loader: DataLoader) -> np.ndarray:
         """
         Generate probability predictions for the input data.
 
+        DataLoader format: Tuple of (stream1, stream2, ..., streamN, labels)
+        Each stream is a tensor of shape [B, C, H, W]
+
         Args:
-            data_loader: DataLoader containing dual-channel input data
+            data_loader: DataLoader containing N-stream input data
 
         Returns:
-            Numpy array of predicted probabilities with shape (n_samples, n_classes)
+            Predicted probabilities as numpy array [num_samples, num_classes]
         """
         if self.device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1133,12 +1113,15 @@ class LINet(BaseModel):
         all_probabilities = []
 
         with torch.no_grad():
-            for stream1_batch, stream2_batch, targets in data_loader:
-                # GPU optimization: non-blocking transfer for dual-channel data
-                stream1_batch = stream1_batch.to(self.device, non_blocking=True)
-                stream2_batch = stream2_batch.to(self.device, non_blocking=True)
+            for batch_data in data_loader:
+                # Unpack N streams + labels from tuple format
+                # DataLoader returns: (stream1, stream2, ..., streamN, labels)
+                *stream_batches, _ = batch_data
 
-                outputs = self(stream1_batch, stream2_batch)
+                # GPU optimization: non-blocking transfer for N-stream data
+                stream_batches = [stream.to(self.device, non_blocking=True) for stream in stream_batches]
+
+                outputs = self(stream_batches)
                 # Apply softmax to get probabilities
                 probabilities = torch.softmax(outputs, dim=1)
                 all_probabilities.append(probabilities.cpu().numpy())
@@ -1165,8 +1148,8 @@ class LINet(BaseModel):
                             to provide accurate monitoring without affecting main model.
 
         Returns:
-            Tuple of (average_train_loss, train_accuracy, stream1_train_acc, stream2_train_acc)
-            If stream_monitoring=False, stream accuracies will be 0.0
+            Tuple of (average_train_loss, train_accuracy, stream_accs: list[float])
+            If stream_monitoring=False, stream_accs will be list of 0.0 values
         """
         self.train()
         train_loss = 0.0
@@ -1174,9 +1157,8 @@ class LINet(BaseModel):
         train_correct = 0
         train_total = 0
 
-        # Stream-specific tracking (if monitoring enabled)
-        stream1_train_correct = 0
-        stream2_train_correct = 0
+        # Stream-specific tracking (if monitoring enabled) - N streams
+        stream_train_correct = [0] * self.num_streams
         stream_train_total = 0
         
         # Ensure gradient_accumulation_steps is at least 1 to avoid division by zero
@@ -1184,11 +1166,14 @@ class LINet(BaseModel):
         
         # OPTIMIZATION 1: Progress bar update frequency - major performance improvement
         update_frequency = max(1, len(train_loader) // 50)  # Update only 50 times per epoch
-        
-        for batch_idx, (stream1_batch, stream2_batch, targets) in enumerate(train_loader):
-            # GPU optimization: non-blocking transfer for dual-channel data
-            stream1_batch = stream1_batch.to(self.device, non_blocking=True)
-            stream2_batch = stream2_batch.to(self.device, non_blocking=True)
+
+        for batch_idx, batch_data in enumerate(train_loader):
+            # Unpack N streams + targets from tuple format
+            # DataLoader returns: (stream1, stream2, ..., streamN, labels)
+            *stream_batches, targets = batch_data
+
+            # GPU optimization: non-blocking transfer for all streams
+            stream_batches = [batch.to(self.device, non_blocking=True) for batch in stream_batches]
             targets = targets.to(self.device, non_blocking=True)
             
             # OPTIMIZATION 5: Gradient accumulation - zero gradients only when starting accumulation
@@ -1198,15 +1183,15 @@ class LINet(BaseModel):
             if self.use_amp:
                 # Use automatic mixed precision
                 with autocast(device_type=self.device.type):
-                    outputs = self(stream1_batch, stream2_batch)
+                    outputs = self(stream_batches)
                     loss = self.criterion(outputs, targets)
                     # Scale loss for gradient accumulation
                     if gradient_accumulation_steps > 1:
                         loss = loss / gradient_accumulation_steps
-                
+
                 # Scale loss and backward pass
                 self.scaler.scale(loss).backward()
-                
+
                 # OPTIMIZATION 5: Only step optimizer every accumulation_steps
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx == len(train_loader) - 1:
                     # Gradient clipping (if enabled)
@@ -1228,7 +1213,7 @@ class LINet(BaseModel):
                             history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
             else:
                 # Standard precision training
-                outputs = self(stream1_batch, stream2_batch)
+                outputs = self(stream_batches)
                 loss = self.criterion(outputs, targets)
                 # Scale loss for gradient accumulation
                 if gradient_accumulation_steps > 1:
@@ -1264,34 +1249,34 @@ class LINet(BaseModel):
             # Note: Full gradients used (no scaling) for accurate monitoring
             if stream_monitoring:
                 # === TRAINING PHASE: Train auxiliary classifiers ===
-                # Forward through stream pathways
-                stream1_features = self._forward_stream1_pathway(stream1_batch)
-                stream2_features = self._forward_stream2_pathway(stream2_batch)
+                # Forward through stream pathways and compute auxiliary losses
+                aux_losses = []
+                for i in range(self.num_streams):
+                    # Forward through this stream's pathway
+                    stream_features = self._forward_stream_pathway(i, stream_batches[i])
 
-                # DETACH features - stops gradient flow to stream weights!
-                stream1_features_detached = stream1_features.detach()
-                stream2_features_detached = stream2_features.detach()
+                    # DETACH features - stops gradient flow to stream weights!
+                    stream_features_detached = stream_features.detach()
 
-                # Classify with auxiliary classifiers (only they get gradients)
-                stream1_outputs = self.fc_stream1(stream1_features_detached)
-                stream2_outputs = self.fc_stream2(stream2_features_detached)
+                    # Classify with auxiliary classifier (only it gets gradients)
+                    stream_outputs = self.fc_streams[i](stream_features_detached)
 
-                # Compute auxiliary losses (full gradient, no scaling)
-                stream1_aux_loss = self.criterion(stream1_outputs, targets)
-                stream2_aux_loss = self.criterion(stream2_outputs, targets)
+                    # Compute auxiliary loss (full gradient, no scaling)
+                    aux_loss = self.criterion(stream_outputs, targets)
+                    aux_losses.append(aux_loss)
 
                 # Backward pass for auxiliary classifiers only (detached features ensure no gradient to streams)
                 # Each stream's classifier learns independently with full gradients
                 # CRITICAL: Use separate aux_optimizer to avoid affecting main optimizer's internal state
                 if self.use_amp:
-                    self.scaler.scale(stream1_aux_loss).backward()
-                    self.scaler.scale(stream2_aux_loss).backward()
+                    for aux_loss in aux_losses:
+                        self.scaler.scale(aux_loss).backward()
                     # Update auxiliary classifiers using separate optimizer
                     self.scaler.step(aux_optimizer)
                     self.scaler.update()
                 else:
-                    stream1_aux_loss.backward()
-                    stream2_aux_loss.backward()
+                    for aux_loss in aux_losses:
+                        aux_loss.backward()
                     # Update auxiliary classifiers using separate optimizer
                     aux_optimizer.step()
 
@@ -1303,19 +1288,13 @@ class LINet(BaseModel):
                     was_training = self.training
                     self.eval()  # Disable dropout, use BN running stats
 
-                    stream1_features = self._forward_stream1_pathway(stream1_batch)
-                    stream2_features = self._forward_stream2_pathway(stream2_batch)
+                    for i in range(self.num_streams):
+                        stream_features = self._forward_stream_pathway(i, stream_batches[i])
+                        stream_outputs = self.fc_streams[i](stream_features)
+                        stream_pred = stream_outputs.argmax(1)
+                        stream_train_correct[i] += (stream_pred == targets).sum().item()
 
-                    stream1_outputs = self.fc_stream1(stream1_features)
-                    stream2_outputs = self.fc_stream2(stream2_features)
-
-                    stream1_pred = stream1_outputs.argmax(1)
-                    stream2_pred = stream2_outputs.argmax(1)
-
-                    stream1_train_correct += (stream1_pred == targets).sum().item()
-                    stream2_train_correct += (stream2_pred == targets).sum().item()
                     stream_train_total += targets.size(0)
-
                     self.train(was_training)  # Restore training mode
 
             # Calculate training accuracy
@@ -1357,15 +1336,17 @@ class LINet(BaseModel):
         avg_train_loss = train_loss / train_batches
         train_accuracy = train_correct / train_total
 
-        # Calculate stream-specific accuracies
-        stream1_train_acc = stream1_train_correct / max(stream_train_total, 1) if stream_monitoring else 0.0
-        stream2_train_acc = stream2_train_correct / max(stream_train_total, 1) if stream_monitoring else 0.0
+        # Calculate stream-specific accuracies (N streams)
+        stream_accs = [
+            stream_train_correct[i] / max(stream_train_total, 1) if stream_monitoring else 0.0
+            for i in range(self.num_streams)
+        ]
 
         # Optional: Clear CUDA cache at end of epoch (only if experiencing OOM issues)
         # if clear_cache_per_epoch and self.device.type == 'cuda':
         #     torch.cuda.empty_cache()
 
-        return avg_train_loss, train_accuracy, stream1_train_acc, stream2_train_acc
+        return avg_train_loss, train_accuracy, stream_accs
     
     def _validate(self, data_loader: DataLoader,
                   pbar: Optional['TqdmType'] = None, stream_monitoring: bool = True) -> tuple:
@@ -1373,13 +1354,13 @@ class LINet(BaseModel):
         Validate the model on the given data with GPU optimizations and reduced progress updates.
 
         Args:
-            data_loader: DataLoader containing dual-channel input data and targets
+            data_loader: DataLoader containing N-stream input data and targets
             pbar: Optional progress bar to update during validation
             stream_monitoring: Whether to track stream-specific metrics during validation
 
         Returns:
-            Tuple of (loss, accuracy, stream1_val_acc, stream2_val_acc, stream1_val_loss, stream2_val_loss)
-            If stream_monitoring=False, stream accuracies and losses will be 0.0
+            Tuple of (loss, accuracy, stream_val_accs: list[float], stream_val_losses: list[float])
+            If stream_monitoring=False, stream accuracies and losses will be lists of 0.0
         """
 
         self.eval()
@@ -1387,30 +1368,31 @@ class LINet(BaseModel):
         correct = 0
         total = 0
 
-        # Stream-specific tracking (if monitoring enabled)
-        stream1_val_correct = 0
-        stream2_val_correct = 0
-        stream1_val_loss = 0.0
-        stream2_val_loss = 0.0
+        # Stream-specific tracking (if monitoring enabled) - N streams
+        stream_val_correct = [0] * self.num_streams
+        stream_val_loss = [0.0] * self.num_streams
         stream_val_total = 0
         
         # OPTIMIZATION 1: Progress bar update frequency for validation - major performance improvement
         update_frequency = max(1, len(data_loader) // 25)  # Update only 25 times during validation
         
         with torch.no_grad():
-            for batch_idx, (stream1_batch, stream2_batch, targets) in enumerate(data_loader):
-                # GPU optimization: non-blocking transfer for dual-channel data
-                stream1_batch = stream1_batch.to(self.device, non_blocking=True)
-                stream2_batch = stream2_batch.to(self.device, non_blocking=True)
+            for batch_idx, batch_data in enumerate(data_loader):
+                # Unpack N streams + targets from tuple format
+                # DataLoader returns: (stream1, stream2, ..., streamN, labels)
+                *stream_batches, targets = batch_data
+
+                # GPU optimization: non-blocking transfer for all streams
+                stream_batches = [batch.to(self.device, non_blocking=True) for batch in stream_batches]
                 targets = targets.to(self.device, non_blocking=True)
-                
+
                 # Use AMP for validation if enabled
                 if self.use_amp:
                     with autocast(device_type=self.device.type):
-                        outputs = self(stream1_batch, stream2_batch)
+                        outputs = self(stream_batches)
                         loss = self.criterion(outputs, targets)
                 else:
-                    outputs = self(stream1_batch, stream2_batch)
+                    outputs = self(stream_batches)
                     loss = self.criterion(outputs, targets)
                 
                 total_loss += loss.item()
@@ -1421,25 +1403,21 @@ class LINet(BaseModel):
                 # Stream-specific monitoring with auxiliary classifiers
                 # Model is already in eval() mode, so dropout is disabled
                 if stream_monitoring:
-                    # Forward through stream pathways
-                    stream1_features = self._forward_stream1_pathway(stream1_batch)
-                    stream2_features = self._forward_stream2_pathway(stream2_batch)
+                    # Forward through stream pathways and compute metrics for all streams
+                    for i in range(self.num_streams):
+                        stream_features = self._forward_stream_pathway(i, stream_batches[i])
 
-                    # Classify with auxiliary classifiers
-                    stream1_outputs = self.fc_stream1(stream1_features)
-                    stream2_outputs = self.fc_stream2(stream2_features)
+                        # Classify with auxiliary classifier
+                        stream_outputs = self.fc_streams[i](stream_features)
 
-                    # Calculate stream losses
-                    stream1_loss = self.criterion(stream1_outputs, targets)
-                    stream2_loss = self.criterion(stream2_outputs, targets)
-                    stream1_val_loss += stream1_loss.item() * targets.size(0)
-                    stream2_val_loss += stream2_loss.item() * targets.size(0)
+                        # Calculate stream loss
+                        loss_i = self.criterion(stream_outputs, targets)
+                        stream_val_loss[i] += loss_i.item() * targets.size(0)
 
-                    stream1_pred = stream1_outputs.argmax(1)
-                    stream2_pred = stream2_outputs.argmax(1)
+                        # Calculate stream accuracy
+                        stream_pred = stream_outputs.argmax(1)
+                        stream_val_correct[i] += (stream_pred == targets).sum().item()
 
-                    stream1_val_correct += (stream1_pred == targets).sum().item()
-                    stream2_val_correct += (stream2_pred == targets).sum().item()
                     stream_val_total += targets.size(0)
 
                 # OPTIMIZATION 1: Update progress bar much less frequently during validation
@@ -1475,27 +1453,27 @@ class LINet(BaseModel):
         avg_loss = total_loss / len(data_loader)
         accuracy = correct / total
 
-        # Calculate stream-specific accuracies and losses
-        stream1_val_acc = stream1_val_correct / max(stream_val_total, 1) if stream_monitoring else 0.0
-        stream2_val_acc = stream2_val_correct / max(stream_val_total, 1) if stream_monitoring else 0.0
-        avg_stream1_val_loss = stream1_val_loss / max(stream_val_total, 1) if stream_monitoring else 0.0
-        avg_stream2_val_loss = stream2_val_loss / max(stream_val_total, 1) if stream_monitoring else 0.0
+        # Calculate stream-specific accuracies and losses (N streams)
+        stream_val_accs = [
+            stream_val_correct[i] / max(stream_val_total, 1) if stream_monitoring else 0.0
+            for i in range(self.num_streams)
+        ]
+        avg_stream_val_losses = [
+            stream_val_loss[i] / max(stream_val_total, 1) if stream_monitoring else 0.0
+            for i in range(self.num_streams)
+        ]
 
-        return avg_loss, accuracy, stream1_val_acc, stream2_val_acc, avg_stream1_val_loss, avg_stream2_val_loss
+        return avg_loss, accuracy, stream_val_accs, avg_stream_val_losses
 
-    def _print_stream_monitoring(self, stream1_train_acc: float, stream1_val_acc: float,
-                                 stream2_train_acc: float, stream2_val_acc: float,
-                                 stream1_val_loss: float = 0.0, stream2_val_loss: float = 0.0) -> dict:
+    def _print_stream_monitoring(self, stream_train_accs: list[float], stream_val_accs: list[float],
+                                 stream_val_losses: list[float]) -> dict:
         """
         Print stream-specific monitoring metrics (computed during main training loop).
 
         Args:
-            stream1_train_acc: Stream1 training accuracy (from full epoch)
-            stream1_val_acc: Stream1 validation accuracy (from full epoch)
-            stream2_train_acc: Stream2 training accuracy (from full epoch)
-            stream2_val_acc: Stream2 validation accuracy (from full epoch)
-            stream1_val_loss: Stream1 validation loss (from full epoch)
-            stream2_val_loss: Stream2 validation loss (from full epoch)
+            stream_train_accs: List of training accuracies for each stream
+            stream_val_accs: List of validation accuracies for each stream
+            stream_val_losses: List of validation losses for each stream
 
         Returns:
             Dictionary containing stream-specific metrics for history tracking
@@ -1503,33 +1481,33 @@ class LINet(BaseModel):
         # Get parameter groups info
         param_groups = self.optimizer.param_groups
 
-        # Build single-line monitoring output for 2 input streams
-        if len(param_groups) >= 3:
-            # Stream1 (RGB)
-            stream1_lr = param_groups[0]['lr']
-            stream1_wd = param_groups[0]['weight_decay']
+        # Build monitoring output for N input streams
+        # If using stream-specific parameter groups, we have N stream groups + 1 shared group
+        if len(param_groups) >= self.num_streams + 1:
+            # Build output strings for each stream
+            stream_strs = []
+            stream_stats = {}
 
-            # Stream2 (Depth)
-            stream2_lr = param_groups[1]['lr']
-            stream2_wd = param_groups[1]['weight_decay']
+            for i in range(self.num_streams):
+                stream_lr = param_groups[i]['lr']
+                stream_wd = param_groups[i]['weight_decay']
 
-            # Display only stream1 and stream2 (full model metrics shown in progress bar above)
-            print(f"  Stream1: V_loss:{stream1_val_loss:.4f}, T_acc:{stream1_train_acc:.4f}, V_acc:{stream1_val_acc:.4f}, LR:{stream1_lr:.2e} | "
-                  f"Stream2: V_loss:{stream2_val_loss:.4f}, T_acc:{stream2_train_acc:.4f}, V_acc:{stream2_val_acc:.4f}, LR:{stream2_lr:.2e}")
+                stream_str = (f"Stream_{i}: "
+                             f"T_acc:{stream_train_accs[i]:.4f}, V_acc:{stream_val_accs[i]:.4f}, "
+                             f"LR:{stream_lr:.2e}")
+                stream_strs.append(stream_str)
 
-            # Return stream stats for history tracking
-            return {
-                'stream1_train_acc': stream1_train_acc,
-                'stream1_val_acc': stream1_val_acc,
-                'stream1_val_loss': stream1_val_loss,
-                'stream2_train_acc': stream2_train_acc,
-                'stream2_val_acc': stream2_val_acc,
-                'stream2_val_loss': stream2_val_loss,
-                'stream1_lr': stream1_lr,
-                'stream1_wd': stream1_wd,
-                'stream2_lr': stream2_lr,
-                'stream2_wd': stream2_wd
-            }
+                # Add to stats dict
+                stream_stats[f'stream_{i}_train_acc'] = stream_train_accs[i]
+                stream_stats[f'stream_{i}_val_acc'] = stream_val_accs[i]
+                stream_stats[f'stream_{i}_val_loss'] = stream_val_losses[i]
+                stream_stats[f'stream_{i}_lr'] = stream_lr
+                stream_stats[f'stream_{i}_wd'] = stream_wd
+
+            # Print all streams on one line, separated by " | "
+            print("  " + " | ".join(stream_strs))
+
+            return stream_stats
 
         return {}
 
@@ -1545,108 +1523,91 @@ class LINet(BaseModel):
         """
         return "linear_integration"
     
-    def _forward_stream1_pathway(self, stream1_input: torch.Tensor) -> torch.Tensor:
+    def _forward_stream_pathway(self, stream_idx: int, stream_input: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass through the stream1 pathway only.
+        Forward pass through a single stream pathway.
 
         Args:
-            stream1_input: The stream1 input tensor.
+            stream_idx: Index of the stream to forward through (0-indexed)
+            stream_input: The stream input tensor [batch_size, channels, height, width]
 
         Returns:
-            The stream1 pathway output tensor (flattened features).
+            The stream pathway output tensor (flattened features) [batch_size, feature_dim]
         """
-        # Process through stream1 pathway of multi-channel layers
-        stream1_x = stream1_input
+        # Create dummy inputs for other streams (they won't be used but needed for layer signature)
+        # We'll only extract the output for the stream we care about
+        batch_size = stream_input.size(0)
 
-        # Initial convolution (stream1 pathway only)
-        stream1_x = self.conv1.forward_stream1(stream1_x)
-        stream1_x = self.bn1.forward_stream1(stream1_x)
-        stream1_x = self.relu.forward_stream1(stream1_x)
+        # Create list of None placeholders, then insert our stream at the correct index
+        stream_inputs = [None] * self.num_streams
+        stream_inputs[stream_idx] = stream_input
 
-        # Max pooling (stream1 pathway only)
-        stream1_x = self.maxpool.forward_stream1(stream1_x)
+        # For other streams, create dummy tensors with correct shape
+        # These won't affect computation for our target stream
+        for i in range(self.num_streams):
+            if i != stream_idx:
+                # Get expected input channels for this stream
+                dummy_channels = self.stream_input_channels[i]
+                # Get spatial dimensions from our target stream
+                h, w = stream_input.size(2), stream_input.size(3)
+                stream_inputs[i] = torch.zeros(
+                    batch_size, dummy_channels, h, w,
+                    device=stream_input.device, dtype=stream_input.dtype
+                )
 
-        # ResNet layers (stream1 pathway only)
-        stream1_x = self.layer1.forward_stream1(stream1_x)
-        stream1_x = self.layer2.forward_stream1(stream1_x)
-        stream1_x = self.layer3.forward_stream1(stream1_x)
-        stream1_x = self.layer4.forward_stream1(stream1_x)
+        # Forward through all layers (they process all streams but we only use one)
+        # No integrated stream initially
+        stream_outputs, _ = self.conv1(stream_inputs, None)
+        stream_outputs, _ = self.bn1(stream_outputs, None)
+        stream_outputs, _ = self.relu(stream_outputs, None)
+        stream_outputs, _ = self.maxpool(stream_outputs, None)
 
-        # Global average pooling (stream1 pathway only)
-        # Note: avgpool is standard nn.AdaptiveAvgPool2d, just call it directly
-        stream1_x = self.avgpool(stream1_x)
+        # ResNet layers (no integrated stream for monitoring)
+        stream_outputs, _ = self.layer1(stream_outputs, None)
+        stream_outputs, _ = self.layer2(stream_outputs, None)
+        stream_outputs, _ = self.layer3(stream_outputs, None)
+        stream_outputs, _ = self.layer4(stream_outputs, None)
+
+        # Extract only the target stream's output
+        stream_x = stream_outputs[stream_idx]
+
+        # Global average pooling
+        stream_x = self.avgpool(stream_x)
 
         # Flatten
-        stream1_x = torch.flatten(stream1_x, 1)
+        stream_x = torch.flatten(stream_x, 1)
 
-        return stream1_x
-    
-    def _forward_stream2_pathway(self, stream2_input: torch.Tensor) -> torch.Tensor:
+        return stream_x
+
+    def _forward_integrated_pathway(self, stream_inputs: list[torch.Tensor]) -> torch.Tensor:
         """
-        Forward pass through the stream2 pathway only.
-
-        Args:
-            stream2_input: The stream2 input tensor.
-
-        Returns:
-            The stream2 pathway output tensor (flattened features).
-        """
-        # Process through stream2 pathway of multi-channel layers
-        stream2_x = stream2_input
-
-        # Initial convolution (stream2 pathway only)
-        stream2_x = self.conv1.forward_stream2(stream2_x)
-        stream2_x = self.bn1.forward_stream2(stream2_x)
-        stream2_x = self.relu.forward_stream2(stream2_x)
-
-        # Max pooling (stream2 pathway only)
-        stream2_x = self.maxpool.forward_stream2(stream2_x)
-
-        # ResNet layers (stream2 pathway only)
-        stream2_x = self.layer1.forward_stream2(stream2_x)
-        stream2_x = self.layer2.forward_stream2(stream2_x)
-        stream2_x = self.layer3.forward_stream2(stream2_x)
-        stream2_x = self.layer4.forward_stream2(stream2_x)
-
-        # Global average pooling (stream2 pathway only)
-        # Note: avgpool is standard nn.AdaptiveAvgPool2d, just call it directly
-        stream2_x = self.avgpool(stream2_x)
-
-        # Flatten
-        stream2_x = torch.flatten(stream2_x, 1)
-
-        return stream2_x
-
-    def _forward_integrated_pathway(self, stream1_input: torch.Tensor, stream2_input: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the integrated pathway only (without stream1/stream2).
+        Forward pass through the integrated pathway only (without individual streams).
 
         This extracts only the integrated stream features by running the full forward pass
         and returning only the integrated stream output.
 
         Args:
-            stream1_input: The stream1 input tensor (needed for integration).
-            stream2_input: The stream2 input tensor (needed for integration).
+            stream_inputs: List of input tensors, one per stream (needed for integration).
 
         Returns:
             The integrated pathway output tensor (flattened features).
         """
-        # Initial convolution (creates integrated stream from stream1 + stream2)
-        s1, s2, ic = self.conv1(stream1_input, stream2_input, None)
-        s1, s2, ic = self.bn1(s1, s2, ic)
-        s1, s2, ic = self.relu(s1, s2, ic)
+        # Initial convolution (creates integrated stream from N streams)
+        stream_outputs, integrated = self.conv1(stream_inputs, None)
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated)
 
-        # Max pooling (all 3 streams)
-        s1, s2, ic = self.maxpool(s1, s2, ic)
+        # Max pooling (all N streams + integrated)
+        stream_outputs, integrated = self.maxpool(stream_outputs, integrated)
 
         # ResNet layers (integration happens inside LIConv2d neurons)
-        s1, s2, ic = self.layer1(s1, s2, ic)
-        s1, s2, ic = self.layer2(s1, s2, ic)
-        s1, s2, ic = self.layer3(s1, s2, ic)
-        s1, s2, ic = self.layer4(s1, s2, ic)
+        stream_outputs, integrated = self.layer1(stream_outputs, integrated)
+        stream_outputs, integrated = self.layer2(stream_outputs, integrated)
+        stream_outputs, integrated = self.layer3(stream_outputs, integrated)
+        stream_outputs, integrated = self.layer4(stream_outputs, integrated)
 
         # Global average pooling for integrated stream
-        integrated_pooled = self.avgpool(ic)
+        integrated_pooled = self.avgpool(integrated)
 
         # Flatten integrated features
         integrated_features = torch.flatten(integrated_pooled, 1)
@@ -1657,15 +1618,15 @@ class LINet(BaseModel):
         """
         Analyze the contribution and performance of individual pathways.
 
-        Uses auxiliary classifiers (fc_stream1, fc_stream2) for stream1/stream2 accuracy.
+        Uses auxiliary classifiers (fc_streams) for per-stream accuracy.
         Uses main classifier (fc) for integrated pathway and full model accuracy.
 
         Args:
-            data_loader: DataLoader containing dual-channel input data
+            data_loader: DataLoader containing N-stream input data
 
         Returns:
-            Dictionary containing pathway analysis results for all 3 streams:
-            - accuracy: stream1_only, stream2_only, integrated_only, full_model
+            Dictionary containing pathway analysis results for all N streams + integrated:
+            - accuracy: stream{i}_only for i in 0..N-1, integrated_only, full_model
             - loss: for each pathway
             - feature_norms: mean/std for each pathway's feature activations
         """
@@ -1674,62 +1635,53 @@ class LINet(BaseModel):
 
         self.eval()
 
-        # Initialize metrics for all 3 streams + full model
+        # Initialize metrics for N streams + integrated + full model
         full_model_correct = 0
-        stream1_only_correct = 0
-        stream2_only_correct = 0
+        stream_only_correct = [0] * self.num_streams
         integrated_only_correct = 0
         total_samples = 0
 
         full_model_loss = 0.0
-        stream1_only_loss = 0.0
-        stream2_only_loss = 0.0
+        stream_only_losses = [0.0] * self.num_streams
         integrated_only_loss = 0.0
 
-        stream1_feature_norms = []
-        stream2_feature_norms = []
+        stream_feature_norms = [[] for _ in range(self.num_streams)]
         integrated_feature_norms = []
 
         with torch.no_grad():
-            for stream1_batch, stream2_batch, targets_batch in data_loader:
+            for batch_data in data_loader:
+                # Unpack N streams + targets from tuple format
+                # DataLoader returns: (stream1, stream2, ..., streamN, labels)
+                *stream_batches, targets_batch = batch_data
+
                 # Move to device
-                stream1_batch = stream1_batch.to(self.device, non_blocking=True)
-                stream2_batch = stream2_batch.to(self.device, non_blocking=True)
+                stream_batches = [stream.to(self.device, non_blocking=True) for stream in stream_batches]
                 targets_batch = targets_batch.to(self.device, non_blocking=True)
 
-                batch_size_actual = stream1_batch.size(0)
+                batch_size_actual = stream_batches[0].size(0)
                 total_samples += batch_size_actual
 
                 # Full model prediction (uses integrated stream)
-                full_outputs = self(stream1_batch, stream2_batch)
+                full_outputs = self(stream_batches)
                 full_loss = self.criterion(full_outputs, targets_batch)
                 full_model_loss += full_loss.item() * batch_size_actual
 
                 _, full_predicted = torch.max(full_outputs, 1)
                 full_model_correct += (full_predicted == targets_batch).sum().item()
 
-                # Stream1 pathway only - USE AUXILIARY CLASSIFIER
-                stream1_features = self._forward_stream1_pathway(stream1_batch)
-                stream1_feature_norms.append(torch.norm(stream1_features, dim=1).cpu())
-                stream1_outputs = self.fc_stream1(stream1_features)  # Auxiliary classifier!
-                stream1_loss = self.criterion(stream1_outputs, targets_batch)
-                stream1_only_loss += stream1_loss.item() * batch_size_actual
+                # Stream pathway analysis - USE AUXILIARY CLASSIFIERS
+                for i in range(self.num_streams):
+                    stream_features = self._forward_stream_pathway(i, stream_batches[i])
+                    stream_feature_norms[i].append(torch.norm(stream_features, dim=1).cpu())
+                    stream_outputs = self.fc_streams[i](stream_features)  # Auxiliary classifier!
+                    stream_loss = self.criterion(stream_outputs, targets_batch)
+                    stream_only_losses[i] += stream_loss.item() * batch_size_actual
 
-                _, stream1_predicted = torch.max(stream1_outputs, 1)
-                stream1_only_correct += (stream1_predicted == targets_batch).sum().item()
-
-                # Stream2 pathway only - USE AUXILIARY CLASSIFIER
-                stream2_features = self._forward_stream2_pathway(stream2_batch)
-                stream2_feature_norms.append(torch.norm(stream2_features, dim=1).cpu())
-                stream2_outputs = self.fc_stream2(stream2_features)  # Auxiliary classifier!
-                stream2_loss = self.criterion(stream2_outputs, targets_batch)
-                stream2_only_loss += stream2_loss.item() * batch_size_actual
-
-                _, stream2_predicted = torch.max(stream2_outputs, 1)
-                stream2_only_correct += (stream2_predicted == targets_batch).sum().item()
+                    _, stream_predicted = torch.max(stream_outputs, 1)
+                    stream_only_correct[i] += (stream_predicted == targets_batch).sum().item()
 
                 # Integrated pathway only (runs full forward but uses only integrated features)
-                integrated_features = self._forward_integrated_pathway(stream1_batch, stream2_batch)
+                integrated_features = self._forward_integrated_pathway(stream_batches)
                 integrated_feature_norms.append(torch.norm(integrated_features, dim=1).cpu())
                 integrated_outputs = self.fc(integrated_features)
                 integrated_loss = self.criterion(integrated_outputs, targets_batch)
@@ -1740,82 +1692,73 @@ class LINet(BaseModel):
 
         # Calculate metrics
         full_accuracy = full_model_correct / total_samples
-        stream1_accuracy = stream1_only_correct / total_samples
-        stream2_accuracy = stream2_only_correct / total_samples
+        stream_accuracies = [correct / total_samples for correct in stream_only_correct]
         integrated_accuracy = integrated_only_correct / total_samples
 
         avg_full_loss = full_model_loss / total_samples
-        avg_stream1_loss = stream1_only_loss / total_samples
-        avg_stream2_loss = stream2_only_loss / total_samples
+        avg_stream_losses = [loss / total_samples for loss in stream_only_losses]
         avg_integrated_loss = integrated_only_loss / total_samples
 
         # Feature analysis
-        stream1_norms = torch.cat(stream1_feature_norms, dim=0)
-        stream2_norms = torch.cat(stream2_feature_norms, dim=0)
+        stream_norms = [torch.cat(norms, dim=0) for norms in stream_feature_norms]
         integrated_norms = torch.cat(integrated_feature_norms, dim=0)
 
+        # Build accuracy dictionary
+        accuracy_dict = {'full_model': full_accuracy}
+        for i in range(self.num_streams):
+            accuracy_dict[f'stream{i}_only'] = stream_accuracies[i]
+            accuracy_dict[f'stream{i}_contribution'] = stream_accuracies[i] / full_accuracy if full_accuracy > 0 else 0
+        accuracy_dict['integrated_only'] = integrated_accuracy
+        accuracy_dict['integrated_contribution'] = integrated_accuracy / full_accuracy if full_accuracy > 0 else 0
+
+        # Build loss dictionary
+        loss_dict = {'full_model': avg_full_loss}
+        for i in range(self.num_streams):
+            loss_dict[f'stream{i}_only'] = avg_stream_losses[i]
+        loss_dict['integrated_only'] = avg_integrated_loss
+
+        # Build feature norms dictionary
+        feature_norms_dict = {}
+        for i in range(self.num_streams):
+            feature_norms_dict[f'stream{i}_mean'] = stream_norms[i].mean().item()
+            feature_norms_dict[f'stream{i}_std'] = stream_norms[i].std().item()
+        feature_norms_dict['integrated_mean'] = integrated_norms.mean().item()
+        feature_norms_dict['integrated_std'] = integrated_norms.std().item()
+
         return {
-            'accuracy': {
-                'full_model': full_accuracy,
-                'stream1_only': stream1_accuracy,
-                'stream2_only': stream2_accuracy,
-                'integrated_only': integrated_accuracy,
-                'stream1_contribution': stream1_accuracy / full_accuracy if full_accuracy > 0 else 0,
-                'stream2_contribution': stream2_accuracy / full_accuracy if full_accuracy > 0 else 0,
-                'integrated_contribution': integrated_accuracy / full_accuracy if full_accuracy > 0 else 0
-            },
-            'loss': {
-                'full_model': avg_full_loss,
-                'stream1_only': avg_stream1_loss,
-                'stream2_only': avg_stream2_loss,
-                'integrated_only': avg_integrated_loss
-            },
-            'feature_norms': {
-                'stream1_mean': stream1_norms.mean().item(),
-                'stream1_std': stream1_norms.std().item(),
-                'stream2_mean': stream2_norms.mean().item(),
-                'stream2_std': stream2_norms.std().item(),
-                'integrated_mean': integrated_norms.mean().item(),
-                'integrated_std': integrated_norms.std().item(),
-                'stream1_to_stream2_ratio': (stream1_norms.mean() / stream2_norms.mean()).item() if stream2_norms.mean() > 0 else float('inf'),
-                'integrated_to_stream1_ratio': (integrated_norms.mean() / stream1_norms.mean()).item() if stream1_norms.mean() > 0 else float('inf')
-            },
+            'accuracy': accuracy_dict,
+            'loss': loss_dict,
+            'feature_norms': feature_norms_dict,
             'samples_analyzed': total_samples
         }
     
     def analyze_pathway_weights(self) -> dict:
         """
-        Analyze the weight distributions and magnitudes across all 3 pathways.
+        Analyze the weight distributions and magnitudes across all N stream pathways + integrated pathway.
 
         Returns:
-            Dictionary containing weight analysis for stream1, stream2, and integrated pathways
+            Dictionary containing weight analysis for all stream pathways and integrated pathway
         """
-        stream1_weights = {}
-        stream2_weights = {}
+        # Initialize dictionaries for N streams + integrated
+        stream_weights = [{} for _ in range(self.num_streams)]
         integrated_weights = {}
         integration_weights = {}
 
-        # Analyze LI layers - look for modules with stream1_weight, stream2_weight, and integrated_weight
+        # Analyze LI layers - look for modules with stream_weights and integrated_weight
         for name, module in self.named_modules():
-            if hasattr(module, 'stream1_weight') and hasattr(module, 'stream2_weight') and hasattr(module, 'integrated_weight'):
+            if hasattr(module, 'stream_weights') and hasattr(module, 'integrated_weight'):
                 # LIConv2d modules
-                stream1_weight = module.stream1_weight
-                stream2_weight = module.stream2_weight
                 integrated_weight = module.integrated_weight
 
-                stream1_weights[name] = {
-                    'mean': stream1_weight.mean().item(),
-                    'std': stream1_weight.std().item(),
-                    'norm': torch.norm(stream1_weight).item(),
-                    'shape': list(stream1_weight.shape)
-                }
-
-                stream2_weights[name] = {
-                    'mean': stream2_weight.mean().item(),
-                    'std': stream2_weight.std().item(),
-                    'norm': torch.norm(stream2_weight).item(),
-                    'shape': list(stream2_weight.shape)
-                }
+                # Analyze each stream's weights
+                for i in range(self.num_streams):
+                    stream_weight = module.stream_weights[i]
+                    stream_weights[i][name] = {
+                        'mean': stream_weight.mean().item(),
+                        'std': stream_weight.std().item(),
+                        'norm': torch.norm(stream_weight).item(),
+                        'shape': list(stream_weight.shape)
+                    }
 
                 integrated_weights[name] = {
                     'mean': integrated_weight.mean().item(),
@@ -1824,66 +1767,83 @@ class LINet(BaseModel):
                     'shape': list(integrated_weight.shape)
                 }
 
-                # Integration weights (from stream1 and stream2 to integrated)
-                if hasattr(module, 'integration_from_stream1') and hasattr(module, 'integration_from_stream2'):
-                    int_from_s1 = module.integration_from_stream1
-                    int_from_s2 = module.integration_from_stream2
-
-                    integration_weights[name] = {
-                        'from_stream1': {
-                            'mean': int_from_s1.mean().item(),
-                            'std': int_from_s1.std().item(),
-                            'norm': torch.norm(int_from_s1).item(),
-                            'shape': list(int_from_s1.shape)
-                        },
-                        'from_stream2': {
-                            'mean': int_from_s2.mean().item(),
-                            'std': int_from_s2.std().item(),
-                            'norm': torch.norm(int_from_s2).item(),
-                            'shape': list(int_from_s2.shape)
+                # Integration weights (from all streams to integrated)
+                if hasattr(module, 'integration_from_streams'):
+                    integration_weights[name] = {}
+                    for i in range(self.num_streams):
+                        int_from_stream = module.integration_from_streams[i]
+                        integration_weights[name][f'from_stream{i}'] = {
+                            'mean': int_from_stream.mean().item(),
+                            'std': int_from_stream.std().item(),
+                            'norm': torch.norm(int_from_stream).item(),
+                            'shape': list(int_from_stream.shape)
                         }
-                    }
 
-        # Calculate overall statistics
-        stream1_norms = [w['norm'] for w in stream1_weights.values()]
-        stream2_norms = [w['norm'] for w in stream2_weights.values()]
+        # Calculate overall statistics for each stream
+        stream_norms = [[w['norm'] for w in stream_weights[i].values()] for i in range(self.num_streams)]
         integrated_norms = [w['norm'] for w in integrated_weights.values()]
 
-        return {
-            'stream1_pathway': {
-                'layer_weights': stream1_weights,
-                'total_norm': sum(stream1_norms),
-                'mean_norm': sum(stream1_norms) / len(stream1_norms) if stream1_norms else 0,
-                'num_layers': len(stream1_weights)
-            },
-            'stream2_pathway': {
-                'layer_weights': stream2_weights,
-                'total_norm': sum(stream2_norms),
-                'mean_norm': sum(stream2_norms) / len(stream2_norms) if stream2_norms else 0,
-                'num_layers': len(stream2_weights)
-            },
-            'integrated_pathway': {
-                'layer_weights': integrated_weights,
-                'total_norm': sum(integrated_norms),
-                'mean_norm': sum(integrated_norms) / len(integrated_norms) if integrated_norms else 0,
-                'num_layers': len(integrated_weights)
-            },
-            'integration_weights': integration_weights,
-            'ratio_analysis': {
-                'stream1_to_stream2_norm_ratio': (sum(stream1_norms) / sum(stream2_norms)) if stream2_norms else float('inf'),
-                'integrated_to_stream1_norm_ratio': (sum(integrated_norms) / sum(stream1_norms)) if stream1_norms else float('inf'),
-                'layer_ratios': {
-                    name: {
-                        's1_to_s2': stream1_weights[name]['norm'] / stream2_weights[name]['norm']
-                        if name in stream2_weights and stream2_weights[name]['norm'] > 0 else float('inf'),
-                        'int_to_s1': integrated_weights[name]['norm'] / stream1_weights[name]['norm']
-                        if stream1_weights[name]['norm'] > 0 else float('inf')
-                    }
-                    for name in stream1_weights.keys()
-                    if name in stream2_weights and name in integrated_weights
-                }
+        # Build result dictionary
+        result = {}
+
+        # Add stream pathway information
+        for i in range(self.num_streams):
+            result[f'stream{i}_pathway'] = {
+                'layer_weights': stream_weights[i],
+                'total_norm': sum(stream_norms[i]),
+                'mean_norm': sum(stream_norms[i]) / len(stream_norms[i]) if stream_norms[i] else 0,
+                'num_layers': len(stream_weights[i])
             }
+
+        # Add integrated pathway information
+        result['integrated_pathway'] = {
+            'layer_weights': integrated_weights,
+            'total_norm': sum(integrated_norms),
+            'mean_norm': sum(integrated_norms) / len(integrated_norms) if integrated_norms else 0,
+            'num_layers': len(integrated_weights)
         }
+
+        # Add integration weights
+        result['integration_weights'] = integration_weights
+
+        # Ratio analysis - compare streams pairwise and integrated to first stream
+        ratio_analysis = {}
+
+        # Stream-to-stream ratios (comparing to stream 0 as baseline)
+        if stream_norms[0]:
+            for i in range(1, self.num_streams):
+                ratio_analysis[f'stream{i}_to_stream0_norm_ratio'] = (
+                    sum(stream_norms[i]) / sum(stream_norms[0])
+                ) if stream_norms[i] else float('inf')
+
+        # Integrated to stream0 ratio
+        if stream_norms[0]:
+            ratio_analysis['integrated_to_stream0_norm_ratio'] = (
+                sum(integrated_norms) / sum(stream_norms[0])
+            ) if stream_norms[0] else float('inf')
+
+        # Per-layer ratios
+        layer_ratios = {}
+        for name in stream_weights[0].keys():
+            layer_ratios[name] = {}
+
+            # Compare each stream to stream 0
+            for i in range(1, self.num_streams):
+                if name in stream_weights[i]:
+                    layer_ratios[name][f's{i}_to_s0'] = (
+                        stream_weights[i][name]['norm'] / stream_weights[0][name]['norm']
+                    ) if stream_weights[0][name]['norm'] > 0 else float('inf')
+
+            # Compare integrated to stream 0
+            if name in integrated_weights:
+                layer_ratios[name]['int_to_s0'] = (
+                    integrated_weights[name]['norm'] / stream_weights[0][name]['norm']
+                ) if stream_weights[0][name]['norm'] > 0 else float('inf')
+
+        ratio_analysis['layer_ratios'] = layer_ratios
+        result['ratio_analysis'] = ratio_analysis
+
+        return result
     
     def get_pathway_importance(self,
                               data_loader: DataLoader,
@@ -1892,7 +1852,7 @@ class LINet(BaseModel):
         Calculate pathway importance using different methods.
 
         Args:
-            data_loader: DataLoader containing dual-channel input data
+            data_loader: DataLoader containing N-stream input data
             method: Method for importance calculation ('gradient', 'ablation', 'feature_norm')
 
         Returns:
@@ -1911,8 +1871,8 @@ class LINet(BaseModel):
         """
         Calculate importance based on gradient magnitudes.
 
-        Note: For LINet, the integrated stream is created FROM stream1 and stream2,
-        so we measure input gradients for stream1 and stream2 only.
+        Note: For LINet, the integrated stream is created FROM the N input streams,
+        so we measure input gradients for all N streams.
         The integrated stream's importance is implicit in how gradients flow back
         through the integration weights to the input streams.
         """
@@ -1923,112 +1883,129 @@ class LINet(BaseModel):
         was_training = self.training
         self.train()  # Enable gradients
 
-        stream1_gradients = []
-        stream2_gradients = []
+        stream_gradients = [[] for _ in range(self.num_streams)]
 
-        for stream1_batch, stream2_batch, targets_batch in data_loader:
-            stream1_batch = stream1_batch.to(self.device, non_blocking=True)
-            stream2_batch = stream2_batch.to(self.device, non_blocking=True)
+        for batch_data in data_loader:
+            # Unpack N streams + targets from tuple format
+            # DataLoader returns: (stream1, stream2, ..., streamN, labels)
+            *stream_batches, targets_batch = batch_data
+
+            # Move to device
+            stream_batches = [stream.to(self.device, non_blocking=True) for stream in stream_batches]
             targets_batch = targets_batch.to(self.device, non_blocking=True)
 
-            # Require gradients for inputs
-            stream1_batch.requires_grad_(True)
-            stream2_batch.requires_grad_(True)
+            # Require gradients for all inputs
+            for stream_batch in stream_batches:
+                stream_batch.requires_grad_(True)
 
             # Forward pass (creates integrated stream internally)
-            outputs = self(stream1_batch, stream2_batch)
+            outputs = self(stream_batches)
             loss = self.criterion(outputs, targets_batch)
 
             # Backward pass
             loss.backward()
 
-            # Calculate gradient norms - flatten and then compute norm
-            stream1_grad_norm = torch.norm(stream1_batch.grad.flatten(1), dim=1).mean().item()
-            stream2_grad_norm = torch.norm(stream2_batch.grad.flatten(1), dim=1).mean().item()
-
-            stream1_gradients.append(stream1_grad_norm)
-            stream2_gradients.append(stream2_grad_norm)
+            # Calculate gradient norms for each stream - flatten and then compute norm
+            for i in range(self.num_streams):
+                grad_norm = torch.norm(stream_batches[i].grad.flatten(1), dim=1).mean().item()
+                stream_gradients[i].append(grad_norm)
 
             # Clear gradients
             self.zero_grad()
-            stream1_batch.grad = None
-            stream2_batch.grad = None
+            for stream_batch in stream_batches:
+                stream_batch.grad = None
 
         # Restore original training state
         self.train(was_training)
 
-        avg_stream1_grad = sum(stream1_gradients) / len(stream1_gradients)
-        avg_stream2_grad = sum(stream2_gradients) / len(stream2_gradients)
-        total_grad = avg_stream1_grad + avg_stream2_grad
+        # Calculate average gradients for each stream
+        avg_stream_grads = [sum(grads) / len(grads) for grads in stream_gradients]
+        total_grad = sum(avg_stream_grads)
 
-        return {
+        # Build result dictionary
+        result = {
             'method': 'gradient',
-            'stream1_importance': avg_stream1_grad / total_grad if total_grad > 0 else 0.5,
-            'stream2_importance': avg_stream2_grad / total_grad if total_grad > 0 else 0.5,
-            'raw_gradients': {
-                'stream1_avg': avg_stream1_grad,
-                'stream2_avg': avg_stream2_grad
-            },
-            'note': 'Integrated stream importance is implicit in how gradients flow through integration weights'
+            'raw_gradients': {}
         }
+
+        # Add importance for each stream
+        for i in range(self.num_streams):
+            result[f'stream{i}_importance'] = (
+                avg_stream_grads[i] / total_grad if total_grad > 0 else 1.0 / self.num_streams
+            )
+            result['raw_gradients'][f'stream{i}_avg'] = avg_stream_grads[i]
+
+        result['note'] = 'Integrated stream importance is implicit in how gradients flow through integration weights'
+
+        return result
 
     def calculate_stream_contributions_to_integration(self, data_loader: DataLoader = None):
         """
         Calculate how much each input stream contributes to the integrated stream.
 
         This method measures architectural contribution by analyzing integration weight magnitudes:
-        ||integration_from_stream1|| vs ||integration_from_stream2||
+        ||integration_from_streams[i]|| for i in 0..N-1
 
         This directly answers: "How much does the model architecture favor each stream?"
 
         Simple, fast, and interpretable:
         - No data required (analyzes learned weights)
         - Stable (doesn't vary with data sampling)
-        - Clear meaning: "The model uses X% from stream1, Y% from stream2"
+        - Clear meaning: "The model uses X% from stream0, Y% from stream1, etc."
 
         Args:
             data_loader: Not used, kept for backward compatibility
 
         Returns:
             Dictionary containing:
-            - stream1_contribution: float (0-1) - proportion from stream1 based on integration weights
-            - stream2_contribution: float (0-1) - proportion from stream2 based on integration weights
+            - stream{i}_contribution: float (0-1) - proportion from stream i based on integration weights
             - raw_norms: dict with actual weight norms for each stream
         """
         # Analyze integration weight magnitudes across all LIConv2d layers
-        stream1_weight_norm = 0.0
-        stream2_weight_norm = 0.0
+        stream_weight_norms = [0.0] * self.num_streams
 
         for name, param in self.named_parameters():
-            if 'integration_from_stream1' in name:
-                stream1_weight_norm += torch.norm(param).item()
-            elif 'integration_from_stream2' in name:
-                stream2_weight_norm += torch.norm(param).item()
+            # Check if this is an integration weight parameter
+            if 'integration_from_streams' in name:
+                # Extract stream index from parameter name
+                # Parameter names look like: "layer.integration_from_streams.0", "layer.integration_from_streams.1", etc.
+                for i in range(self.num_streams):
+                    if f'integration_from_streams.{i}' in name:
+                        stream_weight_norms[i] += torch.norm(param).item()
+                        break
 
-        total_weight_norm = stream1_weight_norm + stream2_weight_norm
+        total_weight_norm = sum(stream_weight_norms)
 
-        return {
+        # Build result dictionary
+        result = {
             'method': 'integration_weights',
-            'stream1_contribution': stream1_weight_norm / total_weight_norm if total_weight_norm > 0 else 0.5,
-            'stream2_contribution': stream2_weight_norm / total_weight_norm if total_weight_norm > 0 else 0.5,
-            'raw_norms': {
-                'stream1_integration_weights': stream1_weight_norm,
-                'stream2_integration_weights': stream2_weight_norm,
-                'total': total_weight_norm
-            },
-            'interpretation': {
-                'stream1_percentage': f"{100 * stream1_weight_norm / total_weight_norm:.1f}%" if total_weight_norm > 0 else "50.0%",
-                'stream2_percentage': f"{100 * stream2_weight_norm / total_weight_norm:.1f}%" if total_weight_norm > 0 else "50.0%"
-            },
-            'note': 'Measures architectural contribution based on integration weight magnitudes. '
-                   'Reflects how the trained model structurally combines the two input streams.'
+            'raw_norms': {'total': total_weight_norm},
+            'interpretation': {}
         }
+
+        # Add contribution and interpretation for each stream
+        for i in range(self.num_streams):
+            result[f'stream{i}_contribution'] = (
+                stream_weight_norms[i] / total_weight_norm if total_weight_norm > 0 else 1.0 / self.num_streams
+            )
+            result['raw_norms'][f'stream{i}_integration_weights'] = stream_weight_norms[i]
+            result['interpretation'][f'stream{i}_percentage'] = (
+                f"{100 * stream_weight_norms[i] / total_weight_norm:.1f}%" if total_weight_norm > 0
+                else f"{100.0 / self.num_streams:.1f}%"
+            )
+
+        result['note'] = (
+            'Measures architectural contribution based on integration weight magnitudes. '
+            f'Reflects how the trained model structurally combines the {self.num_streams} input streams.'
+        )
+
+        return result
 
     def calculate_stream_contributions(self, data_loader: DataLoader):
         """
         DEPRECATED: Calculate hypothetical classification ability of each stream.
 
-        WARNING: This method is MISLEADING for LINet because stream1/stream2 don't directly classify.
+        WARNING: This method is MISLEADING for LINet because streams don't directly classify.
         They only feed into the integrated stream through integration weights.
 
         This method measures: "How well could each stream classify IF it had its own classifier?"
@@ -2038,12 +2015,11 @@ class LINet(BaseModel):
         of how much each input stream contributes to the integrated stream's features.
 
         Args:
-            data_loader: DataLoader containing dual-channel input data
+            data_loader: DataLoader containing N-stream input data
 
         Returns:
             Dictionary containing hypothetical stream classification abilities (misleading for LINet)
         """
-        import warnings
         warnings.warn(
             "calculate_stream_contributions() is deprecated and misleading for LINet. "
             "It measures hypothetical classification ability, but streams don't directly classify. "
@@ -2055,102 +2031,229 @@ class LINet(BaseModel):
         pathway_analysis = self.analyze_pathways(data_loader)
 
         full_accuracy = pathway_analysis['accuracy']['full_model']
-        stream1_accuracy = pathway_analysis['accuracy']['stream1_only']
-        stream2_accuracy = pathway_analysis['accuracy']['stream2_only']
         integrated_accuracy = pathway_analysis['accuracy']['integrated_only']
+
+        # Gather stream accuracies
+        stream_accuracies = []
+        for i in range(self.num_streams):
+            stream_accuracies.append(pathway_analysis['accuracy'][f'stream{i}_only'])
 
         # Calculate contribution scores
         # The integrated stream should perform best (or equal to full model) since that's what we use for prediction
-        total_acc = stream1_accuracy + stream2_accuracy + integrated_accuracy
+        total_acc = sum(stream_accuracies) + integrated_accuracy
 
-        return {
+        # Build result dictionary
+        result = {
             'method': 'ablation',
-            'stream1_importance': stream1_accuracy / total_acc if total_acc > 0 else 0.33,
-            'stream2_importance': stream2_accuracy / total_acc if total_acc > 0 else 0.33,
-            'integrated_importance': integrated_accuracy / total_acc if total_acc > 0 else 0.34,
-            'individual_accuracies': {
-                'full_model': full_accuracy,
-                'stream1_only': stream1_accuracy,
-                'stream2_only': stream2_accuracy,
-                'integrated_only': integrated_accuracy
-            },
-            'relative_to_full_model': {
-                'stream1_ratio': stream1_accuracy / full_accuracy if full_accuracy > 0 else 0,
-                'stream2_ratio': stream2_accuracy / full_accuracy if full_accuracy > 0 else 0,
-                'integrated_ratio': integrated_accuracy / full_accuracy if full_accuracy > 0 else 1.0
-            },
-            'note': 'Integrated stream should perform best as it combines information from both input streams'
+            'individual_accuracies': {'full_model': full_accuracy},
+            'relative_to_full_model': {}
         }
+
+        # Add importance for each stream
+        for i in range(self.num_streams):
+            result[f'stream{i}_importance'] = (
+                stream_accuracies[i] / total_acc if total_acc > 0 else 1.0 / (self.num_streams + 1)
+            )
+            result['individual_accuracies'][f'stream{i}_only'] = stream_accuracies[i]
+            result['relative_to_full_model'][f'stream{i}_ratio'] = (
+                stream_accuracies[i] / full_accuracy if full_accuracy > 0 else 0
+            )
+
+        # Add integrated pathway information
+        result['integrated_importance'] = (
+            integrated_accuracy / total_acc if total_acc > 0 else 1.0 / (self.num_streams + 1)
+        )
+        result['individual_accuracies']['integrated_only'] = integrated_accuracy
+        result['relative_to_full_model']['integrated_ratio'] = (
+            integrated_accuracy / full_accuracy if full_accuracy > 0 else 1.0
+        )
+
+        result['note'] = f'Integrated stream should perform best as it combines information from all {self.num_streams} input streams'
+
+        return result
     
     def calculate_feature_norm_importance(self, data_loader):
-        """Calculate importance based on feature norm magnitudes for all 3 streams."""
+        """Calculate importance based on feature norm magnitudes for all N streams + integrated."""
         # Use the analyze_pathways method for feature analysis
         pathway_analysis = self.analyze_pathways(data_loader)
 
-        stream1_norm = pathway_analysis['feature_norms']['stream1_mean']
-        stream2_norm = pathway_analysis['feature_norms']['stream2_mean']
-        integrated_norm = pathway_analysis['feature_norms']['integrated_mean']
-        total_norm = stream1_norm + stream2_norm + integrated_norm
+        # Gather stream norms
+        stream_norms = []
+        for i in range(self.num_streams):
+            stream_norms.append(pathway_analysis['feature_norms'][f'stream{i}_mean'])
 
-        return {
+        integrated_norm = pathway_analysis['feature_norms']['integrated_mean']
+        total_norm = sum(stream_norms) + integrated_norm
+
+        # Build result dictionary
+        result = {
             'method': 'feature_norm',
-            'stream1_importance': stream1_norm / total_norm if total_norm > 0 else 0.33,
-            'stream2_importance': stream2_norm / total_norm if total_norm > 0 else 0.33,
-            'integrated_importance': integrated_norm / total_norm if total_norm > 0 else 0.34,
             'feature_norms': {
-                'stream1_mean': stream1_norm,
-                'stream2_mean': stream2_norm,
-                'integrated_mean': integrated_norm,
-                'stream1_to_stream2_ratio': stream1_norm / stream2_norm if stream2_norm > 0 else float('inf'),
-                'integrated_to_stream1_ratio': integrated_norm / stream1_norm if stream1_norm > 0 else float('inf')
+                'integrated_mean': integrated_norm
             }
-        } 
+        }
+
+        # Add importance for each stream
+        for i in range(self.num_streams):
+            result[f'stream{i}_importance'] = (
+                stream_norms[i] / total_norm if total_norm > 0 else 1.0 / (self.num_streams + 1)
+            )
+            result['feature_norms'][f'stream{i}_mean'] = stream_norms[i]
+
+        # Add integrated importance
+        result['integrated_importance'] = (
+            integrated_norm / total_norm if total_norm > 0 else 1.0 / (self.num_streams + 1)
+        )
+
+        # Add ratios comparing to stream 0 as baseline
+        if stream_norms[0] > 0:
+            for i in range(1, self.num_streams):
+                result['feature_norms'][f'stream{i}_to_stream0_ratio'] = (
+                    stream_norms[i] / stream_norms[0]
+                )
+            result['feature_norms']['integrated_to_stream0_ratio'] = (
+                integrated_norm / stream_norms[0]
+            )
+
+        return result 
 
 # Factory functions for common LINet architectures
-def li_resnet18(num_classes: int = 1000, **kwargs) -> LINet:
-    """Create a Linear Integration ResNet-18 model."""
+def li_resnet18(num_classes: int = 1000, stream_input_channels: list[int] = None, **kwargs) -> LINet:
+    """
+    Create a Linear Integration ResNet-18 model.
+
+    Args:
+        num_classes: Number of output classes
+        stream_input_channels: List of input channels for each stream.
+                              Default: [3, 1] for RGB + Depth (backward compatible)
+                              For 3 streams: [3, 1, 1] for RGB + Depth + Orthogonal
+        **kwargs: Additional arguments passed to LINet constructor
+
+    Returns:
+        LINet model instance
+
+    Examples:
+        # 2-stream (backward compatible - default)
+        model = li_resnet18(num_classes=15)
+
+        # 3-stream (RGB + Depth + Orthogonal)
+        model = li_resnet18(num_classes=15, stream_input_channels=[3, 1, 1])
+    """
+    # Default to 2-stream for backward compatibility with existing code
+    if stream_input_channels is None:
+        stream_input_channels = [3, 1]  # RGB + Depth
+
     return LINet(
         LIBasicBlock,
         [2, 2, 2, 2],
         num_classes=num_classes,
+        stream_input_channels=stream_input_channels,
         **kwargs
     )
 
-def li_resnet34(num_classes: int = 1000, **kwargs) -> LINet:
-    """Create a Linear Integration ResNet-34 model."""
+def li_resnet34(num_classes: int = 1000, stream_input_channels: list[int] = None, **kwargs) -> LINet:
+    """
+    Create a Linear Integration ResNet-34 model.
+
+    Args:
+        num_classes: Number of output classes
+        stream_input_channels: List of input channels for each stream.
+                              Default: [3, 1] for RGB + Depth (backward compatible)
+                              For 3 streams: [3, 1, 1] for RGB + Depth + Orthogonal
+        **kwargs: Additional arguments passed to LINet constructor
+
+    Returns:
+        LINet model instance
+    """
+    # Default to 2-stream for backward compatibility with existing code
+    if stream_input_channels is None:
+        stream_input_channels = [3, 1]  # RGB + Depth
+
     return LINet(
         LIBasicBlock,
         [3, 4, 6, 3],
         num_classes=num_classes,
+        stream_input_channels=stream_input_channels,
         **kwargs
     )
 
 
-def li_resnet50(num_classes: int = 1000, **kwargs) -> LINet:
-    """Create a Linear Integration ResNet-50 model."""
+def li_resnet50(num_classes: int = 1000, stream_input_channels: list[int] = None, **kwargs) -> LINet:
+    """
+    Create a Linear Integration ResNet-50 model.
+
+    Args:
+        num_classes: Number of output classes
+        stream_input_channels: List of input channels for each stream.
+                              Default: [3, 1] for RGB + Depth (backward compatible)
+                              For 3 streams: [3, 1, 1] for RGB + Depth + Orthogonal
+        **kwargs: Additional arguments passed to LINet constructor
+
+    Returns:
+        LINet model instance
+    """
+    # Default to 2-stream for backward compatibility with existing code
+    if stream_input_channels is None:
+        stream_input_channels = [3, 1]  # RGB + Depth
+
     return LINet(
         LIBottleneck,
         [3, 4, 6, 3],
         num_classes=num_classes,
+        stream_input_channels=stream_input_channels,
         **kwargs
     )
 
 
-def li_resnet101(num_classes: int = 1000, **kwargs) -> LINet:
-    """Create a Linear Integration ResNet-101 model."""
+def li_resnet101(num_classes: int = 1000, stream_input_channels: list[int] = None, **kwargs) -> LINet:
+    """
+    Create a Linear Integration ResNet-101 model.
+
+    Args:
+        num_classes: Number of output classes
+        stream_input_channels: List of input channels for each stream.
+                              Default: [3, 1] for RGB + Depth (backward compatible)
+                              For 3 streams: [3, 1, 1] for RGB + Depth + Orthogonal
+        **kwargs: Additional arguments passed to LINet constructor
+
+    Returns:
+        LINet model instance
+    """
+    # Default to 2-stream for backward compatibility with existing code
+    if stream_input_channels is None:
+        stream_input_channels = [3, 1]  # RGB + Depth
+
     return LINet(
         LIBottleneck,
         [3, 4, 23, 3],
         num_classes=num_classes,
+        stream_input_channels=stream_input_channels,
         **kwargs
     )
 
 
-def li_resnet152(num_classes: int = 1000, **kwargs) -> LINet:
-    """Create a Linear Integration ResNet-152 model."""
+def li_resnet152(num_classes: int = 1000, stream_input_channels: list[int] = None, **kwargs) -> LINet:
+    """
+    Create a Linear Integration ResNet-152 model.
+
+    Args:
+        num_classes: Number of output classes
+        stream_input_channels: List of input channels for each stream.
+                              Default: [3, 1] for RGB + Depth (backward compatible)
+                              For 3 streams: [3, 1, 1] for RGB + Depth + Orthogonal
+        **kwargs: Additional arguments passed to LINet constructor
+
+    Returns:
+        LINet model instance
+    """
+    # Default to 2-stream for backward compatibility with existing code
+    if stream_input_channels is None:
+        stream_input_channels = [3, 1]  # RGB + Depth
+
     return LINet(
         LIBottleneck,
         [3, 8, 36, 3],
         num_classes=num_classes,
+        stream_input_channels=stream_input_channels,
         **kwargs
     )

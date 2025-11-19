@@ -2,7 +2,7 @@
 Linear Integration ResNet blocks for building LINet architectures.
 """
 
-from typing import Callable, Optional, Union
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -12,11 +12,9 @@ from .container import LIReLU
 
 
 def li_conv3x3(
-    stream1_in_planes: int,
-    stream2_in_planes: int,
+    stream_in_planes: list[int],
+    stream_out_planes: list[int],
     integrated_in_planes: int,
-    stream1_out_planes: int,
-    stream2_out_planes: int,
     integrated_out_planes: int,
     stride: int = 1,
     groups: int = 1,
@@ -24,11 +22,9 @@ def li_conv3x3(
 ) -> LIConv2d:
     """3x3 linear integration convolution with padding."""
     return LIConv2d(
-        stream1_in_planes,
-        stream2_in_planes,
+        stream_in_planes,
+        stream_out_planes,
         integrated_in_planes,
-        stream1_out_planes,
-        stream2_out_planes,
         integrated_out_planes,
         kernel_size=3,
         stride=stride,
@@ -40,21 +36,17 @@ def li_conv3x3(
 
 
 def li_conv1x1(
-    stream1_in_planes: int,
-    stream2_in_planes: int,
+    stream_in_planes: list[int],
+    stream_out_planes: list[int],
     integrated_in_planes: int,
-    stream1_out_planes: int,
-    stream2_out_planes: int,
     integrated_out_planes: int,
     stride: int = 1
 ) -> LIConv2d:
     """1x1 linear integration convolution."""
     return LIConv2d(
-        stream1_in_planes,
-        stream2_in_planes,
+        stream_in_planes,
+        stream_out_planes,
         integrated_in_planes,
-        stream1_out_planes,
-        stream2_out_planes,
         integrated_out_planes,
         kernel_size=1,
         stride=stride,
@@ -66,7 +58,7 @@ class LIBasicBlock(nn.Module):
     """
     Linear Integration version of ResNet BasicBlock.
 
-    Uses unified LIConv2d neurons that process 3 streams simultaneously.
+    Uses unified LIConv2d neurons that process N streams simultaneously.
     Integration happens INSIDE LIConv2d during convolution (not as separate step).
     """
 
@@ -74,11 +66,10 @@ class LIBasicBlock(nn.Module):
 
     def __init__(
         self,
-        stream1_inplanes: int,
-        stream2_inplanes: int,
+        stream_inplanes: list[int],
+        stream_planes: list[int],
         integrated_inplanes: int,
-        stream1_planes: int,
-        stream2_planes: int,
+        integrated_planes: int,
         stride: int = 1,
         downsample: Optional[nn.Module] = None,
         groups: int = 1,
@@ -95,30 +86,33 @@ class LIBasicBlock(nn.Module):
             raise NotImplementedError("Dilation > 1 not supported in LIBasicBlock")
 
         # Store channel counts for output
-        self.stream1_outplanes = stream1_planes * self.expansion
-        self.stream2_outplanes = stream2_planes * self.expansion
-        self.integrated_outplanes = stream1_planes * self.expansion  # Same as stream1
+        self.num_streams = len(stream_inplanes)
+        self.stream_outplanes = [planes * self.expansion for planes in stream_planes]
+        self.integrated_outplanes = integrated_planes * self.expansion
 
-        # Use unified LI neurons instead of MC neurons
-        # Integration happens inside LIConv2d!
+        # Use unified LI neurons - integration happens inside LIConv2d!
         self.conv1 = li_conv3x3(
-            stream1_inplanes, stream2_inplanes, integrated_inplanes,
-            stream1_planes, stream2_planes, stream1_planes,
+            stream_inplanes,
+            stream_planes,
+            integrated_inplanes,
+            integrated_planes,
             stride=stride
         )
-        self.bn1 = norm_layer(stream1_planes, stream2_planes, stream1_planes)
+        self.bn1 = norm_layer(stream_planes, integrated_planes)
         self.relu = LIReLU(inplace=True)
 
         self.conv2 = li_conv3x3(
-            stream1_planes, stream2_planes, stream1_planes,
-            stream1_planes, stream2_planes, stream1_planes
+            stream_planes,
+            stream_planes,
+            integrated_planes,
+            integrated_planes
         )
-        self.bn2 = norm_layer(stream1_planes, stream2_planes, stream1_planes)
+        self.bn2 = norm_layer(stream_planes, integrated_planes)
 
         self.downsample = downsample
         self.stride = stride
 
-    def forward(self, stream1_input: Tensor, stream2_input: Tensor, integrated_input: Tensor = None) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
         """
         Forward pass - MUCH SIMPLER with unified LIConv2d neurons!
 
@@ -126,79 +120,39 @@ class LIBasicBlock(nn.Module):
         just needs to do: conv → bn → relu → residual (ResNet pattern)
         """
         # Save identities
-        stream1_identity = stream1_input
-        stream2_identity = stream2_input
+        stream_identities = stream_inputs.copy()
         integrated_identity = integrated_input
 
         # First conv block (integration happens inside LIConv2d!)
-        s1, s2, ic = self.conv1(stream1_input, stream2_input, integrated_input)
-        s1, s2, ic = self.bn1(s1, s2, ic)
-        s1, s2, ic = self.relu(s1, s2, ic)
+        stream_outputs, integrated = self.conv1(stream_inputs, integrated_input)
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated)
 
         # Second conv block (integration happens inside LIConv2d!)
-        s1, s2, ic = self.conv2(s1, s2, ic)
-        s1, s2, ic = self.bn2(s1, s2, ic)
+        stream_outputs, integrated = self.conv2(stream_outputs, integrated)
+        stream_outputs, integrated = self.bn2(stream_outputs, integrated)
 
-        # Apply downsampling to identities if needed (handles all 3 streams together)
+        # Apply downsampling to identities if needed (handles all N streams together)
         if self.downsample is not None:
-            stream1_identity, stream2_identity, integrated_identity = self.downsample(
-                stream1_identity, stream2_identity, integrated_identity
+            stream_identities, integrated_identity = self.downsample(
+                stream_identities, integrated_identity
             )
 
         # Residual connections (exact ResNet pattern)
-        s1 += stream1_identity
-        s2 += stream2_identity
+        stream_outputs = [s + s_id for s, s_id in zip(stream_outputs, stream_identities)]
         if integrated_identity is not None:
-            ic += integrated_identity
+            integrated = integrated + integrated_identity
 
         # Final activation
-        s1, s2, ic = self.relu(s1, s2, ic)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated)
 
-        return s1, s2, ic
-
-    def forward_stream1(self, stream1_input: Tensor) -> Tensor:
-        """Forward pass through stream1 pathway only."""
-        stream1_identity = stream1_input
-
-        stream1_out = self.conv1.forward_stream1(stream1_input)
-        stream1_out = self.bn1.forward_stream1(stream1_out)
-        stream1_out = self.relu.forward_stream1(stream1_out)
-
-        stream1_out = self.conv2.forward_stream1(stream1_out)
-        stream1_out = self.bn2.forward_stream1(stream1_out)
-
-        if self.downsample is not None:
-            stream1_identity = self.downsample.forward_stream1(stream1_identity)
-
-        stream1_out += stream1_identity
-        stream1_out = self.relu.forward_stream1(stream1_out)
-
-        return stream1_out
-
-    def forward_stream2(self, stream2_input: Tensor) -> Tensor:
-        """Forward pass through stream2 pathway only."""
-        stream2_identity = stream2_input
-
-        stream2_out = self.conv1.forward_stream2(stream2_input)
-        stream2_out = self.bn1.forward_stream2(stream2_out)
-        stream2_out = self.relu.forward_stream2(stream2_out)
-
-        stream2_out = self.conv2.forward_stream2(stream2_out)
-        stream2_out = self.bn2.forward_stream2(stream2_out)
-
-        if self.downsample is not None:
-            stream2_identity = self.downsample.forward_stream2(stream2_identity)
-
-        stream2_out += stream2_identity
-        stream2_out = self.relu.forward_stream2(stream2_out)
-
-        return stream2_out
+        return stream_outputs, integrated
 
 class LIBottleneck(nn.Module):
     """
     Linear Integration version of ResNet Bottleneck block.
 
-    Uses unified LIConv2d neurons that process 3 streams simultaneously.
+    Uses unified LIConv2d neurons that process N streams simultaneously.
     Integration happens INSIDE LIConv2d during convolution (not as separate step).
 
     Note: Bottleneck in torchvision places the stride for downsampling at 3x3 convolution(self.conv2)
@@ -209,14 +163,13 @@ class LIBottleneck(nn.Module):
     """
 
     expansion: int = 4
-    
+
     def __init__(
         self,
-        stream1_inplanes: int,
-        stream2_inplanes: int,
+        stream_inplanes: list[int],
+        stream_planes: list[int],
         integrated_inplanes: int,
-        stream1_planes: int,
-        stream2_planes: int,
+        integrated_planes: int,
         stride: int = 1,
         downsample: Optional[nn.Module] = None,
         groups: int = 1,
@@ -229,114 +182,71 @@ class LIBottleneck(nn.Module):
             norm_layer = LIBatchNorm2d
 
         # Calculate intermediate width for all pathways
-        stream1_width = int(stream1_planes * (base_width / 64.0)) * groups
-        stream2_width = int(stream2_planes * (base_width / 64.0)) * groups
-        integrated_width = stream1_width  # Same as stream1
+        stream_widths = [int(planes * (base_width / 64.0)) * groups for planes in stream_planes]
+        integrated_width = int(integrated_planes * (base_width / 64.0)) * groups
 
         # Store channel counts for output
-        self.stream1_outplanes = stream1_planes * self.expansion
-        self.stream2_outplanes = stream2_planes * self.expansion
-        self.integrated_outplanes = stream1_planes * self.expansion
+        self.num_streams = len(stream_inplanes)
+        self.stream_outplanes = [planes * self.expansion for planes in stream_planes]
+        self.integrated_outplanes = integrated_planes * self.expansion
 
         # Use unified LI neurons - integration happens inside LIConv2d!
         self.conv1 = li_conv1x1(
-            stream1_inplanes, stream2_inplanes, integrated_inplanes,
-            stream1_width, stream2_width, integrated_width
+            stream_inplanes,
+            stream_widths,
+            integrated_inplanes,
+            integrated_width
         )
-        self.bn1 = norm_layer(stream1_width, stream2_width, integrated_width)
+        self.bn1 = norm_layer(stream_widths, integrated_width)
         self.conv2 = li_conv3x3(
-            stream1_width, stream2_width, integrated_width,
-            stream1_width, stream2_width, integrated_width,
+            stream_widths,
+            stream_widths,
+            integrated_width,
+            integrated_width,
             stride, groups, dilation
         )
-        self.bn2 = norm_layer(stream1_width, stream2_width, integrated_width)
+        self.bn2 = norm_layer(stream_widths, integrated_width)
         self.conv3 = li_conv1x1(
-            stream1_width, stream2_width, integrated_width,
-            self.stream1_outplanes, self.stream2_outplanes, self.integrated_outplanes
+            stream_widths,
+            self.stream_outplanes,
+            integrated_width,
+            self.integrated_outplanes
         )
-        self.bn3 = norm_layer(self.stream1_outplanes, self.stream2_outplanes, self.integrated_outplanes)
+        self.bn3 = norm_layer(self.stream_outplanes, self.integrated_outplanes)
         self.relu = LIReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
     
-    def forward(self, stream1_input: Tensor, stream2_input: Tensor, integrated_input: Tensor = None) -> tuple[Tensor, Tensor, Tensor]:
-        """Forward pass with 3-stream processing."""
+    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
+        """Forward pass with N-stream processing."""
         # Save identities
-        stream1_identity = stream1_input
-        stream2_identity = stream2_input
+        stream_identities = stream_inputs.copy()
         integrated_identity = integrated_input
 
         # Three conv blocks (integration happens inside LIConv2d!)
-        s1, s2, ic = self.conv1(stream1_input, stream2_input, integrated_input)
-        s1, s2, ic = self.bn1(s1, s2, ic)
-        s1, s2, ic = self.relu(s1, s2, ic)
+        stream_outputs, integrated = self.conv1(stream_inputs, integrated_input)
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated)
 
-        s1, s2, ic = self.conv2(s1, s2, ic)
-        s1, s2, ic = self.bn2(s1, s2, ic)
-        s1, s2, ic = self.relu(s1, s2, ic)
+        stream_outputs, integrated = self.conv2(stream_outputs, integrated)
+        stream_outputs, integrated = self.bn2(stream_outputs, integrated)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated)
 
-        s1, s2, ic = self.conv3(s1, s2, ic)
-        s1, s2, ic = self.bn3(s1, s2, ic)
+        stream_outputs, integrated = self.conv3(stream_outputs, integrated)
+        stream_outputs, integrated = self.bn3(stream_outputs, integrated)
 
-        # Apply downsampling to identities if needed (handles all 3 streams together)
+        # Apply downsampling to identities if needed (handles all N streams together)
         if self.downsample is not None:
-            stream1_identity, stream2_identity, integrated_identity = self.downsample(
-                stream1_identity, stream2_identity, integrated_identity
+            stream_identities, integrated_identity = self.downsample(
+                stream_identities, integrated_identity
             )
 
         # Residual connections
-        s1 += stream1_identity
-        s2 += stream2_identity
+        stream_outputs = [s + s_id for s, s_id in zip(stream_outputs, stream_identities)]
         if integrated_identity is not None:
-            ic += integrated_identity
+            integrated = integrated + integrated_identity
 
         # Final activation
-        s1, s2, ic = self.relu(s1, s2, ic)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated)
 
-        return s1, s2, ic
-
-    def forward_stream1(self, stream1_input: Tensor) -> Tensor:
-        """Forward pass through stream1 pathway only."""
-        stream1_identity = stream1_input
-        
-        stream1_out = self.conv1.forward_stream1(stream1_input)
-        stream1_out = self.bn1.forward_stream1(stream1_out)
-        stream1_out = self.relu.forward_stream1(stream1_out)
-        
-        stream1_out = self.conv2.forward_stream1(stream1_out)
-        stream1_out = self.bn2.forward_stream1(stream1_out)
-        stream1_out = self.relu.forward_stream1(stream1_out)
-        
-        stream1_out = self.conv3.forward_stream1(stream1_out)
-        stream1_out = self.bn3.forward_stream1(stream1_out)
-        
-        if self.downsample is not None:
-            stream1_identity = self.downsample.forward_stream1(stream1_identity)
-        
-        stream1_out += stream1_identity
-        stream1_out = self.relu.forward_stream1(stream1_out)
-        
-        return stream1_out
-    
-    def forward_stream2(self, stream2_input: Tensor) -> Tensor:
-        """Forward pass through stream2 pathway only."""
-        stream2_identity = stream2_input
-        
-        stream2_out = self.conv1.forward_stream2(stream2_input)
-        stream2_out = self.bn1.forward_stream2(stream2_out)
-        stream2_out = self.relu.forward_stream2(stream2_out)
-        
-        stream2_out = self.conv2.forward_stream2(stream2_out)
-        stream2_out = self.bn2.forward_stream2(stream2_out)
-        stream2_out = self.relu.forward_stream2(stream2_out)
-        
-        stream2_out = self.conv3.forward_stream2(stream2_out)
-        stream2_out = self.bn3.forward_stream2(stream2_out)
-        
-        if self.downsample is not None:
-            stream2_identity = self.downsample.forward_stream2(stream2_identity)
-        
-        stream2_out += stream2_identity
-        stream2_out = self.relu.forward_stream2(stream2_out)
-        
-        return stream2_out
+        return stream_outputs, integrated

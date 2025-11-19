@@ -1,7 +1,7 @@
 """
-Linear Integration convolution layers for 3-stream processing.
+Linear Integration convolution layers for N-stream processing.
 
-This module provides 3-stream convolution operations with learned integration
+This module provides N-stream convolution operations with learned integration
 that maintain independent pathways with unified neuron architecture.
 """
 
@@ -22,31 +22,36 @@ class _LIConvNd(nn.Module):
     Linear Integration convolution base class - follows PyTorch's _ConvNd pattern exactly.
 
     This is the base class for linear integration convolution layers, mirroring PyTorch's
-    _ConvNd but adapted for 3-stream (stream1/stream2/integrated) processing.
+    _ConvNd but adapted for N-stream processing with dynamic stream handling.
     """
-    
+
     __constants__ = [
         "stride", "padding", "dilation", "groups", "padding_mode", "output_padding",
-        "stream1_in_channels", "stream2_in_channels", "integrated_in_channels",
-        "stream1_out_channels", "stream2_out_channels", "integrated_out_channels", "kernel_size",
+        "num_streams", "stream_in_channels", "stream_out_channels",
+        "integrated_in_channels", "integrated_out_channels", "kernel_size",
     ]
     __annotations__ = {
-        "stream1_bias": Optional[torch.Tensor],
-        "stream2_bias": Optional[torch.Tensor],
+        "stream_biases": Optional[nn.ParameterList],
         "integrated_bias": Optional[torch.Tensor],
     }
     
-    def _conv_forward(self, stream1_input: Tensor, stream2_input: Tensor, integrated_input: Tensor,
-                     stream1_weight: Tensor, stream2_weight: Tensor, integrated_weight: Tensor,
-                     stream1_bias: Optional[Tensor], stream2_bias: Optional[Tensor], integrated_bias: Optional[Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+    def _conv_forward(
+        self,
+        stream_inputs: list[Tensor],
+        integrated_input: Optional[Tensor],
+        stream_weights: list[Tensor],
+        integrated_weight: Optional[Tensor],
+        integration_from_streams_weights: list[Tensor],
+        stream_biases: list[Optional[Tensor]],
+        integrated_bias: Optional[Tensor]
+    ) -> tuple[list[Tensor], Tensor]:
         """Abstract method to be implemented by subclasses."""
         ...
 
-    stream1_in_channels: int
-    stream2_in_channels: int
+    num_streams: int
+    stream_in_channels: list[int]
+    stream_out_channels: list[int]
     integrated_in_channels: int
-    stream1_out_channels: int
-    stream2_out_channels: int
     integrated_out_channels: int
     kernel_size: tuple[int, ...]
     stride: tuple[int, ...]
@@ -56,21 +61,18 @@ class _LIConvNd(nn.Module):
     output_padding: tuple[int, ...]
     groups: int
     padding_mode: str
-    stream1_weight: Tensor
-    stream2_weight: Tensor
+    stream_weights: nn.ParameterList
     integrated_weight: Tensor
-    stream1_bias: Optional[Tensor]
-    stream2_bias: Optional[Tensor]
+    integration_from_streams: nn.ParameterList
+    stream_biases: Optional[nn.ParameterList]
     integrated_bias: Optional[Tensor]
     _reversed_padding_repeated_twice: list[int]
 
     def __init__(
         self,
-        stream1_in_channels: int,
-        stream2_in_channels: int,
+        stream_in_channels: list[int],
+        stream_out_channels: list[int],
         integrated_in_channels: int,
-        stream1_out_channels: int,
-        stream2_out_channels: int,
         integrated_out_channels: int,
         kernel_size: tuple[int, ...],
         stride: tuple[int, ...],
@@ -90,20 +92,27 @@ class _LIConvNd(nn.Module):
         # Validate parameters exactly like _ConvNd
         if groups <= 0:
             raise ValueError("groups must be a positive integer")
-        if stream1_in_channels % groups != 0:
-            raise ValueError("stream1_in_channels must be divisible by groups")
-        if stream2_in_channels % groups != 0:
-            raise ValueError("stream2_in_channels must be divisible by groups")
+
+        # Validate stream channel counts
+        num_streams = len(stream_in_channels)
+        if len(stream_out_channels) != num_streams:
+            raise ValueError(f"stream_in_channels and stream_out_channels must have same length, "
+                           f"got {num_streams} and {len(stream_out_channels)}")
+
+        for i, in_ch in enumerate(stream_in_channels):
+            if in_ch % groups != 0:
+                raise ValueError(f"stream_in_channels[{i}] must be divisible by groups")
+
+        for i, out_ch in enumerate(stream_out_channels):
+            if out_ch % groups != 0:
+                raise ValueError(f"stream_out_channels[{i}] must be divisible by groups")
+
         # Allow integrated_in_channels=0 for first layer (no integrated input yet)
         if integrated_in_channels > 0 and integrated_in_channels % groups != 0:
             raise ValueError("integrated_in_channels must be divisible by groups")
-        if stream1_out_channels % groups != 0:
-            raise ValueError("stream1_out_channels must be divisible by groups")
-        if stream2_out_channels % groups != 0:
-            raise ValueError("stream2_out_channels must be divisible by groups")
         if integrated_out_channels % groups != 0:
             raise ValueError("integrated_out_channels must be divisible by groups")
-        
+
         valid_padding_strings = {"same", "valid"}
         if isinstance(padding, str):
             if padding not in valid_padding_strings:
@@ -114,19 +123,18 @@ class _LIConvNd(nn.Module):
                 raise ValueError(
                     "padding='same' is not supported for strided convolutions"
                 )
-        
+
         valid_padding_modes = {"zeros", "reflect", "replicate", "circular"}
         if padding_mode not in valid_padding_modes:
             raise ValueError(
                 f"padding_mode must be one of {valid_padding_modes}, but got padding_mode='{padding_mode}'"
             )
-        
+
         # Store parameters
-        self.stream1_in_channels = stream1_in_channels
-        self.stream2_in_channels = stream2_in_channels
+        self.num_streams = num_streams
+        self.stream_in_channels = stream_in_channels
+        self.stream_out_channels = stream_out_channels
         self.integrated_in_channels = integrated_in_channels
-        self.stream1_out_channels = stream1_out_channels
-        self.stream2_out_channels = stream2_out_channels
         self.integrated_out_channels = integrated_out_channels
         self.kernel_size = kernel_size
         self.stride = stride
@@ -160,21 +168,17 @@ class _LIConvNd(nn.Module):
                 self.padding, 2
             )
         
-        # Create weight parameters for stream1 and stream2 pathways (full kernel_size)
+        # Create weight parameters for all N streams (full kernel_size)
         if transposed:
-            self.stream1_weight = Parameter(
-                torch.empty(
-                    (stream1_in_channels, stream1_out_channels // groups, *kernel_size),
+            self.stream_weights = nn.ParameterList([
+                Parameter(torch.empty(
+                    (stream_in_channels[i], stream_out_channels[i] // groups, *kernel_size),
                     **factory_kwargs,
-                )
-            )
-            self.stream2_weight = Parameter(
-                torch.empty(
-                    (stream2_in_channels, stream2_out_channels // groups, *kernel_size),
-                    **factory_kwargs,
-                )
-            )
+                ))
+                for i in range(num_streams)
+            ])
             # Integrated weight is always 1x1 (channel-wise only)
+            # Note: Can have shape (0, out_channels, 1, 1) when integrated_in_channels=0 (first layer)
             self.integrated_weight = Parameter(
                 torch.empty(
                     (integrated_in_channels, integrated_out_channels // groups, 1, 1),
@@ -182,50 +186,42 @@ class _LIConvNd(nn.Module):
                 )
             )
         else:
-            self.stream1_weight = Parameter(
-                torch.empty(
-                    (stream1_out_channels, stream1_in_channels // groups, *kernel_size),
+            self.stream_weights = nn.ParameterList([
+                Parameter(torch.empty(
+                    (stream_out_channels[i], stream_in_channels[i] // groups, *kernel_size),
                     **factory_kwargs,
-                )
-            )
-            self.stream2_weight = Parameter(
-                torch.empty(
-                    (stream2_out_channels, stream2_in_channels // groups, *kernel_size),
-                    **factory_kwargs,
-                )
-            )
+                ))
+                for i in range(num_streams)
+            ])
             # Integrated weight is always 1x1 (channel-wise only)
+            # Note: Can have shape (out_channels, 0, 1, 1) when integrated_in_channels=0 (first layer)
             self.integrated_weight = Parameter(
                 torch.empty(
                     (integrated_out_channels, integrated_in_channels // groups, 1, 1),
                     **factory_kwargs,
                 )
             )
-        
-        # Create bias parameters for all 3 pathways
+
+        # Create bias parameters for all N streams
         if bias:
-            self.stream1_bias = Parameter(torch.empty(stream1_out_channels, **factory_kwargs))
-            self.stream2_bias = Parameter(torch.empty(stream2_out_channels, **factory_kwargs))
+            self.stream_biases = nn.ParameterList([
+                Parameter(torch.empty(stream_out_channels[i], **factory_kwargs))
+                for i in range(num_streams)
+            ])
             self.integrated_bias = Parameter(torch.empty(integrated_out_channels, **factory_kwargs))
         else:
-            self.register_parameter("stream1_bias", None)
-            self.register_parameter("stream2_bias", None)
+            self.register_parameter("stream_biases", None)
             self.register_parameter("integrated_bias", None)
 
         # Create 1x1 integration weights for Linear Integration (channel-wise mixing)
-        # These weights learn how to combine stream1 and stream2 outputs into the integrated stream
-        self.integration_from_stream1 = Parameter(
-            torch.empty(
-                (integrated_out_channels, stream1_out_channels, 1, 1),
+        # These weights learn how to combine all stream outputs into the integrated stream
+        self.integration_from_streams = nn.ParameterList([
+            Parameter(torch.empty(
+                (integrated_out_channels, stream_out_channels[i], 1, 1),
                 **factory_kwargs,
-            )
-        )
-        self.integration_from_stream2 = Parameter(
-            torch.empty(
-                (integrated_out_channels, stream2_out_channels, 1, 1),
-                **factory_kwargs,
-            )
-        )
+            ))
+            for i in range(num_streams)
+        ])
 
         self.reset_parameters()
     
@@ -235,21 +231,16 @@ class _LIConvNd(nn.Module):
         # uniform(-1/sqrt(k), 1/sqrt(k)), where k = weight.size(1) * prod(*kernel_size)
         # For more details see: https://github.com/pytorch/pytorch/issues/15314#issuecomment-477448573
 
-        # Initialize stream1 pathway weights
-        init.kaiming_uniform_(self.stream1_weight, a=math.sqrt(5))
-        if self.stream1_bias is not None:
-            fan_in, _ = init._calculate_fan_in_and_fan_out(self.stream1_weight)
-            if fan_in != 0:
-                bound = 1 / math.sqrt(fan_in)
-                init.uniform_(self.stream1_bias, -bound, bound)
+        # Initialize all stream pathway weights
+        for stream_weight in self.stream_weights:
+            init.kaiming_uniform_(stream_weight, a=math.sqrt(5))
 
-        # Initialize stream2 pathway weights
-        init.kaiming_uniform_(self.stream2_weight, a=math.sqrt(5))
-        if self.stream2_bias is not None:
-            fan_in, _ = init._calculate_fan_in_and_fan_out(self.stream2_weight)
-            if fan_in != 0:
-                bound = 1 / math.sqrt(fan_in)
-                init.uniform_(self.stream2_bias, -bound, bound)
+        if self.stream_biases is not None:
+            for i, stream_bias in enumerate(self.stream_biases):
+                fan_in, _ = init._calculate_fan_in_and_fan_out(self.stream_weights[i])
+                if fan_in != 0:
+                    bound = 1 / math.sqrt(fan_in)
+                    init.uniform_(stream_bias, -bound, bound)
 
         # Initialize integrated pathway weights
         init.kaiming_uniform_(self.integrated_weight, a=math.sqrt(5))
@@ -260,31 +251,32 @@ class _LIConvNd(nn.Module):
                 init.uniform_(self.integrated_bias, -bound, bound)
 
         # Initialize integration weights (1x1 convolutions for stream mixing)
-        init.kaiming_uniform_(self.integration_from_stream1, a=math.sqrt(5))
-        init.kaiming_uniform_(self.integration_from_stream2, a=math.sqrt(5))
+        for integration_weight in self.integration_from_streams:
+            init.kaiming_uniform_(integration_weight, a=math.sqrt(5))
     
     def extra_repr(self):
         """String representation exactly like _ConvNd."""
         s = (
-            "stream1_in_channels={stream1_in_channels}, stream2_in_channels={stream2_in_channels}, "
-            "integrated_in_channels={integrated_in_channels}, "
-            "stream1_out_channels={stream1_out_channels}, stream2_out_channels={stream2_out_channels}, "
-            "integrated_out_channels={integrated_out_channels}, "
-            "kernel_size={kernel_size}, stride={stride}"
+            f"num_streams={self.num_streams}, "
+            f"stream_in_channels={self.stream_in_channels}, "
+            f"stream_out_channels={self.stream_out_channels}, "
+            f"integrated_in_channels={self.integrated_in_channels}, "
+            f"integrated_out_channels={self.integrated_out_channels}, "
+            f"kernel_size={self.kernel_size}, stride={self.stride}"
         )
         if self.padding != (0,) * len(self.padding):
-            s += ", padding={padding}"
+            s += f", padding={self.padding}"
         if self.dilation != (1,) * len(self.dilation):
-            s += ", dilation={dilation}"
+            s += f", dilation={self.dilation}"
         if self.output_padding != (0,) * len(self.output_padding):
-            s += ", output_padding={output_padding}"
+            s += f", output_padding={self.output_padding}"
         if self.groups != 1:
-            s += ", groups={groups}"
-        if self.stream1_bias is None:
+            s += f", groups={self.groups}"
+        if self.stream_biases is None:
             s += ", bias=False"
         if self.padding_mode != "zeros":
-            s += ", padding_mode={padding_mode}"
-        return s.format(**self.__dict__)
+            s += f", padding_mode={self.padding_mode}"
+        return s
     
     def __setstate__(self, state):
         """Handle backward compatibility like _ConvNd."""
@@ -297,17 +289,15 @@ class LIConv2d(_LIConvNd):
     """
     Linear Integration 2D Convolution layer - follows PyTorch's Conv2d pattern exactly.
 
-    This layer processes stream1, stream2, and integrated streams with learned integration
-    using 5 weight matrices, maintaining full compatibility with PyTorch's Conv2d interface.
+    This layer processes N input streams and integrated stream with learned integration,
+    maintaining full compatibility with PyTorch's Conv2d interface.
     """
-    
+
     def __init__(
         self,
-        stream1_in_channels: int,
-        stream2_in_channels: int,
+        stream_in_channels: list[int],
+        stream_out_channels: list[int],
         integrated_in_channels: int,
-        stream1_out_channels: int,
-        stream2_out_channels: int,
         integrated_out_channels: int,
         kernel_size: _size_2_t,
         stride: _size_2_t = 1,
@@ -325,11 +315,9 @@ class LIConv2d(_LIConvNd):
         padding_ = padding if isinstance(padding, str) else _pair(padding)
         dilation_ = _pair(dilation)
         super().__init__(
-            stream1_in_channels,
-            stream2_in_channels,
+            stream_in_channels,
+            stream_out_channels,
             integrated_in_channels,
-            stream1_out_channels,
-            stream2_out_channels,
             integrated_out_channels,
             kernel_size_,
             stride_,
@@ -343,48 +331,42 @@ class LIConv2d(_LIConvNd):
             **factory_kwargs,
         )
     
-    def _conv_forward(self, stream1_input: Tensor, stream2_input: Tensor, integrated_input: Optional[Tensor],
-                     stream1_weight: Tensor, stream2_weight: Tensor, integrated_weight: Tensor,
-                     stream1_bias: Optional[Tensor], stream2_bias: Optional[Tensor], integrated_bias: Optional[Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+    def _conv_forward(
+        self,
+        stream_inputs: list[Tensor],
+        integrated_input: Optional[Tensor],
+        stream_weights: list[Tensor],
+        integrated_weight: Optional[Tensor],
+        integration_from_streams_weights: list[Tensor],
+        stream_biases: list[Optional[Tensor]],
+        integrated_bias: Optional[Tensor]
+    ) -> tuple[list[Tensor], Tensor]:
         """Forward pass implementation exactly like Conv2d._conv_forward."""
-        # Process stream1 pathway
-        if self.padding_mode != "zeros":
-            stream1_out = F.conv2d(
-                F.pad(
-                    stream1_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
-                ),
-                stream1_weight,
-                stream1_bias,
-                self.stride,
-                _pair(0),
-                self.dilation,
-                self.groups,
-            )
-        else:
-            stream1_out = F.conv2d(
-                stream1_input, stream1_weight, stream1_bias, self.stride, self.padding, self.dilation, self.groups
-            )
-
-        # Process stream2 pathway
-        if self.padding_mode != "zeros":
-            stream2_out = F.conv2d(
-                F.pad(
-                    stream2_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
-                ),
-                stream2_weight,
-                stream2_bias,
-                self.stride,
-                _pair(0),
-                self.dilation,
-                self.groups,
-            )
-        else:
-            stream2_out = F.conv2d(
-                stream2_input, stream2_weight, stream2_bias, self.stride, self.padding, self.dilation, self.groups
-            )
+        # Process all stream pathways
+        stream_outputs = []
+        for i, (stream_input, stream_weight, stream_bias) in enumerate(
+            zip(stream_inputs, stream_weights, stream_biases)
+        ):
+            if self.padding_mode != "zeros":
+                stream_out = F.conv2d(
+                    F.pad(
+                        stream_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
+                    ),
+                    stream_weight,
+                    stream_bias,
+                    self.stride,
+                    _pair(0),
+                    self.dilation,
+                    self.groups,
+                )
+            else:
+                stream_out = F.conv2d(
+                    stream_input, stream_weight, stream_bias, self.stride, self.padding, self.dilation, self.groups
+                )
+            stream_outputs.append(stream_out)
 
         # ===== Process integrated pathway =====
-        # Apply Linear Integration: integrated_out = W3·integrated + W1·stream1 + W2·stream2 + bias
+        # Apply Linear Integration: integrated_out = W_prev·integrated_prev + Σ(Wi·stream_i_out) + bias
 
         # Process previous integrated (if exists) using 1x1 conv with stride matching
         # IMPORTANT: integrated_weight is 1x1, but stride must match main conv for spatial alignment
@@ -398,171 +380,68 @@ class LIConv2d(_LIConvNd):
             # First layer: no previous integrated stream
             integrated_from_prev = 0
 
-        # Integration step: combine stream outputs using 1x1 convs (channel-wise mixing)
-        integrated_from_s1 = F.conv2d(
-            stream1_out, self.integration_from_stream1, None,
-            stride=1, padding=0  # 1x1 conv, stride=1 (already spatially aligned)
-        )
-        integrated_from_s2 = F.conv2d(
-            stream2_out, self.integration_from_stream2, None,
-            stride=1, padding=0  # 1x1 conv, stride=1 (already spatially aligned)
-        )
+        # Integration step: combine all stream outputs using 1x1 convs (channel-wise mixing)
+        integrated_from_streams = []
+        for stream_out, integration_weight in zip(stream_outputs, integration_from_streams_weights):
+            integrated_contrib = F.conv2d(
+                stream_out, integration_weight, None,
+                stride=1, padding=0  # 1x1 conv, stride=1 (already spatially aligned)
+            )
+            integrated_from_streams.append(integrated_contrib)
 
         # Combine all contributions to create integrated output
-        integrated_out = integrated_from_prev + integrated_from_s1 + integrated_from_s2
+        integrated_out = integrated_from_prev + sum(integrated_from_streams)
 
         # Add bias at the end (ensures bias is applied in both first layer and later layers)
         if integrated_bias is not None:
             integrated_out = integrated_out + integrated_bias.view(1, -1, 1, 1)
 
-        return stream1_out, stream2_out, integrated_out
+        return stream_outputs, integrated_out
     
-    def forward(self, stream1_input: Tensor, stream2_input: Tensor, integrated_input: Optional[Tensor] = None) -> tuple[Tensor, Tensor, Tensor]:
-        """Forward pass through all 3 convolution streams with Linear Integration."""
+    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
+        """Forward pass through all N convolution streams with Linear Integration."""
+        # Convert ParameterList to list of tensors for _conv_forward
+        stream_weights_list = list(self.stream_weights)
+        integration_from_streams_weights_list = list(self.integration_from_streams)
+        stream_biases_list = list(self.stream_biases) if self.stream_biases is not None else [None] * self.num_streams
+
         return self._conv_forward(
-            stream1_input, stream2_input, integrated_input,
-            self.stream1_weight, self.stream2_weight, self.integrated_weight,
-            self.stream1_bias, self.stream2_bias, self.integrated_bias
+            stream_inputs,
+            integrated_input,
+            stream_weights_list,
+            self.integrated_weight,
+            integration_from_streams_weights_list,
+            stream_biases_list,
+            self.integrated_bias
         )
-    
-    def forward_stream1(self, stream1_input: Tensor) -> Tensor:
-        """Forward pass through stream1 stream only."""
-        if self.padding_mode != "zeros":
-            return F.conv2d(
-                F.pad(
-                    stream1_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
-                ),
-                self.stream1_weight,
-                self.stream1_bias,
-                self.stride,
-                _pair(0),
-                self.dilation,
-                self.groups,
-            )
-        return F.conv2d(
-            stream1_input, self.stream1_weight, self.stream1_bias, self.stride, self.padding, self.dilation, self.groups
-        )
-    
-    def forward_stream2(self, stream2_input: Tensor) -> Tensor:
-        """Forward pass through stream2 stream only."""
-        if self.padding_mode != "zeros":
-            return F.conv2d(
-                F.pad(
-                    stream2_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
-                ),
-                self.stream2_weight,
-                self.stream2_bias,
-                self.stride,
-                _pair(0),
-                self.dilation,
-                self.groups,
-            )
-        return F.conv2d(
-            stream2_input, self.stream2_weight, self.stream2_bias, self.stride, self.padding, self.dilation, self.groups
-        )
-    
-    def _forward_interleaved(self, stream1_input: Tensor, stream2_input: Tensor, integrated_input: Optional[Tensor] = None) -> tuple[Tensor, Tensor, Tensor]:
-        """Forward pass using channel interleaving for balanced processing."""
-        # Repeat brightness to match color channels for interleaving
-        if self.stream2_in_channels < self.stream1_in_channels:
-            # Repeat brightness channels to match color
-            repeat_factor = self.stream1_in_channels // self.stream2_in_channels
-            remainder = self.stream1_in_channels % self.stream2_in_channels
-            
-            brightness_repeated = stream2_input.repeat(1, repeat_factor, 1, 1)
-            if remainder > 0:
-                brightness_extra = stream2_input[:, :remainder, :, :]
-                brightness_repeated = torch.cat([brightness_repeated, brightness_extra], dim=1)
-        else:
-            brightness_repeated = stream2_input
-        
-        # Interleave channels: [C1, B1, C2, B2, C3, B3, ...]
-        channels = []
-        for i in range(max(self.stream1_in_channels, self.stream2_in_channels)):
-            if i < self.stream1_in_channels:
-                channels.append(stream1_input[:, i:i+1, :, :])
-            if i < brightness_repeated.size(1):
-                channels.append(brightness_repeated[:, i:i+1, :, :])
-        
-        interleaved_input = torch.cat(channels, dim=1)
-        
-        # Create interleaved weights
-        stream1_weight_expanded = self.stream1_weight.repeat_interleave(2, dim=1)
-        stream2_weight_expanded = self.stream2_weight.repeat_interleave(2, dim=1)
-        weight_interleaved = torch.cat([stream1_weight_expanded, stream2_weight_expanded], dim=0)
-        
-        # Apply convolution
-        if self.padding_mode != "zeros":
-            interleaved_input = F.pad(interleaved_input, self._reversed_padding_repeated_twice, mode=self.padding_mode)
-            out_combined = F.conv2d(
-                interleaved_input, weight_interleaved, None,
-                self.stride, _pair(0), self.dilation, groups=2
-            )
-        else:
-            out_combined = F.conv2d(
-                interleaved_input, weight_interleaved, None,
-                self.stride, self.padding, self.dilation, groups=2
-            )
-        
-        # De-interleave outputs
-        stream1_out = out_combined[:, :self.stream1_out_channels, :, :]
-        stream2_out = out_combined[:, self.stream1_out_channels:, :, :]
-
-        # ===== Process integrated pathway =====
-        # Apply Linear Integration: integrated_out = W3·integrated + W1·stream1 + W2·stream2 + bias
-
-        # Process previous integrated (if exists) using 1x1 conv with stride matching
-        # IMPORTANT: integrated_weight is 1x1, but stride must match main conv for spatial alignment
-        # Note: We apply bias at the end (after summing all contributions) for consistency
-        if integrated_input is not None:
-            integrated_from_prev = F.conv2d(
-                integrated_input, self.integrated_weight, None,  # No bias here
-                stride=self.stride, padding=0  # 1x1 conv, stride matches main conv
-            )
-        else:
-            # First layer: no previous integrated stream
-            integrated_from_prev = 0
-
-        # Integration step: combine stream outputs using 1x1 convs (channel-wise mixing)
-        integrated_from_s1 = F.conv2d(
-            stream1_out, self.integration_from_stream1, None,
-            stride=1, padding=0  # 1x1 conv, stride=1 (already spatially aligned)
-        )
-        integrated_from_s2 = F.conv2d(
-            stream2_out, self.integration_from_stream2, None,
-            stride=1, padding=0  # 1x1 conv, stride=1 (already spatially aligned)
-        )
-
-        # Combine all contributions to create integrated output
-        integrated_out = integrated_from_prev + integrated_from_s1 + integrated_from_s2
-
-        # Add bias at the end (ensures bias is applied in both first layer and later layers)
-        if self.integrated_bias is not None:
-            integrated_out = integrated_out + self.integrated_bias.view(1, -1, 1, 1)
-
-        return stream1_out, stream2_out, integrated_out
     
 
 
 class _LINormBase(nn.Module):
     """Common base for Linear Integration normalization - follows PyTorch's _NormBase pattern exactly."""
-    
+
     _version = 2
-    __constants__ = ["track_running_stats", "momentum", "eps", "stream1_num_features", "stream2_num_features", "integrated_num_features", "affine"]
-    stream1_num_features: int
-    stream2_num_features: int
+    __constants__ = ["track_running_stats", "momentum", "eps", "num_streams", "stream_num_features", "integrated_num_features", "affine"]
+    num_streams: int
+    stream_num_features: list[int]
     integrated_num_features: int
     eps: float
     momentum: Optional[float]
     affine: bool
     track_running_stats: bool
-    # WARNING: stream1_weight, stream2_weight, stream1_bias, stream2_bias purposely not defined here.
+    # WARNING: stream_weights, stream_biases purposely not defined here.
     # Following PyTorch's pattern from https://github.com/pytorch/pytorch/issues/39670
+
+    # Type annotations for buffers that are always present
+    integrated_running_mean: Optional[Tensor]
+    integrated_running_var: Optional[Tensor]
+    num_batches_tracked: Optional[Tensor]
+    # NOTE: Per-stream buffers (stream{i}_running_mean, stream{i}_running_var) are registered
+    # dynamically at runtime for i in range(num_streams), so they cannot be statically typed here.
     
     def __init__(
         self,
-        stream1_num_features: int,
-        stream2_num_features: int,
+        stream_num_features: list[int],
         integrated_num_features: int,
         eps: float = 1e-5,
         momentum: Optional[float] = 0.1,
@@ -573,50 +452,52 @@ class _LINormBase(nn.Module):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.stream1_num_features = stream1_num_features
-        self.stream2_num_features = stream2_num_features
+        self.num_streams = len(stream_num_features)
+        self.stream_num_features = stream_num_features
         self.integrated_num_features = integrated_num_features
         self.eps = eps
         self.momentum = momentum
         self.affine = affine
         self.track_running_stats = track_running_stats
-        
-        # Create parameters for all 3 pathways - exactly like _NormBase but for 3 streams
+
+        # Create parameters for all N stream pathways - exactly like _NormBase but for N streams
         if self.affine:
-            self.stream1_weight = Parameter(torch.empty(stream1_num_features, **factory_kwargs))
-            self.stream1_bias = Parameter(torch.empty(stream1_num_features, **factory_kwargs))
-            self.stream2_weight = Parameter(torch.empty(stream2_num_features, **factory_kwargs))
-            self.stream2_bias = Parameter(torch.empty(stream2_num_features, **factory_kwargs))
+            self.stream_weights = nn.ParameterList([
+                Parameter(torch.empty(num_features, **factory_kwargs))
+                for num_features in stream_num_features
+            ])
+            self.stream_biases = nn.ParameterList([
+                Parameter(torch.empty(num_features, **factory_kwargs))
+                for num_features in stream_num_features
+            ])
             self.integrated_weight = Parameter(torch.empty(integrated_num_features, **factory_kwargs))
             self.integrated_bias = Parameter(torch.empty(integrated_num_features, **factory_kwargs))
         else:
-            self.register_parameter("stream1_weight", None)
-            self.register_parameter("stream1_bias", None)
-            self.register_parameter("stream2_weight", None)
-            self.register_parameter("stream2_bias", None)
+            self.register_parameter("stream_weights", None)
+            self.register_parameter("stream_biases", None)
             self.register_parameter("integrated_weight", None)
             self.register_parameter("integrated_bias", None)
-        
-        # Create buffers for all 3 pathways - stream alternating pattern like PyTorch
+
+        # Create buffers for all N stream pathways
         if self.track_running_stats:
-            self.register_buffer(
-                "stream1_running_mean", torch.zeros(stream1_num_features, **factory_kwargs)
-            )
-            self.register_buffer(
-                "stream2_running_mean", torch.zeros(stream2_num_features, **factory_kwargs)
-            )
+            # Register running stats for each stream
+            for i, num_features in enumerate(stream_num_features):
+                self.register_buffer(
+                    f"stream{i}_running_mean", torch.zeros(num_features, **factory_kwargs)
+                )
+                self.register_buffer(
+                    f"stream{i}_running_var", torch.ones(num_features, **factory_kwargs)
+                )
+
+            # Register integrated stream buffers
             self.register_buffer(
                 "integrated_running_mean", torch.zeros(integrated_num_features, **factory_kwargs)
             )
             self.register_buffer(
-                "stream1_running_var", torch.ones(stream1_num_features, **factory_kwargs)
-            )
-            self.register_buffer(
-                "stream2_running_var", torch.ones(stream2_num_features, **factory_kwargs)
-            )
-            self.register_buffer(
                 "integrated_running_var", torch.ones(integrated_num_features, **factory_kwargs)
             )
+
+            # Register num_batches_tracked (shared across all streams)
             self.register_buffer(
                 "num_batches_tracked",
                 torch.tensor(
@@ -625,34 +506,26 @@ class _LINormBase(nn.Module):
                     **{k: v for k, v in factory_kwargs.items() if k != "dtype"},
                 ),
             )
-            self.stream1_running_mean: Optional[Tensor]
-            self.stream2_running_mean: Optional[Tensor]
-            self.integrated_running_mean: Optional[Tensor]
-            self.stream1_running_var: Optional[Tensor]
-            self.stream2_running_var: Optional[Tensor]
-            self.integrated_running_var: Optional[Tensor]
-            self.num_batches_tracked: Optional[Tensor]
         else:
-            self.register_buffer("stream1_running_mean", None)
-            self.register_buffer("stream2_running_mean", None)
+            # Register None buffers for each stream
+            for i in range(self.num_streams):
+                self.register_buffer(f"stream{i}_running_mean", None)
+                self.register_buffer(f"stream{i}_running_var", None)
+
             self.register_buffer("integrated_running_mean", None)
-            self.register_buffer("stream1_running_var", None)
-            self.register_buffer("stream2_running_var", None)
             self.register_buffer("integrated_running_var", None)
             self.register_buffer("num_batches_tracked", None)
-        
+
         self.reset_parameters()
     
     def reset_running_stats(self) -> None:
-        """Reset running statistics for all 3 pathways - exactly like _NormBase but for 3 streams."""
+        """Reset running statistics for all N pathways - exactly like _NormBase but for N streams."""
         if self.track_running_stats:
             # running_mean/running_var/num_batches... are registered at runtime depending
             # if self.track_running_stats is on
-            self.stream1_running_mean.zero_()  # type: ignore[union-attr]
-            self.stream1_running_var.fill_(1)  # type: ignore[union-attr]
-
-            self.stream2_running_mean.zero_()  # type: ignore[union-attr]
-            self.stream2_running_var.fill_(1)  # type: ignore[union-attr]
+            for i in range(self.num_streams):
+                getattr(self, f"stream{i}_running_mean").zero_()  # type: ignore[union-attr]
+                getattr(self, f"stream{i}_running_var").fill_(1)  # type: ignore[union-attr]
 
             self.integrated_running_mean.zero_()  # type: ignore[union-attr]
             self.integrated_running_var.fill_(1)  # type: ignore[union-attr]
@@ -661,13 +534,12 @@ class _LINormBase(nn.Module):
             self.num_batches_tracked.zero_()  # type: ignore[union-attr,operator]
 
     def reset_parameters(self) -> None:
-        """Reset parameters for all 3 pathways - exactly like _NormBase but for 3 streams."""
+        """Reset parameters for all N pathways - exactly like _NormBase but for N streams."""
         self.reset_running_stats()
         if self.affine:
-            init.ones_(self.stream1_weight)
-            init.zeros_(self.stream1_bias)
-            init.ones_(self.stream2_weight)
-            init.zeros_(self.stream2_bias)
+            for stream_weight, stream_bias in zip(self.stream_weights, self.stream_biases):
+                init.ones_(stream_weight)
+                init.zeros_(stream_bias)
             init.ones_(self.integrated_weight)
             init.zeros_(self.integrated_bias)
     
@@ -676,12 +548,13 @@ class _LINormBase(nn.Module):
         raise NotImplementedError
     
     def extra_repr(self):
-        """String representation - updated for 3 streams."""
+        """String representation - updated for N streams."""
         return (
-            "stream1_num_features={stream1_num_features}, stream2_num_features={stream2_num_features}, "
-            "integrated_num_features={integrated_num_features}, "
-            "eps={eps}, momentum={momentum}, affine={affine}, "
-            "track_running_stats={track_running_stats}".format(**self.__dict__)
+            f"num_streams={self.num_streams}, "
+            f"stream_num_features={self.stream_num_features}, "
+            f"integrated_num_features={self.integrated_num_features}, "
+            f"eps={self.eps}, momentum={self.momentum}, affine={self.affine}, "
+            f"track_running_stats={self.track_running_stats}"
         )
     
     def _load_from_state_dict(
@@ -722,11 +595,10 @@ class _LINormBase(nn.Module):
 
 class _LIBatchNorm(_LINormBase):
     """Linear Integration BatchNorm - follows PyTorch's _BatchNorm pattern exactly."""
-    
+
     def __init__(
         self,
-        stream1_num_features: int,
-        stream2_num_features: int,
+        stream_num_features: list[int],
         integrated_num_features: int,
         eps: float = 1e-5,
         momentum: Optional[float] = 0.1,
@@ -737,38 +609,31 @@ class _LIBatchNorm(_LINormBase):
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
-            stream1_num_features, stream2_num_features, integrated_num_features, eps, momentum, affine, track_running_stats, **factory_kwargs
+            stream_num_features, integrated_num_features, eps, momentum, affine, track_running_stats, **factory_kwargs
         )
     
-    def forward(self, stream1_input: Tensor, stream2_input: Tensor, integrated_input: Optional[Tensor] = None) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
         """
-        Forward pass - implements the exact same algorithm as _BatchNorm.forward() for 3 streams.
+        Forward pass - implements the exact same algorithm as _BatchNorm.forward() for N streams.
         """
         # Check input dimensions for all inputs
-        self._check_input_dim(stream1_input)
-        self._check_input_dim(stream2_input)
+        for stream_input in stream_inputs:
+            self._check_input_dim(stream_input)
         if integrated_input is not None:
             self._check_input_dim(integrated_input)
 
-        # Process stream1 pathway using the exact _BatchNorm algorithm
-        stream1_out = self._forward_single_pathway(
-            stream1_input,
-            self.stream1_running_mean,
-            self.stream1_running_var,
-            self.stream1_weight,
-            self.stream1_bias,
-            self.num_batches_tracked,
-        )
-
-        # Process stream2 pathway using the exact _BatchNorm algorithm
-        stream2_out = self._forward_single_pathway(
-            stream2_input,
-            self.stream2_running_mean,
-            self.stream2_running_var,
-            self.stream2_weight,
-            self.stream2_bias,
-            self.num_batches_tracked,
-        )
+        # Process all stream pathways using the exact _BatchNorm algorithm
+        stream_outputs = []
+        for i, stream_input in enumerate(stream_inputs):
+            stream_out = self._forward_single_pathway(
+                stream_input,
+                getattr(self, f"stream{i}_running_mean"),
+                getattr(self, f"stream{i}_running_var"),
+                self.stream_weights[i] if self.affine else None,
+                self.stream_biases[i] if self.affine else None,
+                self.num_batches_tracked,
+            )
+            stream_outputs.append(stream_out)
 
         # Process integrated pathway using the exact _BatchNorm algorithm (if exists)
         if integrated_input is not None:
@@ -783,31 +648,7 @@ class _LIBatchNorm(_LINormBase):
         else:
             integrated_out = None
 
-        return stream1_out, stream2_out, integrated_out
-    
-    def forward_stream1(self, stream1_input: Tensor) -> Tensor:
-        """Forward pass through stream1 pathway only."""
-        self._check_input_dim(stream1_input)
-        return self._forward_single_pathway(
-            stream1_input,
-            self.stream1_running_mean,
-            self.stream1_running_var,
-            self.stream1_weight,
-            self.stream1_bias,
-            self.num_batches_tracked,
-        )
-    
-    def forward_stream2(self, stream2_input: Tensor) -> Tensor:
-        """Forward pass through stream2 pathway only."""
-        self._check_input_dim(stream2_input)
-        return self._forward_single_pathway(
-            stream2_input,
-            self.stream2_running_mean,
-            self.stream2_running_var,
-            self.stream2_weight,
-            self.stream2_bias,
-            self.num_batches_tracked,
-        )
+        return stream_outputs, integrated_out
     
     def _forward_single_pathway(
         self,
@@ -866,10 +707,10 @@ class _LIBatchNorm(_LINormBase):
 
 
 class LIBatchNorm2d(_LIBatchNorm):
-    r"""Applies Linear Integration Batch Normalization over 3 4D inputs.
+    r"""Applies Linear Integration Batch Normalization over N 4D inputs.
 
-    This layer applies Batch Normalization separately to stream1, stream2, and integrated pathways,
-    following PyTorch's BatchNorm2d pattern exactly but extended for 3-stream processing.
+    This layer applies Batch Normalization separately to N stream and integrated pathways,
+    following PyTorch's BatchNorm2d pattern exactly but extended for N-stream processing.
     Each pathway operates independently with its own parameters and running statistics.
 
     The 4D inputs are mini-batches of 2D inputs with additional channel dimension.
@@ -881,7 +722,7 @@ class LIBatchNorm2d(_LIBatchNorm):
         y = \frac{x - \mathrm{E}[x]}{ \sqrt{\mathrm{Var}[x] + \epsilon}} * \gamma + \beta
 
     The mean and standard-deviation are calculated per-dimension over the mini-batches
-    and :math:`\gamma` and :math:`\beta` are learnable parameter vectors of size `C` 
+    and :math:`\gamma` and :math:`\beta` are learnable parameter vectors of size `C`
     (where `C` is the input size). By default, the elements of :math:`\gamma` are set
     to 1 and the elements of :math:`\beta` are set to 0. At train time in the forward pass, the
     standard-deviation is calculated via the biased estimator, equivalent to
@@ -910,8 +751,8 @@ class LIBatchNorm2d(_LIBatchNorm):
     on `(N, H, W)` slices, it's common terminology to call this Spatial Batch Normalization.
 
     Args:
-        stream1_num_features: :math:`C` from expected stream1 input of size :math:`(N, C, H, W)`
-        stream2_num_features: :math:`C` from expected stream2 input of size :math:`(N, C, H, W)`
+        stream_num_features: List of :math:`C` values from expected stream inputs of size :math:`(N, C, H, W)`
+        integrated_num_features: :math:`C` from expected integrated input of size :math:`(N, C, H, W)`
         eps: a value added to the denominator for numerical stability.
             Default: 1e-5
         momentum: the value used for the running_mean and running_var
@@ -927,21 +768,20 @@ class LIBatchNorm2d(_LIBatchNorm):
             in both training and eval modes. Default: ``True``
 
     Shape:
-        - Stream1 Input: :math:`(N, C_{stream1}, H, W)`
-        - Stream2 Input: :math:`(N, C_{stream2}, H, W)`
-        - Stream1 Output: :math:`(N, C_{stream1}, H, W)` (same shape as stream1 input)
-        - Stream2 Output: :math:`(N, C_{stream2}, H, W)` (same shape as stream2 input)
+        - Stream Inputs: List of :math:`(N, C_{i}, H, W)` where i = 0..N-1
+        - Integrated Input: :math:`(N, C_{integrated}, H, W)`
+        - Stream Outputs: List of :math:`(N, C_{i}, H, W)` (same shape as stream inputs)
+        - Integrated Output: :math:`(N, C_{integrated}, H, W)` (same shape as integrated input)
 
     Examples::
 
-        >>> # With Learnable Parameters
-        >>> m = LIBatchNorm2d(100, 50, 75)
+        >>> # With Learnable Parameters for 3 streams
+        >>> m = LIBatchNorm2d([64, 64, 64], 64)
         >>> # Without Learnable Parameters
-        >>> m = LIBatchNorm2d(100, 50, 75, affine=False)
-        >>> stream1_input = torch.randn(20, 100, 35, 45)
-        >>> stream2_input = torch.randn(20, 50, 35, 45)
-        >>> integrated_input = torch.randn(20, 75, 35, 45)
-        >>> stream1_output, stream2_output, integrated_output = m(stream1_input, stream2_input, integrated_input)
+        >>> m = LIBatchNorm2d([64, 64, 64], 64, affine=False)
+        >>> stream_inputs = [torch.randn(20, 64, 35, 45) for _ in range(3)]
+        >>> integrated_input = torch.randn(20, 64, 35, 45)
+        >>> stream_outputs, integrated_output = m(stream_inputs, integrated_input)
     """
     
     def _check_input_dim(self, input):

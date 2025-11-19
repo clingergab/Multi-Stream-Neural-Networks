@@ -1,5 +1,5 @@
 """
-Linear Integration pooling layers for 3-stream processing.
+Linear Integration pooling layers for N-stream processing.
 """
 
 from typing import Optional
@@ -21,8 +21,8 @@ class _LIMaxPoolNd(Module):
     """
     Linear Integration MaxPool base class - follows PyTorch's _MaxPoolNd pattern exactly.
 
-    This is the base class for 3-stream max pooling layers, mirroring PyTorch's
-    _MaxPoolNd but adapted for 3-stream (stream1/stream2/integrated) processing.
+    This is the base class for N-stream max pooling layers, mirroring PyTorch's
+    _MaxPoolNd but adapted for N-stream (streams + integrated) processing.
     """
     
     __constants__ = [
@@ -63,7 +63,7 @@ class _LIMaxPoolNd(Module):
 class LIMaxPool2d(_LIMaxPoolNd):
     r"""Linear Integration 2D max pooling - follows PyTorch's MaxPool2d pattern exactly.
 
-    Applies a 2D max pooling over 3 input signals (stream1, stream2, and integrated streams)
+    Applies a 2D max pooling over N input signals (stream inputs and integrated stream)
     composed of several input planes.
 
     In the simplest case, the output value of the layer with input size :math:`(N, C, H, W)`,
@@ -77,7 +77,7 @@ class LIMaxPool2d(_LIMaxPoolNd):
                                                    \text{stride[1]} \times w + n)
         \end{aligned}
 
-    This operation is applied independently to both stream1 and stream2 streams.
+    This operation is applied independently to all N streams and the integrated stream.
 
     If :attr:`padding` is non-zero, then the input is implicitly padded with negative infinity on both sides
     for :attr:`padding` number of points. :attr:`dilation` controls the spacing between the kernel points.
@@ -116,11 +116,15 @@ class LIMaxPool2d(_LIMaxPoolNd):
 
     Examples::
 
-        >>> # pool of square window of size=3, stride=2
-        >>> m = MCMaxPool2d(3, stride=2)
-        >>> stream1_input = torch.randn(20, 16, 50, 32)
-        >>> stream2_input = torch.randn(20, 8, 50, 32)
-        >>> stream1_output, stream2_output = m(stream1_input, stream2_input)
+        >>> # pool of square window of size=3, stride=2 for 3 streams
+        >>> m = LIMaxPool2d(3, stride=2)
+        >>> stream_inputs = [
+        ...     torch.randn(20, 16, 50, 32),  # stream 0
+        ...     torch.randn(20, 8, 50, 32),   # stream 1
+        ...     torch.randn(20, 12, 50, 32)   # stream 2
+        ... ]
+        >>> integrated_input = torch.randn(20, 16, 50, 32)
+        >>> stream_outputs, integrated_output = m(stream_inputs, integrated_input)
 
     .. _link:
         https://github.com/vdumoulin/conv_arithmetic/blob/master/README.md
@@ -131,39 +135,30 @@ class LIMaxPool2d(_LIMaxPoolNd):
     padding: _size_2_t
     dilation: _size_2_t
 
-    def forward(self, stream1_input: Tensor, stream2_input: Tensor, integrated_input: Tensor = None) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
         """
-        Forward pass through 3-stream max pooling layers.
+        Forward pass through N-stream max pooling layers.
 
         Args:
-            stream1_input: RGB input tensor [batch_size, channels, height, width]
-            stream2_input: Depth input tensor [batch_size, channels, height, width]
+            stream_inputs: List of stream input tensors [batch_size, channels, height, width]
             integrated_input: Integrated input tensor [batch_size, channels, height, width] or None
 
         Returns:
-            Tuple of (stream1_output, stream2_output, integrated_output) tensors
+            Tuple of (stream_outputs, integrated_output) where stream_outputs is a list of tensors
         """
-        # Apply max pooling to stream1
-        stream1_output = F.max_pool2d(
-            stream1_input,
-            self.kernel_size,
-            self.stride,
-            self.padding,
-            self.dilation,
-            ceil_mode=self.ceil_mode,
-            return_indices=self.return_indices,
-        )
-
-        # Apply max pooling to stream2
-        stream2_output = F.max_pool2d(
-            stream2_input,
-            self.kernel_size,
-            self.stride,
-            self.padding,
-            self.dilation,
-            ceil_mode=self.ceil_mode,
-            return_indices=self.return_indices,
-        )
+        # Apply max pooling to all stream inputs
+        stream_outputs = []
+        for stream_input in stream_inputs:
+            stream_output = F.max_pool2d(
+                stream_input,
+                self.kernel_size,
+                self.stride,
+                self.padding,
+                self.dilation,
+                ceil_mode=self.ceil_mode,
+                return_indices=self.return_indices,
+            )
+            stream_outputs.append(stream_output)
 
         # Apply max pooling to integrated (if exists)
         if integrated_input is not None:
@@ -179,39 +174,15 @@ class LIMaxPool2d(_LIMaxPoolNd):
         else:
             integrated_output = None
 
-        return stream1_output, stream2_output, integrated_output
-
-    def forward_stream1(self, stream1_input: Tensor) -> Tensor:
-        """Forward pass through stream1 stream only."""
-        return F.max_pool2d(
-            stream1_input,
-            self.kernel_size,
-            self.stride,
-            self.padding,
-            self.dilation,
-            ceil_mode=self.ceil_mode,
-            return_indices=self.return_indices,
-        )
-    
-    def forward_stream2(self, stream2_input: Tensor) -> Tensor:
-        """Forward pass through stream2 stream only."""
-        return F.max_pool2d(
-            stream2_input,
-            self.kernel_size,
-            self.stride,
-            self.padding,
-            self.dilation,
-            ceil_mode=self.ceil_mode,
-            return_indices=self.return_indices,
-        )
+        return stream_outputs, integrated_output
 
 
 class _LIAdaptiveAvgPoolNd(Module):
     """
     Linear Integration Adaptive Average Pool base class - follows PyTorch's _AdaptiveAvgPoolNd pattern exactly.
 
-    This is the base class for 3-stream adaptive average pooling layers, mirroring PyTorch's
-    _AdaptiveAvgPoolNd but adapted for 3-stream (stream1/stream2/integrated) processing.
+    This is the base class for N-stream adaptive average pooling layers, mirroring PyTorch's
+    _AdaptiveAvgPoolNd but adapted for N-stream (streams + integrated) processing.
     """
     
     __constants__ = ["output_size"]
@@ -227,7 +198,7 @@ class _LIAdaptiveAvgPoolNd(Module):
 class LIAdaptiveAvgPool2d(_LIAdaptiveAvgPoolNd):
     r"""Linear Integration 2D adaptive average pooling - follows PyTorch's AdaptiveAvgPool2d pattern exactly.
 
-    Applies a 2D adaptive average pooling over 3 input signals (stream1, stream2, and integrated streams)
+    Applies a 2D adaptive average pooling over N input signals (stream inputs and integrated stream)
     composed of several input planes.
 
     The output is of size H x W, for any input size.
@@ -240,49 +211,39 @@ class LIAdaptiveAvgPool2d(_LIAdaptiveAvgPoolNd):
                      be the same as that of the input.
 
     Shape:
-        - Input: :math:`(N, C, H_{in}, W_{in})` or :math:`(C, H_{in}, W_{in})` for both stream1 and stream2.
-        - Output: :math:`(N, C, S_{0}, S_{1})` or :math:`(C, S_{0}, S_{1})` for both stream1 and stream2, where
+        - Input: List of :math:`(N, C, H_{in}, W_{in})` or :math:`(C, H_{in}, W_{in})` for all streams.
+        - Output: List of :math:`(N, C, S_{0}, S_{1})` or :math:`(C, S_{0}, S_{1})` for all streams, where
           :math:`S=\text{output\_size}`.
 
     Examples::
 
-        >>> # target output size of 5x7
-        >>> m = MCAdaptiveAvgPool2d((5, 7))
-        >>> stream1_input = torch.randn(1, 64, 8, 9)
-        >>> stream2_input = torch.randn(1, 32, 8, 9)
-        >>> stream1_output, stream2_output = m(stream1_input, stream2_input)
+        >>> # target output size of 5x7 for 3 streams
+        >>> m = LIAdaptiveAvgPool2d((5, 7))
+        >>> stream_inputs = [torch.randn(1, 64, 8, 9) for _ in range(3)]
+        >>> stream_outputs, _ = m(stream_inputs, None)
         >>> # target output size of 7x7 (square)
-        >>> m = MCAdaptiveAvgPool2d(7)
-        >>> stream1_input = torch.randn(1, 64, 10, 9)
-        >>> stream2_input = torch.randn(1, 32, 10, 9)
-        >>> stream1_output, stream2_output = m(stream1_input, stream2_input)
-        >>> # target output size of 10x7
-        >>> m = MCAdaptiveAvgPool2d((None, 7))
-        >>> stream1_input = torch.randn(1, 64, 10, 9)
-        >>> stream2_input = torch.randn(1, 32, 10, 9)
-        >>> stream1_output, stream2_output = m(stream1_input, stream2_input)
+        >>> m = LIAdaptiveAvgPool2d(7)
+        >>> stream_inputs = [torch.randn(1, 64, 10, 9) for _ in range(3)]
+        >>> integrated_input = torch.randn(1, 64, 10, 9)
+        >>> stream_outputs, integrated_output = m(stream_inputs, integrated_input)
 
     """
 
     output_size: _size_2_opt_t
 
-    def forward(self, stream1_input: Tensor, stream2_input: Tensor, integrated_input: Tensor = None) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
         """
-        Forward pass through 3-stream adaptive average pooling layers.
+        Forward pass through N-stream adaptive average pooling layers.
 
         Args:
-            stream1_input: RGB input tensor [batch_size, channels, height, width]
-            stream2_input: Depth input tensor [batch_size, channels, height, width]
+            stream_inputs: List of stream input tensors [batch_size, channels, height, width]
             integrated_input: Integrated input tensor [batch_size, channels, height, width] or None
 
         Returns:
-            Tuple of (stream1_output, stream2_output, integrated_output) tensors
+            Tuple of (stream_outputs, integrated_output) where stream_outputs is a list of tensors
         """
-        # Apply adaptive average pooling to stream1
-        stream1_output = F.adaptive_avg_pool2d(stream1_input, self.output_size)
-
-        # Apply adaptive average pooling to stream2
-        stream2_output = F.adaptive_avg_pool2d(stream2_input, self.output_size)
+        # Apply adaptive average pooling to all stream inputs
+        stream_outputs = [F.adaptive_avg_pool2d(stream_input, self.output_size) for stream_input in stream_inputs]
 
         # Apply adaptive average pooling to integrated (if exists)
         if integrated_input is not None:
@@ -290,12 +251,4 @@ class LIAdaptiveAvgPool2d(_LIAdaptiveAvgPoolNd):
         else:
             integrated_output = None
 
-        return stream1_output, stream2_output, integrated_output
-
-    def forward_stream1(self, stream1_input: Tensor) -> Tensor:
-        """Forward pass through stream1 stream only."""
-        return F.adaptive_avg_pool2d(stream1_input, self.output_size)
-    
-    def forward_stream2(self, stream2_input: Tensor) -> Tensor:
-        """Forward pass through stream2 stream only."""
-        return F.adaptive_avg_pool2d(stream2_input, self.output_size)
+        return stream_outputs, integrated_output

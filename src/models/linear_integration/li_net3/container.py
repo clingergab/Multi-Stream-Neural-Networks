@@ -1,7 +1,7 @@
 """
-Linear Integration container modules for 3-stream processing.
+Linear Integration container modules for N-stream processing.
 
-Provides LISequential and LIReLU for managing 3-stream operations.
+Provides LISequential and LIReLU for managing N-stream operations.
 """
 
 import operator
@@ -26,27 +26,24 @@ __all__ = [
 
 class LIReLU(nn.Module):
     """
-    Linear Integration ReLU activation function for 3 streams.
+    Linear Integration ReLU activation function for N streams.
 
-    Applies ReLU activation separately to stream1, stream2, and integrated pathways.
+    Applies ReLU activation separately to all stream and integrated pathways.
 
     Args:
         inplace: If set to True, will do this operation in-place. Default: False
 
     Shape:
-        - Stream1 Input: Any tensor shape
-        - Stream2 Input: Any tensor shape
+        - Stream Inputs: List of tensors of any shape
         - Integrated Input: Any tensor shape (or None)
-        - Stream1 Output: Same shape as stream1 input
-        - Stream2 Output: Same shape as stream2 input
+        - Stream Outputs: List of tensors with same shape as stream inputs
         - Integrated Output: Same shape as integrated input (or None)
 
     Examples::
         >>> m = LIReLU()
-        >>> stream1_input = torch.randn(2, 64, 28, 28)
-        >>> stream2_input = torch.randn(2, 64, 28, 28)
+        >>> stream_inputs = [torch.randn(2, 64, 28, 28) for _ in range(3)]
         >>> integrated_input = torch.randn(2, 64, 28, 28)
-        >>> s1, s2, ic = m(stream1_input, stream2_input, integrated_input)
+        >>> stream_outputs, integrated_output = m(stream_inputs, integrated_input)
     """
 
     __constants__ = ['inplace']
@@ -56,25 +53,16 @@ class LIReLU(nn.Module):
         super().__init__()
         self.inplace = inplace
 
-    def forward(self, stream1_input: Tensor, stream2_input: Tensor, integrated_input: Tensor = None) -> tuple[Tensor, Tensor, Tensor]:
-        """Apply ReLU to all 3 pathways."""
-        stream1_out = F.relu(stream1_input, inplace=self.inplace)
-        stream2_out = F.relu(stream2_input, inplace=self.inplace)
+    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
+        """Apply ReLU to all N pathways."""
+        stream_outputs = [F.relu(stream_input, inplace=self.inplace) for stream_input in stream_inputs]
 
         if integrated_input is not None:
             integrated_out = F.relu(integrated_input, inplace=self.inplace)
         else:
             integrated_out = None
 
-        return stream1_out, stream2_out, integrated_out
-
-    def forward_stream1(self, stream1_input: Tensor) -> Tensor:
-        """Apply ReLU to stream1 pathway only."""
-        return F.relu(stream1_input, inplace=self.inplace)
-
-    def forward_stream2(self, stream2_input: Tensor) -> Tensor:
-        """Apply ReLU to stream2 pathway only."""
-        return F.relu(stream2_input, inplace=self.inplace)
+        return stream_outputs, integrated_out
 
     def extra_repr(self) -> str:
         inplace_str = 'inplace=True' if self.inplace else ''
@@ -82,21 +70,21 @@ class LIReLU(nn.Module):
 
 
 class LISequential(Module):
-    r"""A linear integration sequential container for 3-stream processing.
+    r"""A linear integration sequential container for N-stream processing.
 
     Modules will be added to it in the order they are passed in the
     constructor. Alternatively, an ``OrderedDict`` of modules can be
-    passed in. The ``forward()`` method of ``LISequential`` accepts three
-    inputs (stream1, stream2, and integrated) and forwards them through the contained modules.
+    passed in. The ``forward()`` method of ``LISequential`` accepts
+    stream_inputs (list[Tensor]) and integrated_input (Optional[Tensor])
+    and forwards them through the contained modules.
 
-    LISequential is an extension of PyTorch's Sequential for 3-stream processing.
+    LISequential is an extension of PyTorch's Sequential for N-stream processing.
 
-    All modules within LISequential must support 3-stream input/output:
-    - Each module takes three inputs (stream1_input, stream2_input, integrated_input)
-    - Each module returns three outputs (stream1_output, stream2_output, integrated_output)
-    - Each module must have forward_stream1() and forward_stream2() methods
+    All modules within LISequential must support N-stream input/output:
+    - Each module takes (stream_inputs: list[Tensor], integrated_input: Optional[Tensor])
+    - Each module returns (stream_outputs: list[Tensor], integrated_output: Optional[Tensor])
 
-    This design maintains the clean 3-stream architecture where LISequential
+    This design maintains the clean N-stream architecture where LISequential
     extends nn.Sequential behavior to linear integration processing.
     """
 
@@ -234,31 +222,19 @@ class LISequential(Module):
     def __iter__(self) -> Iterator[Module]:
         return iter(self._modules.values())
 
-    def forward(self, stream1_input, stream2_input, integrated_input=None):
+    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
         """
         Forward pass through the sequential container.
 
-        Each module must accept 3 inputs (stream1_input, stream2_input, integrated_input)
-        and return 3 outputs (stream1_output, stream2_output, integrated_output).
+        Each module must accept (stream_inputs: list[Tensor], integrated_input: Optional[Tensor])
+        and return (stream_outputs: list[Tensor], integrated_output: Optional[Tensor]).
 
         This ensures compatibility with LI modules like LIConv2d,
         LIBatchNorm2d, LIReLU, etc.
         """
         for module in self:
-            stream1_input, stream2_input, integrated_input = module(stream1_input, stream2_input, integrated_input)
-        return stream1_input, stream2_input, integrated_input
-
-    def forward_stream1(self, stream1_input):
-        """Forward pass through stream1 pathway only."""
-        for module in self:
-            stream1_input = module.forward_stream1(stream1_input)
-        return stream1_input
-
-    def forward_stream2(self, stream2_input):
-        """Forward pass through stream2 pathway only."""
-        for module in self:
-            stream2_input = module.forward_stream2(stream2_input)
-        return stream2_input
+            stream_inputs, integrated_input = module(stream_inputs, integrated_input)
+        return stream_inputs, integrated_input
 
     def append(self, module: Module) -> "LISequential":
         r"""Append a given module to the end.

@@ -13,16 +13,14 @@ from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR, ReduceLROnPlatea
 def create_stream_optimizer(
     model,
     optimizer_type: str = 'adamw',
-    stream1_lr: float = 2e-4,
-    stream2_lr: float = 7e-4,
-    shared_lr: float = 5e-4,
-    stream1_weight_decay: float = 1e-4,
-    stream2_weight_decay: float = 2e-4,
-    shared_weight_decay: float = 1.5e-4,
+    stream_lrs=None,
+    stream_weight_decays=None,
+    shared_lr=None,
+    shared_weight_decay: float = 0.0,
     **optimizer_kwargs
 ):
     """
-    Create optimizer with stream-specific learning rates for multi-stream models.
+    Create optimizer with stream-specific learning rates for N-stream models.
 
     This is a convenience function that combines parameter group creation and optimizer
     instantiation in one step. It's designed for multi-stream models (MCResNet, LINet)
@@ -31,35 +29,45 @@ def create_stream_optimizer(
     Args:
         model: The model instance (must have get_stream_parameter_groups method)
         optimizer_type: Type of optimizer ('adam', 'adamw', 'sgd', 'rmsprop')
-        stream1_lr: Learning rate for stream1 (RGB/color) parameters
-        stream2_lr: Learning rate for stream2 (depth/brightness) parameters
-        shared_lr: Learning rate for shared/fusion/integrated parameters
-        stream1_weight_decay: Weight decay for stream1 parameters
-        stream2_weight_decay: Weight decay for stream2 parameters
-        shared_weight_decay: Weight decay for shared parameters
+        stream_lrs: Learning rates for stream parameters. Can be:
+                   - float: Same LR for all streams (default: 2e-4)
+                   - list[float]: One LR per stream
+                   - dict[str, float]: Explicit mapping {'stream0': lr, 'stream1': lr, ...}
+        stream_weight_decays: Weight decay for stream parameters (same format as stream_lrs, default: 1e-4)
+        shared_lr: Learning rate for shared/fusion/integrated parameters (default: mean of stream_lrs)
+        shared_weight_decay: Weight decay for shared parameters (default: 0.0)
         **optimizer_kwargs: Additional optimizer-specific arguments
                            (e.g., betas, eps, momentum, nesterov)
 
     Returns:
-        torch.optim.Optimizer with 3 parameter groups
+        torch.optim.Optimizer with N+1 parameter groups (N streams + shared)
 
     Example:
-        >>> from src.models.multi_channel.mc_resnet import mc_resnet50
+        >>> from src.models.linear_integration.li_net3 import li_net3_50
         >>> from src.training.optimizers import create_stream_optimizer
         >>> from src.training.schedulers import setup_scheduler
         >>>
-        >>> model = mc_resnet50(num_classes=15)
+        >>> model = li_net3_50(num_classes=15, num_streams=3)
         >>>
-        >>> # Create optimizer with stream-specific LRs (one function call!)
+        >>> # Option 1: Same LR for all streams
+        >>> optimizer = create_stream_optimizer(model, optimizer_type='adamw', stream_lrs=1e-3)
+        >>>
+        >>> # Option 2: List (one per stream)
         >>> optimizer = create_stream_optimizer(
         ...     model,
         ...     optimizer_type='adamw',
-        ...     stream1_lr=2e-4,
-        ...     stream2_lr=7e-4,
-        ...     shared_lr=5e-4,
-        ...     stream1_weight_decay=1e-4,
-        ...     stream2_weight_decay=2e-4,
-        ...     shared_weight_decay=1.5e-4
+        ...     stream_lrs=[2e-4, 7e-4, 5e-4],
+        ...     stream_weight_decays=[1e-4, 2e-4, 1.5e-4],
+        ...     shared_lr=5e-4
+        ... )
+        >>>
+        >>> # Option 3: Dict (explicit mapping)
+        >>> optimizer = create_stream_optimizer(
+        ...     model,
+        ...     optimizer_type='adamw',
+        ...     stream_lrs={'stream0': 2e-4, 'stream1': 7e-4, 'stream2': 5e-4},
+        ...     stream_weight_decays={'stream0': 1e-4, 'stream1': 2e-4, 'stream2': 1.5e-4},
+        ...     shared_lr=5e-4
         ... )
         >>>
         >>> # Create scheduler
@@ -67,7 +75,7 @@ def create_stream_optimizer(
         >>>
         >>> # Compile and train
         >>> model.compile(optimizer=optimizer, scheduler=scheduler, loss='cross_entropy')
-        >>> model.fit(train_loader, val_loader, epochs=80, stream_monitoring=True)
+        >>> model.fit(train_loader, val_loader, epochs=80)
     """
     # Get stream-specific parameter groups from model
     if not hasattr(model, 'get_stream_parameter_groups'):
@@ -76,12 +84,16 @@ def create_stream_optimizer(
             "This function only works with multi-stream models (MCResNet, LINet)."
         )
 
+    # Set defaults if not provided
+    if stream_lrs is None:
+        stream_lrs = 2e-4
+    if stream_weight_decays is None:
+        stream_weight_decays = 1e-4
+
     param_groups = model.get_stream_parameter_groups(
-        stream1_lr=stream1_lr,
-        stream2_lr=stream2_lr,
+        stream_lrs=stream_lrs,
+        stream_weight_decays=stream_weight_decays,
         shared_lr=shared_lr,
-        stream1_weight_decay=stream1_weight_decay,
-        stream2_weight_decay=stream2_weight_decay,
         shared_weight_decay=shared_weight_decay
     )
 
