@@ -99,14 +99,15 @@ class SUNRGBD3StreamDataset(Dataset):
         # Load depth image
         depth_path = os.path.join(self.depth_dir, f'{idx:05d}.png')
         depth = Image.open(depth_path)
-        
-        # Convert Depth to Mode F (Float32) for high precision and robust resizing
-        # We preserve the per-image normalization logic but keep it in float
+
+        # Convert Depth to Mode F (Float32) with global normalization
+        # Use global normalization to maintain semantic consistency across images
+        # (same depth value should normalize to same output value regardless of image content)
         if depth.mode in ('I', 'I;16', 'I;16B'):
             depth_arr = np.array(depth, dtype=np.float32)
-            # Per-image scaling (legacy behavior for this dataset)
-            if depth_arr.max() > 0:
-                depth_arr = depth_arr / depth_arr.max()
+            # Global normalization: divide by max possible depth value
+            # Using 65000 to cover 99th percentile (65392) while avoiding clipping
+            depth_arr = np.clip(depth_arr / 65000.0, 0.0, 1.0)
             depth = Image.fromarray(depth_arr, mode='F')
         else:
             # Fallback for other modes
@@ -120,15 +121,14 @@ class SUNRGBD3StreamDataset(Dataset):
         orth_path = os.path.join(self.orth_dir, f'{idx:05d}.png')
         orth = Image.open(orth_path)
 
-        # Convert Orth to Mode F (Float32) with per-image normalization
-        # Same approach as depth: normalize each image to [0, 1] based on its own range
+        # Convert Orth to Mode F (Float32) with global normalization
+        # Use global normalization to avoid artifacts from per-image normalization after cropping
         if orth.mode in ('I', 'I;16', 'I;16B'):
             orth_arr = np.array(orth, dtype=np.float32)
-            # Per-image scaling (same as depth)
-            if orth_arr.max() > orth_arr.min():
-                orth_arr = (orth_arr - orth_arr.min()) / (orth_arr.max() - orth_arr.min())
-            else:
-                orth_arr = np.zeros_like(orth_arr)
+            # Global normalization using dataset statistics (1-99 percentile range)
+            # Computed from full dataset: min=4368, max=60859 (covers 98% of data)
+            # Using slightly wider range for safety: [0, 65000] to avoid clipping outliers
+            orth_arr = np.clip(orth_arr / 65000.0, 0.0, 1.0)
             orth = Image.fromarray(orth_arr, mode='F')
         else:
             # Fallback for other modes
@@ -240,10 +240,10 @@ class SUNRGBD3StreamDataset(Dataset):
             orth = transforms.functional.resize(orth, self.target_size)
 
         # ==================== NORMALIZATION ====================
-        # Convert to tensor and normalize
-        # We normalize ALL streams to [-1, 1] for consistency.
-        # This uses mean=0.5, std=0.5 for inputs in [0, 1].
-        
+        # Convert to tensor and normalize ALL modalities to ~[-1, 1]
+        # Using mean=0.5, std=0.5 for consistency across all streams
+        # This ensures all inputs have similar scale to the neural network
+
         rgb = transforms.functional.to_tensor(rgb)
         rgb = transforms.functional.normalize(
             rgb, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
@@ -253,12 +253,8 @@ class SUNRGBD3StreamDataset(Dataset):
         depth = transforms.functional.normalize(
             depth, mean=[0.5], std=[0.5]
         )
-        
-        # Orthogonal normalization
-        # Convert to tensor (Mode F already in [0, 1] from per-image normalization)
-        orth = transforms.functional.to_tensor(orth)
 
-        # Normalize to [-1, 1]
+        orth = transforms.functional.to_tensor(orth)
         orth = transforms.functional.normalize(
             orth, mean=[0.5], std=[0.5]
         )
