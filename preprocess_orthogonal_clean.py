@@ -14,31 +14,33 @@ from torchvision import transforms
 from tqdm import tqdm
 
 
-def load_raw_image(image_path, target_size=(224, 224)):
+def load_raw_image(image_path, target_size=None):
     """
     Load and preprocess a single image exactly like SUNRGBDDataset does,
     but WITHOUT any augmentation (no flip, no crop, no color jitter).
+    
+    Args:
+        image_path: Path to image file
+        target_size: (H, W) tuple. If None, keeps original size.
     """
     # Load image
     img = Image.open(image_path)
 
-    # Resize to target size
-    img = transforms.functional.resize(img, target_size)
+    # Resize only if target_size is provided (NOT recommended for preprocessing)
+    if target_size is not None:
+        img = transforms.functional.resize(img, target_size)
 
     return img
 
 
 def preprocess_rgb(rgb_pil):
-    """Convert RGB PIL image to normalized tensor."""
+    """Convert RGB PIL image to tensor [0, 1]."""
     rgb_tensor = transforms.functional.to_tensor(rgb_pil)
-    rgb_tensor = transforms.functional.normalize(
-        rgb_tensor, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-    )
     return rgb_tensor
 
 
 def preprocess_depth(depth_pil):
-    """Convert depth PIL image to normalized tensor."""
+    """Convert depth PIL image to tensor [0, 1]."""
     # Convert depth to grayscale/float format (same as SUNRGBDDataset)
     if depth_pil.mode in ('I', 'I;16', 'I;16B'):
         depth_array = np.array(depth_pil, dtype=np.float32)
@@ -52,11 +54,8 @@ def preprocess_depth(depth_pil):
     elif depth_pil.mode != 'L':
         depth_pil = depth_pil.convert('L')
 
-    # To tensor and normalize
+    # To tensor [0, 1]
     depth_tensor = transforms.functional.to_tensor(depth_pil)
-    depth_tensor = transforms.functional.normalize(
-        depth_tensor, mean=[0.5027], std=[0.2197]
-    )
     return depth_tensor
 
 
@@ -65,23 +64,18 @@ def extract_global_orthogonal_stream(rgb_tensor, depth_tensor):
     Extract global orthogonal stream from RGB and Depth tensors.
 
     Args:
-        rgb_tensor: (3, H, W) normalized RGB tensor
-        depth_tensor: (1, H, W) normalized depth tensor
+        rgb_tensor: (3, H, W) RGB tensor [0, 1]
+        depth_tensor: (1, H, W) depth tensor [0, 1]
 
     Returns:
         orth_stream: (H, W) float32 array of orthogonal values
     """
-    # Denormalize to [0, 1] range
-    rgb_denorm = rgb_tensor * torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1) + \
-                 torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    depth_denorm = depth_tensor * 0.2197 + 0.5027
-
     # Flatten to get all pixels
     H, W = rgb_tensor.shape[1], rgb_tensor.shape[2]
-    r = rgb_denorm[0].flatten().numpy()
-    g = rgb_denorm[1].flatten().numpy()
-    b = rgb_denorm[2].flatten().numpy()
-    d = depth_denorm[0].flatten().numpy()
+    r = rgb_tensor[0].flatten().numpy()
+    g = rgb_tensor[1].flatten().numpy()
+    b = rgb_tensor[2].flatten().numpy()
+    d = depth_tensor[0].flatten().numpy()
 
     # Stack into (N_pixels, 4) matrix
     X = np.stack([r, g, b, d], axis=1)
@@ -124,8 +118,9 @@ def analyze_value_range(data_root, split, num_samples=100):
         rgb_path = os.path.join(rgb_dir, rgb_files[i])
         depth_path = os.path.join(depth_dir, rgb_files[i].replace('.jpg', '.png'))
 
-        rgb_pil = load_raw_image(rgb_path)
-        depth_pil = load_raw_image(depth_path)
+        # Load without resizing (target_size=None)
+        rgb_pil = load_raw_image(rgb_path, target_size=None)
+        depth_pil = load_raw_image(depth_path, target_size=None)
 
         # Preprocess
         rgb_tensor = preprocess_rgb(rgb_pil)
@@ -203,8 +198,9 @@ def process_split(data_root, split, vmin, vmax):
         rgb_path = os.path.join(rgb_dir, rgb_file)
         depth_path = os.path.join(depth_dir, rgb_file.replace('.jpg', '.png'))
 
-        rgb_pil = load_raw_image(rgb_path)
-        depth_pil = load_raw_image(depth_path)
+        # Load without resizing (target_size=None)
+        rgb_pil = load_raw_image(rgb_path, target_size=None)
+        depth_pil = load_raw_image(depth_path, target_size=None)
 
         # Preprocess
         rgb_tensor = preprocess_rgb(rgb_pil)
@@ -261,6 +257,7 @@ def main():
     data_root = 'data/sunrgbd_15'
 
     # Step 1: Analyze value range on training set
+    # Pass target_size=None to use original image dimensions
     vmin, vmax = analyze_value_range(data_root, 'train', num_samples=100)
 
     # Save normalization params

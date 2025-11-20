@@ -10,6 +10,8 @@ data/cifar-100/
 data/cifar-100-python/
 data/ImageNet/
 data/
+*.tar.gz
+*.zip
 
 # Python cache files
 __pycache__/

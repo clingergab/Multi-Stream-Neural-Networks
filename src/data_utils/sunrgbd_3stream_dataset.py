@@ -119,7 +119,8 @@ class SUNRGBD3StreamDataset(Dataset):
             return img
 
         depth = process_single_channel(depth)
-        orth = process_single_channel(orth)
+        # orth is kept as 16-bit (I;16) to preserve global consistency
+        # orth = process_single_channel(orth)  <-- REMOVED
 
         # ==================== TRAINING AUGMENTATION ====================
         if self.train:
@@ -163,30 +164,25 @@ class SUNRGBD3StreamDataset(Dataset):
             if np.random.random() < 0.17:
                 rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
-            # 6. Depth & Orthogonal: Combined Appearance Augmentation (50% probability each)
-            
-            def augment_single_channel(img):
-                if np.random.random() < 0.5:
-                    img_array = np.array(img, dtype=np.float32)
+            # 6. Depth Only: Appearance Augmentation
+            # (Skipping orth appearance aug to preserve geometric meaning for now)
+            if np.random.random() < 0.5:
+                img_array = np.array(depth, dtype=np.float32)
 
-                    # Apply brightness and contrast
-                    brightness_factor = np.random.uniform(0.75, 1.25)  # ±25%
-                    contrast_factor = np.random.uniform(0.75, 1.25)    # ±25%
+                # Apply brightness and contrast
+                brightness_factor = np.random.uniform(0.75, 1.25)  # ±25%
+                contrast_factor = np.random.uniform(0.75, 1.25)    # ±25%
 
-                    # Apply contrast then brightness
-                    img_array = (img_array - 127.5) * contrast_factor + 127.5
-                    img_array = img_array * brightness_factor
+                # Apply contrast then brightness
+                img_array = (img_array - 127.5) * contrast_factor + 127.5
+                img_array = img_array * brightness_factor
 
-                    # Add Gaussian noise
-                    noise = np.random.normal(0, 15, img_array.shape)
-                    img_array = img_array + noise
+                # Add Gaussian noise
+                noise = np.random.normal(0, 15, img_array.shape)
+                img_array = img_array + noise
 
-                    img_array = np.clip(img_array, 0, 255)
-                    return Image.fromarray(img_array.astype(np.uint8), mode='L')
-                return img
-
-            depth = augment_single_channel(depth)
-            orth = augment_single_channel(orth)
+                img_array = np.clip(img_array, 0, 255)
+                depth = Image.fromarray(img_array.astype(np.uint8), mode='L')
 
         else:
             # Validation: just resize (no augmentation)
@@ -206,10 +202,17 @@ class SUNRGBD3StreamDataset(Dataset):
             depth, mean=[0.5027], std=[0.2197]
         )
         
-        # Orthogonal normalization - using same stats as depth for now as it's also a depth-like map
-        orth = transforms.functional.to_tensor(orth)
+        # Orthogonal normalization
+        # 1. Convert 16-bit PIL to float tensor [0, 1]
+        # Note: to_tensor handles uint8 but not uint16 correctly for scaling
+        orth_arr = np.array(orth, dtype=np.float32)
+        orth = torch.from_numpy(orth_arr).unsqueeze(0) / 65535.0
+        
+        # 2. Normalize to [-1, 1]
+        # Since 0 maps to 0.5 in [0,1] range, we use mean=0.5
+        # std=0.5 maps [0, 1] -> [-1, 1]
         orth = transforms.functional.normalize(
-            orth, mean=[0.5027], std=[0.2197]
+            orth, mean=[0.5], std=[0.5]
         )
 
         # 7. Post-normalization Random Erasing
@@ -330,7 +333,7 @@ def get_sunrgbd_3stream_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=(num_workers > 0)
     )
 
     val_loader = torch.utils.data.DataLoader(
@@ -339,7 +342,7 @@ def get_sunrgbd_3stream_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=(num_workers > 0)
     )
 
     print(f"\nDataLoader Info:")
