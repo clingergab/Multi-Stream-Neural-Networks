@@ -10,6 +10,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
+from collections import Counter
 
 
 class SUNRGBD3StreamDataset(Dataset):
@@ -98,39 +99,57 @@ class SUNRGBD3StreamDataset(Dataset):
         # Load depth image
         depth_path = os.path.join(self.depth_dir, f'{idx:05d}.png')
         depth = Image.open(depth_path)
+        
+        # Convert Depth to Mode F (Float32) for high precision and robust resizing
+        # We preserve the per-image normalization logic but keep it in float
+        if depth.mode in ('I', 'I;16', 'I;16B'):
+            depth_arr = np.array(depth, dtype=np.float32)
+            # Per-image scaling (legacy behavior for this dataset)
+            if depth_arr.max() > 0:
+                depth_arr = depth_arr / depth_arr.max()
+            depth = Image.fromarray(depth_arr, mode='F')
+        else:
+            # Fallback for other modes
+            depth = depth.convert('F')
+            # If it was 0-255, scale to 0-1
+            if np.array(depth).max() > 1.0:
+                depth_arr = np.array(depth)
+                depth = Image.fromarray(depth_arr / 255.0, mode='F')
 
         # Load orthogonal image
         orth_path = os.path.join(self.orth_dir, f'{idx:05d}.png')
         orth = Image.open(orth_path)
 
-        # Helper to convert single channel images
-        def process_single_channel(img):
-            if img.mode in ('I', 'I;16', 'I;16B'):
-                img_array = np.array(img, dtype=np.float32)
-                if img_array.max() > 0:
-                    img_array = (img_array / img_array.max() * 255).astype(np.uint8)
-                else:
-                    img_array = img_array.astype(np.uint8)
-                return Image.fromarray(img_array, mode='L')
-            elif img.mode == 'RGB':
-                return img.convert('L')
-            elif img.mode != 'L':
-                return img.convert('L')
-            return img
+        # Convert Orth to Mode F (Float32) with per-image normalization
+        # Same approach as depth: normalize each image to [0, 1] based on its own range
+        if orth.mode in ('I', 'I;16', 'I;16B'):
+            orth_arr = np.array(orth, dtype=np.float32)
+            # Per-image scaling (same as depth)
+            if orth_arr.max() > orth_arr.min():
+                orth_arr = (orth_arr - orth_arr.min()) / (orth_arr.max() - orth_arr.min())
+            else:
+                orth_arr = np.zeros_like(orth_arr)
+            orth = Image.fromarray(orth_arr, mode='F')
+        else:
+            # Fallback for other modes
+            orth = orth.convert('F')
+            # If it was 0-255, scale to 0-1
+            if np.array(orth).max() > 1.0:
+                orth_arr = np.array(orth)
+                orth = Image.fromarray(orth_arr / 255.0, mode='F')
 
-        depth = process_single_channel(depth)
-        # orth is kept as 16-bit (I;16) to preserve global consistency
-        # orth = process_single_channel(orth)  <-- REMOVED
 
         # ==================== TRAINING AUGMENTATION ====================
         if self.train:
             # 1. Synchronized Random Horizontal Flip (50%)
+            # Applied to ALL streams to maintain geometric consistency
             if np.random.random() < 0.5:
                 rgb = rgb.transpose(Image.FLIP_LEFT_RIGHT)
                 depth = depth.transpose(Image.FLIP_LEFT_RIGHT)
                 orth = orth.transpose(Image.FLIP_LEFT_RIGHT)
 
             # 2. Synchronized Random Resized Crop (50% probability)
+            # Applied to ALL streams to maintain geometric consistency
             if np.random.random() < 0.5:
                 i, j, h, w = transforms.RandomResizedCrop.get_params(
                     rgb, scale=(0.9, 1.0), ratio=(0.95, 1.05)
@@ -145,6 +164,7 @@ class SUNRGBD3StreamDataset(Dataset):
                 orth = transforms.functional.resize(orth, self.target_size)
 
             # 3. RGB-Only: Color Jitter (43% probability)
+            # Appearance only - does not affect geometry
             if np.random.random() < 0.43:
                 color_jitter = transforms.ColorJitter(
                     brightness=0.37,
@@ -155,34 +175,63 @@ class SUNRGBD3StreamDataset(Dataset):
                 rgb = color_jitter(rgb)
 
             # 4. RGB-Only: Gaussian Blur (25% probability)
+            # Appearance only
             if np.random.random() < 0.25:
                 kernel_size = int(np.random.choice([3, 5, 7]))
                 sigma = float(np.random.uniform(0.1, 1.7))
                 rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
 
             # 5. RGB-Only: Occasional Grayscale (17%)
+            # Appearance only
             if np.random.random() < 0.17:
                 rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
-            # 6. Depth Only: Appearance Augmentation
-            # (Skipping orth appearance aug to preserve geometric meaning for now)
+            # 6. Depth & Orth: Appearance Augmentation (50% probability each)
+            # Independent augmentation for each modality to increase training diversity
+            # Each modality gets its own brightness/contrast/noise variations
+
+            # Depth appearance augmentation (50%)
             if np.random.random() < 0.5:
-                img_array = np.array(depth, dtype=np.float32)
+                depth_array = np.array(depth, dtype=np.float32)  # Ensure float32
 
                 # Apply brightness and contrast
+                # Slightly higher than RGB (±25% vs ±20%) to compensate for:
+                #   1. Depth having 1 channel vs RGB's 3 channels
+                #   2. Reduced crop probability (50% vs previous 100%)
+                brightness_factor = np.random.uniform(0.75, 1.25)  # ±25%
+                contrast_factor = np.random.uniform(0.75, 1.25)    # ±25%
+
+                # Apply contrast then brightness (same order as ColorJitter)
+                # Center is 0.5 for contrast (0-1 range)
+                depth_array = (depth_array - 0.5) * contrast_factor + 0.5
+                depth_array = depth_array * brightness_factor
+
+                # Add Gaussian noise (simulates sensor noise)
+                # Scaled for 0-1 range: sigma=0.06 on 0-1 (~6%)
+                noise = np.random.normal(0, 0.06, depth_array.shape).astype(np.float32)
+                depth_array = depth_array + noise
+
+                depth_array = np.clip(depth_array, 0.0, 1.0).astype(np.float32)
+                depth = Image.fromarray(depth_array, mode='F')
+
+            # Orth appearance augmentation (50% - independent from depth)
+            if np.random.random() < 0.5:
+                orth_array = np.array(orth, dtype=np.float32)  # Ensure float32
+
+                # Apply independent brightness and contrast factors
                 brightness_factor = np.random.uniform(0.75, 1.25)  # ±25%
                 contrast_factor = np.random.uniform(0.75, 1.25)    # ±25%
 
                 # Apply contrast then brightness
-                img_array = (img_array - 127.5) * contrast_factor + 127.5
-                img_array = img_array * brightness_factor
+                orth_array = (orth_array - 0.5) * contrast_factor + 0.5
+                orth_array = orth_array * brightness_factor
 
                 # Add Gaussian noise
-                noise = np.random.normal(0, 15, img_array.shape)
-                img_array = img_array + noise
+                noise = np.random.normal(0, 0.06, orth_array.shape).astype(np.float32)
+                orth_array = orth_array + noise
 
-                img_array = np.clip(img_array, 0, 255)
-                depth = Image.fromarray(img_array.astype(np.uint8), mode='L')
+                orth_array = np.clip(orth_array, 0.0, 1.0).astype(np.float32)
+                orth = Image.fromarray(orth_array, mode='F')
 
         else:
             # Validation: just resize (no augmentation)
@@ -192,25 +241,24 @@ class SUNRGBD3StreamDataset(Dataset):
 
         # ==================== NORMALIZATION ====================
         # Convert to tensor and normalize
+        # We normalize ALL streams to [-1, 1] for consistency.
+        # This uses mean=0.5, std=0.5 for inputs in [0, 1].
+        
         rgb = transforms.functional.to_tensor(rgb)
         rgb = transforms.functional.normalize(
-            rgb, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+            rgb, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
         )
 
         depth = transforms.functional.to_tensor(depth)
         depth = transforms.functional.normalize(
-            depth, mean=[0.5027], std=[0.2197]
+            depth, mean=[0.5], std=[0.5]
         )
         
         # Orthogonal normalization
-        # 1. Convert 16-bit PIL to float tensor [0, 1]
-        # Note: to_tensor handles uint8 but not uint16 correctly for scaling
-        orth_arr = np.array(orth, dtype=np.float32)
-        orth = torch.from_numpy(orth_arr).unsqueeze(0) / 65535.0
-        
-        # 2. Normalize to [-1, 1]
-        # Since 0 maps to 0.5 in [0,1] range, we use mean=0.5
-        # std=0.5 maps [0, 1] -> [-1, 1]
+        # Convert to tensor (Mode F already in [0, 1] from per-image normalization)
+        orth = transforms.functional.to_tensor(orth)
+
+        # Normalize to [-1, 1]
         orth = transforms.functional.normalize(
             orth, mean=[0.5], std=[0.5]
         )
@@ -256,7 +304,6 @@ class SUNRGBD3StreamDataset(Dataset):
         Returns:
             Tensor of shape [num_classes] with weights
         """
-        from collections import Counter
         label_counts = Counter(self.labels)
 
         weights = torch.zeros(len(self.CLASS_NAMES))
@@ -278,7 +325,6 @@ class SUNRGBD3StreamDataset(Dataset):
         Returns:
             Dictionary with class counts and percentages
         """
-        from collections import Counter
         label_counts = Counter(self.labels)
 
         distribution = {}
