@@ -19,6 +19,45 @@ from torch.optim.lr_scheduler import (
 )
 
 
+class WarmupReduceLROnPlateau:
+    """
+    Wrapper to combine LinearLR warmup with ReduceLROnPlateau.
+    SequentialLR does not support ReduceLROnPlateau because step() signatures differ.
+    """
+    def __init__(self, optimizer, warmup_scheduler, plateau_scheduler, warmup_epochs):
+        self.optimizer = optimizer
+        self.warmup_scheduler = warmup_scheduler
+        self.plateau_scheduler = plateau_scheduler
+        self.warmup_epochs = warmup_epochs
+        self.last_epoch = 0
+
+    def step(self, metrics=None):
+        if self.last_epoch < self.warmup_epochs:
+            self.warmup_scheduler.step()
+        else:
+            self.plateau_scheduler.step(metrics)
+        self.last_epoch += 1
+
+    def state_dict(self):
+        return {
+            'warmup_scheduler': self.warmup_scheduler.state_dict(),
+            'plateau_scheduler': self.plateau_scheduler.state_dict(),
+            'warmup_epochs': self.warmup_epochs,
+            'last_epoch': self.last_epoch
+        }
+
+    def load_state_dict(self, state_dict):
+        self.warmup_scheduler.load_state_dict(state_dict['warmup_scheduler'])
+        self.plateau_scheduler.load_state_dict(state_dict['plateau_scheduler'])
+        self.warmup_epochs = state_dict['warmup_epochs']
+        self.last_epoch = state_dict['last_epoch']
+
+    def get_last_lr(self):
+        if self.last_epoch <= self.warmup_epochs:
+             return self.warmup_scheduler.get_last_lr()
+        else:
+             return [group['lr'] for group in self.optimizer.param_groups]
+
 class PerGroupSchedulerWrapper:
     """
     Universal wrapper that creates independent scheduler instances for each parameter group.
@@ -417,13 +456,18 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
             total_iters=warmup_epochs
         )
 
-        # Use SequentialLR to chain warmup + main scheduler
-        # Milestones specify when to switch schedulers (in epochs)
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, main_scheduler],
-            milestones=[warmup_epochs]
-        )
+        if isinstance(main_scheduler, ReduceLROnPlateau):
+            # Special case: ReduceLROnPlateau cannot be used with SequentialLR
+            # Wrap warmup + plateau in WarmupReduceLROnPlateau
+            scheduler = WarmupReduceLROnPlateau(optimizer, warmup_scheduler, main_scheduler, warmup_epochs)
+        else:
+            # Use SequentialLR to chain warmup + main scheduler
+            # Milestones specify when to switch schedulers (in epochs)
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, main_scheduler],
+                milestones=[warmup_epochs]
+            )
     else:
         # No warmup, use main scheduler directly
         scheduler = main_scheduler
@@ -440,7 +484,7 @@ def update_scheduler(scheduler, val_loss: float) -> None:
     """
     if scheduler is not None:
         # Skip OneCycleLR as it's updated after each batch
-        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+        if isinstance(scheduler, (torch.optim.lr_scheduler.ReduceLROnPlateau, WarmupReduceLROnPlateau)):
             scheduler.step(val_loss)
         elif isinstance(scheduler, PerGroupSchedulerWrapper):
             # PerGroupSchedulerWrapper - check if it contains plateau schedulers
@@ -1445,3 +1489,5 @@ class CubicInOutLR:
             f"eta_min={self.eta_min}, "
             f"last_epoch={self.last_epoch})"
         )
+
+
