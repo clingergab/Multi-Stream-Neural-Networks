@@ -41,7 +41,7 @@ class SUNRGBDDataset(Dataset):
         self,
         data_root='data/sunrgbd_15',
         train=True,
-        target_size=(224, 224),
+        target_size=(416, 544),
     ):
         """
         Args:
@@ -95,18 +95,22 @@ class SUNRGBDDataset(Dataset):
         depth_path = os.path.join(self.depth_dir, f'{idx:05d}.png')
         depth = Image.open(depth_path)
 
-        # Convert depth to grayscale/float format
+        # Convert Depth to Mode F (Float32) with global normalization
+        # Use global normalization to maintain semantic consistency across images
+        # (same depth value should normalize to same output value regardless of image content)
         if depth.mode in ('I', 'I;16', 'I;16B'):
-            depth_array = np.array(depth, dtype=np.float32)
-            if depth_array.max() > 0:
-                depth_array = (depth_array / depth_array.max() * 255).astype(np.uint8)
-            else:
-                depth_array = depth_array.astype(np.uint8)
-            depth = Image.fromarray(depth_array, mode='L')
-        elif depth.mode == 'RGB':
-            depth = depth.convert('L')
-        elif depth.mode != 'L':
-            depth = depth.convert('L')
+            depth_arr = np.array(depth, dtype=np.float32)
+            # Global normalization: divide by max possible depth value (16-bit)
+            # Using 65535.0 to cover full range and avoid clipping (max observed: 65528)
+            depth_arr = np.clip(depth_arr / 65535.0, 0.0, 1.0)
+            depth = Image.fromarray(depth_arr, mode='F')
+        else:
+            # Fallback for other modes
+            depth = depth.convert('F')
+            # If it was 0-255, scale to 0-1
+            if np.array(depth).max() > 1.0:
+                depth_arr = np.array(depth)
+                depth = Image.fromarray(depth_arr / 255.0, mode='F')
 
         # ==================== TRAINING AUGMENTATION ====================
         if self.train:
@@ -188,16 +192,20 @@ class SUNRGBDDataset(Dataset):
             depth = transforms.functional.resize(depth, self.target_size)
 
         # ==================== NORMALIZATION ====================
-        # Convert to tensor and normalize
+        # Convert to tensor and normalize ALL modalities to ~[-1, 1]
+        # Using mean=0.5, std=0.5 for consistency across all streams
+        # This ensures all inputs have similar scale to the neural network
+
         rgb = transforms.functional.to_tensor(rgb)
         rgb = transforms.functional.normalize(
-            rgb, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+            rgb, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
         )
 
         depth = transforms.functional.to_tensor(depth)
         depth = transforms.functional.normalize(
-            depth, mean=[0.5027], std=[0.2197]
+            depth, mean=[0.5], std=[0.5]
         )
+
 
         # 7. Post-normalization Random Erasing
         # Applied after normalization for both modalities

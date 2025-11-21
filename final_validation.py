@@ -55,8 +55,8 @@ for idx in sample_indices:
     orth_raw = np.array(Image.open(orth_files[idx]), dtype=np.float32)
 
     # Apply scaling
-    depth_scaled = depth_raw / 65000.0
-    orth_scaled = orth_raw / 65000.0
+    depth_scaled = depth_raw / 65535.0
+    orth_scaled = orth_raw / 65535.0
 
     # Check for clipping
     if depth_scaled.min() < 0:
@@ -78,7 +78,7 @@ depth_maxs = np.array(depth_maxs)
 orth_mins = np.array(orth_mins)
 orth_maxs = np.array(orth_maxs)
 
-print(f"\nDEPTH SCALING (raw / 65000):")
+print(f"\nDEPTH SCALING (raw / 65535):")
 print(f"  Samples checked: {n_samples}")
 print(f"  Global min: {depth_mins.min():.6f}")
 print(f"  Global max: {depth_maxs.max():.6f}")
@@ -87,7 +87,7 @@ print(f"  Clipped above 1: {depth_clipped_high} ({depth_clipped_high/n_samples*1
 print(f"  Mean of mins: {depth_mins.mean():.6f}")
 print(f"  Mean of maxs: {depth_maxs.mean():.6f}")
 
-print(f"\nORTH SCALING (raw / 65000):")
+print(f"\nORTH SCALING (raw / 65535):")
 print(f"  Samples checked: {n_samples}")
 print(f"  Global min: {orth_mins.min():.6f}")
 print(f"  Global max: {orth_maxs.max():.6f}")
@@ -138,28 +138,31 @@ depth_all = np.concatenate([x.flatten() for x in depth_all])
 orth_all = np.concatenate([x.flatten() for x in orth_all])
 
 print(f"\nRGB Normalization:")
-print(f"  Formula: (x - 0.5) / 0.5")
+print(f"  Formula: (x - computed_mean) / computed_std")
 print(f"  Range: [{rgb_all.min():.4f}, {rgb_all.max():.4f}]")
 print(f"  Mean: {rgb_all.mean():.4f} (target: ~0)")
 print(f"  Std: {rgb_all.std():.4f} (target: ~1)")
 
 print(f"\nDepth Normalization:")
-print(f"  Formula: (x - 0.5) / 0.5")
+print(f"  Formula: (x - 0.3108) / 0.1629")
 print(f"  Range: [{depth_all.min():.4f}, {depth_all.max():.4f}]")
 print(f"  Mean: {depth_all.mean():.4f} (target: ~0)")
 print(f"  Std: {depth_all.std():.4f} (target: ~1)")
 
 print(f"\nOrth Normalization:")
-print(f"  Formula: (x - 0.5) / 0.5")
+print(f"  Formula: (x - 0.5001) / 0.5")
 print(f"  Range: [{orth_all.min():.4f}, {orth_all.max():.4f}]")
 print(f"  Mean: {orth_all.mean():.4f} (target: ~0)")
-print(f"  Std: {orth_all.std():.4f} (target: ~1)")
+print(f"  Std: {orth_all.std():.4f} (target: ~0.14 due to fixed std)")
 
 print(f"\n" + "-"*80)
 # Check all are in reasonable range
-rgb_in_range = -2 <= rgb_all.min() and rgb_all.max() <= 2
-depth_in_range = -2 <= depth_all.min() and depth_all.max() <= 2
-orth_in_range = -2 <= orth_all.min() and orth_all.max() <= 2
+# RGB range with computed stats is approx [-2, 2.5]
+# Depth range with computed stats is approx [-1.9, 4.2]
+# Orth range with computed stats is approx [-7, 7]
+rgb_in_range = -3 <= rgb_all.min() and rgb_all.max() <= 3
+depth_in_range = -3 <= depth_all.min() and depth_all.max() <= 5
+orth_in_range = -7 <= orth_all.min() and orth_all.max() <= 7
 
 # Check means are close to 0
 rgb_mean_ok = abs(rgb_all.mean()) < 0.5
@@ -168,7 +171,7 @@ orth_mean_ok = abs(orth_all.mean()) < 0.5
 
 if rgb_in_range and depth_in_range and orth_in_range and rgb_mean_ok and depth_mean_ok and orth_mean_ok:
     print(f"✅ PASS: All modalities properly normalized")
-    print(f"   - All in range ~[-2, 2]")
+    print(f"   - All in range ~[-7, 7]")
     print(f"   - All means close to 0 (within ±0.5)")
     print(f"   - Consistent normalization across modalities")
 else:

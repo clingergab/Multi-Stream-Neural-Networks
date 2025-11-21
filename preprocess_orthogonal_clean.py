@@ -41,18 +41,25 @@ def preprocess_rgb(rgb_pil):
 
 def preprocess_depth(depth_pil):
     """Convert depth PIL image to tensor [0, 1]."""
-    # Convert depth to grayscale/float format (same as SUNRGBDDataset)
+    # CRITICAL: Use GLOBAL normalization (divide by 65535) to match training dataset
+    # This ensures orthogonal stream is computed with the same depth scaling
+    # that the network sees during training
     if depth_pil.mode in ('I', 'I;16', 'I;16B'):
         depth_array = np.array(depth_pil, dtype=np.float32)
-        if depth_array.max() > 0:
-            depth_array = (depth_array / depth_array.max() * 255).astype(np.uint8)
-        else:
-            depth_array = depth_array.astype(np.uint8)
-        depth_pil = Image.fromarray(depth_array, mode='L')
+        # Global normalization: divide by 16-bit max (matches SUNRGBDDataset)
+        depth_array = np.clip(depth_array / 65535.0, 0.0, 1.0)
+        depth_pil = Image.fromarray(depth_array, mode='F')
     elif depth_pil.mode == 'RGB':
         depth_pil = depth_pil.convert('L')
+        # Scale to [0, 1] if needed
+        depth_array = np.array(depth_pil, dtype=np.float32)
+        if depth_array.max() > 1.0:
+            depth_pil = Image.fromarray(depth_array / 255.0, mode='F')
     elif depth_pil.mode != 'L':
         depth_pil = depth_pil.convert('L')
+        depth_array = np.array(depth_pil, dtype=np.float32)
+        if depth_array.max() > 1.0:
+            depth_pil = Image.fromarray(depth_array / 255.0, mode='F')
 
     # To tensor [0, 1]
     depth_tensor = transforms.functional.to_tensor(depth_pil)
@@ -99,8 +106,11 @@ def extract_global_orthogonal_stream(rgb_tensor, depth_tensor):
     return orth_stream
 
 
-def analyze_value_range(data_root, split, num_samples=100):
-    """Analyze value range across dataset to determine normalization."""
+def analyze_value_range(data_root, split, num_samples=500):
+    """Analyze value range across dataset to determine normalization.
+
+    Uses P1-P99 percentiles computed from actual pixel values to clip outliers.
+    """
     print(f"\nAnalyzing value range on {num_samples} {split} samples...")
 
     rgb_dir = os.path.join(data_root, split, 'rgb')
@@ -110,8 +120,8 @@ def analyze_value_range(data_root, split, num_samples=100):
     rgb_files = sorted([f for f in os.listdir(rgb_dir) if f.endswith(('.png', '.jpg'))])
     num_samples = min(num_samples, len(rgb_files))
 
-    all_mins = []
-    all_maxs = []
+    # Collect all pixel values from sampled images
+    all_orth_values = []
 
     for i in tqdm(range(num_samples), desc="Analyzing"):
         # Load raw images
@@ -129,28 +139,38 @@ def analyze_value_range(data_root, split, num_samples=100):
         # Compute orthogonal
         orth = extract_global_orthogonal_stream(rgb_tensor, depth_tensor)
 
-        all_mins.append(orth.min())
-        all_maxs.append(orth.max())
+        # Collect all pixel values
+        all_orth_values.append(orth.flatten())
 
-    global_min = np.min(all_mins)
-    global_max = np.max(all_maxs)
-    percentile_min = np.percentile(all_mins, 1)  # 1st percentile
-    percentile_max = np.percentile(all_maxs, 99)  # 99th percentile
+    # Concatenate all values
+    all_orth_values = np.concatenate(all_orth_values)
 
-    print(f"\nValue range analysis:")
+    # Compute percentiles from actual pixel values (NOT per-image min/max)
+    p1 = np.percentile(all_orth_values, 1)
+    p99 = np.percentile(all_orth_values, 99)
+
+    global_min = all_orth_values.min()
+    global_max = all_orth_values.max()
+    mean = all_orth_values.mean()
+
+    print(f"\nValue range analysis ({len(all_orth_values):,} pixels):")
     print(f"  Absolute min: {global_min:.6f}")
     print(f"  Absolute max: {global_max:.6f}")
-    print(f"  1st percentile min: {percentile_min:.6f}")
-    print(f"  99th percentile max: {percentile_max:.6f}")
+    print(f"  Mean: {mean:.6f}")
+    print(f"  P1:  {p1:.6f}")
+    print(f"  P99: {p99:.6f}")
 
-    # Use percentiles for better range (avoids extreme outliers)
-    # Make it symmetric around 0
-    range_magnitude = max(abs(percentile_min), abs(percentile_max))
-    vmin = -range_magnitude
-    vmax = range_magnitude
+    # Use P1-P99 for clipping (removes 2% outliers)
+    vmin = p1
+    vmax = p99
 
-    print(f"\nRecommended normalization range:")
+    # Calculate how many pixels will be clipped
+    clipped = np.sum((all_orth_values < vmin) | (all_orth_values > vmax))
+    clipped_pct = 100 * clipped / len(all_orth_values)
+
+    print(f"\nUsing P1-P99 clipping range:")
     print(f"  [{vmin:.6f}, {vmax:.6f}]")
+    print(f"  Will clip {clipped:,} pixels ({clipped_pct:.2f}%)")
 
     return vmin, vmax
 

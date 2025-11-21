@@ -43,7 +43,7 @@ class SUNRGBD3StreamDataset(Dataset):
         self,
         data_root='data/sunrgbd_15',
         train=True,
-        target_size=(224, 224),
+        target_size=(416, 544),
     ):
         """
         Args:
@@ -105,9 +105,9 @@ class SUNRGBD3StreamDataset(Dataset):
         # (same depth value should normalize to same output value regardless of image content)
         if depth.mode in ('I', 'I;16', 'I;16B'):
             depth_arr = np.array(depth, dtype=np.float32)
-            # Global normalization: divide by max possible depth value
-            # Using 65000 to cover 99th percentile (65392) while avoiding clipping
-            depth_arr = np.clip(depth_arr / 65000.0, 0.0, 1.0)
+            # Global normalization: divide by max possible depth value (16-bit)
+            # Using 65535.0 to cover full range and avoid clipping (max observed: 65528)
+            depth_arr = np.clip(depth_arr / 65535.0, 0.0, 1.0)
             depth = Image.fromarray(depth_arr, mode='F')
         else:
             # Fallback for other modes
@@ -125,10 +125,9 @@ class SUNRGBD3StreamDataset(Dataset):
         # Use global normalization to avoid artifacts from per-image normalization after cropping
         if orth.mode in ('I', 'I;16', 'I;16B'):
             orth_arr = np.array(orth, dtype=np.float32)
-            # Global normalization using dataset statistics (1-99 percentile range)
-            # Computed from full dataset: min=4368, max=60859 (covers 98% of data)
-            # Using slightly wider range for safety: [0, 65000] to avoid clipping outliers
-            orth_arr = np.clip(orth_arr / 65000.0, 0.0, 1.0)
+            # Global normalization using full 16-bit range
+            # Max observed value is 65535, so we must use 65535.0 to avoid clipping
+            orth_arr = np.clip(orth_arr / 65535.0, 0.0, 1.0)
             orth = Image.fromarray(orth_arr, mode='F')
         else:
             # Fallback for other modes
@@ -240,23 +239,31 @@ class SUNRGBD3StreamDataset(Dataset):
             orth = transforms.functional.resize(orth, self.target_size)
 
         # ==================== NORMALIZATION ====================
-        # Convert to tensor and normalize ALL modalities to ~[-1, 1]
-        # Using mean=0.5, std=0.5 for consistency across all streams
-        # This ensures all inputs have similar scale to the neural network
+        # Convert to tensor and normalize
+        # Statistics computed from 8041 training samples at (416, 544) resolution
+        # after scaling to [0, 1] range
 
+        # RGB: Use exact computed training statistics
         rgb = transforms.functional.to_tensor(rgb)
         rgb = transforms.functional.normalize(
-            rgb, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
+            rgb,
+            mean=[0.4905626144214781, 0.4564359471868703, 0.43112756716677114],
+            std=[0.27944652961530003, 0.2868739703756949, 0.29222326115669395]
         )
 
+        # Depth: Use exact computed training statistics
         depth = transforms.functional.to_tensor(depth)
         depth = transforms.functional.normalize(
-            depth, mean=[0.5], std=[0.5]
+            depth, mean=[0.2912], std=[0.1472]
         )
 
+        # Orth: Use exact computed statistics from P1-P99 clipped data
+        # After P1-P99 outlier clipping, the data has mean=0.4736, std=0.1490
+        # This gives a normalized range of [-3.18, 3.53] which is stable for training
+        # Data generated with P1-P99 percentile clipping to remove extreme outliers
         orth = transforms.functional.to_tensor(orth)
         orth = transforms.functional.normalize(
-            orth, mean=[0.5], std=[0.5]
+            orth, mean=[0.4736], std=[0.1490]
         )
 
         # 7. Post-normalization Random Erasing
