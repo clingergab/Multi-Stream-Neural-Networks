@@ -192,18 +192,22 @@ class SUNRGBDDataset(Dataset):
             depth = transforms.functional.resize(depth, self.target_size)
 
         # ==================== NORMALIZATION ====================
-        # Convert to tensor and normalize ALL modalities to ~[-1, 1]
-        # Using mean=0.5, std=0.5 for consistency across all streams
-        # This ensures all inputs have similar scale to the neural network
+        # Convert to tensor and normalize
+        # Statistics computed from 8041 training samples at (416, 544) resolution
+        # after scaling to [0, 1] range
 
+        # RGB: Use exact computed training statistics
         rgb = transforms.functional.to_tensor(rgb)
         rgb = transforms.functional.normalize(
-            rgb, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
+            rgb,
+            mean=[0.4905626144214781, 0.4564359471868703, 0.43112756716677114],
+            std=[0.27944652961530003, 0.2868739703756949, 0.29222326115669395]
         )
 
+        # Depth: Use exact computed training statistics
         depth = transforms.functional.to_tensor(depth)
         depth = transforms.functional.normalize(
-            depth, mean=[0.5], std=[0.5]
+            depth, mean=[0.2912], std=[0.1472]
         )
 
 
@@ -281,7 +285,7 @@ def get_sunrgbd_dataloaders(
     data_root='data/sunrgbd_15',
     batch_size=32,
     num_workers=4,
-    target_size=(224, 224),
+    target_size=(416, 544),
     use_class_weights=False,
 ):
     """

@@ -346,7 +346,7 @@ def get_sunrgbd_3stream_dataloaders(
     data_root='data/sunrgbd_15',
     batch_size=32,
     num_workers=4,
-    target_size=(224, 224),
+    target_size=(416, 544),
     use_class_weights=False,
 ):
     """
