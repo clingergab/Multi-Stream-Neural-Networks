@@ -458,11 +458,10 @@ class _LINormBase(nn.Module):
     # Following PyTorch's pattern from https://github.com/pytorch/pytorch/issues/39670
 
     # Type annotations for buffers that are always present
-    integrated_running_mean: Optional[Tensor]
-    integrated_running_var: Optional[Tensor]
     num_batches_tracked: Optional[Tensor]
     # NOTE: Per-stream buffers (stream{i}_running_mean, stream{i}_running_var) are registered
     # dynamically at runtime for i in range(num_streams), so they cannot be statically typed here.
+    # NOTE: No integrated BN buffers for li_net3_soma (integrated gets only ReLU, no BN)
     
     def __init__(
         self,
@@ -495,13 +494,10 @@ class _LINormBase(nn.Module):
                 Parameter(torch.empty(num_features, **factory_kwargs))
                 for num_features in stream_num_features
             ])
-            self.integrated_weight = Parameter(torch.empty(integrated_num_features, **factory_kwargs))
-            self.integrated_bias = Parameter(torch.empty(integrated_num_features, **factory_kwargs))
+            # Note: No integrated_weight/bias for li_net3_soma (integrated gets no BN)
         else:
             self.register_parameter("stream_weights", None)
             self.register_parameter("stream_biases", None)
-            self.register_parameter("integrated_weight", None)
-            self.register_parameter("integrated_bias", None)
 
         # Create buffers for all N stream pathways
         if self.track_running_stats:
@@ -514,13 +510,7 @@ class _LINormBase(nn.Module):
                     f"stream{i}_running_var", torch.ones(num_features, **factory_kwargs)
                 )
 
-            # Register integrated stream buffers
-            self.register_buffer(
-                "integrated_running_mean", torch.zeros(integrated_num_features, **factory_kwargs)
-            )
-            self.register_buffer(
-                "integrated_running_var", torch.ones(integrated_num_features, **factory_kwargs)
-            )
+            # Note: No integrated_running_mean/var for li_net3_soma (integrated gets no BN)
 
             # Register num_batches_tracked (shared across all streams)
             self.register_buffer(
@@ -537,14 +527,13 @@ class _LINormBase(nn.Module):
                 self.register_buffer(f"stream{i}_running_mean", None)
                 self.register_buffer(f"stream{i}_running_var", None)
 
-            self.register_buffer("integrated_running_mean", None)
-            self.register_buffer("integrated_running_var", None)
+            # Note: No integrated buffers for li_net3_soma
             self.register_buffer("num_batches_tracked", None)
 
         self.reset_parameters()
     
     def reset_running_stats(self) -> None:
-        """Reset running statistics for all N pathways - exactly like _NormBase but for N streams."""
+        """Reset running statistics for stream pathways only (no integrated BN)."""
         if self.track_running_stats:
             # running_mean/running_var/num_batches... are registered at runtime depending
             # if self.track_running_stats is on
@@ -552,21 +541,19 @@ class _LINormBase(nn.Module):
                 getattr(self, f"stream{i}_running_mean").zero_()  # type: ignore[union-attr]
                 getattr(self, f"stream{i}_running_var").fill_(1)  # type: ignore[union-attr]
 
-            self.integrated_running_mean.zero_()  # type: ignore[union-attr]
-            self.integrated_running_var.fill_(1)  # type: ignore[union-attr]
+            # Note: No integrated running stats (integrated gets no BN)
 
             # Shared batch tracking
             self.num_batches_tracked.zero_()  # type: ignore[union-attr,operator]
 
     def reset_parameters(self) -> None:
-        """Reset parameters for all N pathways - exactly like _NormBase but for N streams."""
+        """Reset parameters for stream pathways only (no integrated BN)."""
         self.reset_running_stats()
         if self.affine:
             for stream_weight, stream_bias in zip(self.stream_weights, self.stream_biases):
                 init.ones_(stream_weight)
                 init.zeros_(stream_bias)
-            init.ones_(self.integrated_weight)
-            init.zeros_(self.integrated_bias)
+            # Note: No integrated weight/bias (integrated gets no BN)
     
     def _check_input_dim(self, input):
         """Check input dimensions - to be implemented by subclasses."""
@@ -660,18 +647,9 @@ class _LIBatchNorm(_LINormBase):
             )
             stream_outputs.append(stream_out)
 
-        # Process integrated pathway using the exact _BatchNorm algorithm (if exists)
-        if integrated_input is not None:
-            integrated_out = self._forward_single_pathway(
-                integrated_input,
-                self.integrated_running_mean,
-                self.integrated_running_var,
-                self.integrated_weight,
-                self.integrated_bias,
-                self.num_batches_tracked,
-            )
-        else:
-            integrated_out = None
+        # For li_net3_soma: skip BN on integrated stream
+        # Integrated stream gets only ReLU (applied in blocks.py), no BN
+        integrated_out = integrated_input
 
         return stream_outputs, integrated_out
     
@@ -734,9 +712,10 @@ class _LIBatchNorm(_LINormBase):
 class LIBatchNorm2d(_LIBatchNorm):
     r"""Applies Linear Integration Batch Normalization over N 4D inputs.
 
-    This layer applies Batch Normalization separately to N stream and integrated pathways,
-    following PyTorch's BatchNorm2d pattern exactly but extended for N-stream processing.
-    Each pathway operates independently with its own parameters and running statistics.
+    For li_net3_soma: This layer applies Batch Normalization ONLY to stream pathways.
+    The integrated pathway is returned unchanged (no BN applied).
+    This follows the biological model where integrated stream gets only activation threshold (ReLU),
+    not additional normalization.
 
     The 4D inputs are mini-batches of 2D inputs with additional channel dimension.
     Method described in the paper `Batch Normalization: Accelerating Deep Network Training by Reducing

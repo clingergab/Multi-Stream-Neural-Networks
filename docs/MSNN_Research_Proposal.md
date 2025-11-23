@@ -55,6 +55,8 @@ The human visual system provides a compelling model for specialized processing:
 
 Traditional artificial neural networks use single weights between neurons, forcing all information through the same connection. This differs from biological neural networks where multiple synaptic connections between the same neurons allow parallel processing of different information types. MSNNs bridge this gap by introducing multiple specialized weight channels between neurons.
 
+**Dendritic Integration Model**: Biological neurons integrate graded potentials from dendritic filtering at the soma before applying a firing threshold—not post-firing action potentials. This integration-before-threshold principle directly informs our design: stream convolutions perform dendritic filtering, integration combines these filtered signals (somatic integration), and BN+ReLU applies the threshold. This contrasts with post-activation fusion that combines already-thresholded signals.
+
 ### 1.4 Research Questions
 
 1. Can separate processing pathways for RGB and depth achieve competitive performance with significantly better training efficiency than ensemble methods?
@@ -106,8 +108,8 @@ I will evaluate four integration strategies, progressing from simplest to most s
 Separate pathways remain independent until final classification:
 
 ```python
-rgb_l = ReLU(W_rgb^l · rgb_{l-1} + b_rgb^l)
-depth_l = ReLU(W_d^l · depth_{l-1} + b_d^l)
+rgb_l = f(W_rgb^l · rgb_{l-1} + b_rgb^l)
+depth_l = f(W_d^l · depth_{l-1} + b_d^l)
 output = Classifier([rgb_L; depth_L])  # Concatenate at end
 ```
 
@@ -124,10 +126,10 @@ output = Classifier([rgb_L; depth_L])  # Concatenate at end
 Integration at each layer through learned linear transformations:
 
 ```python
-rgb_l = ReLU(W_rgb^l · rgb_{l-1} + b_rgb^l)
-depth_l = ReLU(W_d^l · depth_{l-1} + b_d^l)
+rgb_l = f(W_rgb^l · rgb_{l-1} + b_rgb^l)
+depth_l = f(W_d^l · depth_{l-1} + b_d^l)
 concat_l = [rgb_l; depth_l; integrated_{l-1}]
-integrated_l = ReLU(W_i^l · concat_l + b_i^l)
+integrated_l = f(W_i^l · concat_l + b_i^l)
 ```
 
 **Properties**:
@@ -136,6 +138,8 @@ integrated_l = ReLU(W_i^l · concat_l + b_i^l)
 - Parameters: O(3h²) per integration layer
 - Standard gradient flow (similar to ResNet, DenseNet)
 
+**Biological Motivation**: Models somatic integration where multiple dendritic inputs converge. Concatenation represents parallel signals arriving at the soma, and the learned weight matrix (W_i) represents complex synaptic integration before the threshold function (f).
+
 **Advantage**: Features from both modalities inform each other at every layer, but lower interpretability as importance is distributed across weight matrices.
 
 #### Approach 3: Direct Mixing with Learnable Weights
@@ -143,8 +147,8 @@ integrated_l = ReLU(W_i^l · concat_l + b_i^l)
 Uses learnable scalar parameters (α, β, γ) to control pathway mixing:
 
 ```python
-rgb_l = ReLU(W_rgb^l · rgb_{l-1} + b_rgb^l)
-depth_l = ReLU(W_d^l · depth_{l-1} + b_d^l)
+rgb_l = f(W_rgb^l · rgb_{l-1} + b_rgb^l)
+depth_l = f(W_d^l · depth_{l-1} + b_d^l)
 integrated_l = α_l · rgb_l + β_l · depth_l + γ_l · integrated_{l-1}
 ```
 
@@ -155,6 +159,8 @@ Where α, β, γ are learnable parameters initialized to 1.0, 1.0, 0.2 respectiv
 - High interpretability - α, β, γ directly show pathway importance
 - Gradients scaled by integration weights
 - Self-organizing - network learns optimal mixing ratios
+
+**Biological Motivation**: Simplified somatic integration with scalar synaptic strengths. The learnable scalars (α, β, γ) represent relative synaptic efficacies, analogous to varying neurotransmitter strengths at different synapses.
 
 **Key Advantages**:
 - Can analyze which modality dominates at each layer

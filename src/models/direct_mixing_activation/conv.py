@@ -1,12 +1,11 @@
 """
-Linear Integration convolution layers for N-stream processing.
+Direct Mixing convolution layers for N-stream processing.
 
-This module provides N-stream convolution operations with learned integration
-that maintain independent pathways with unified neuron architecture.
+This module provides N-stream convolution operations with scalar-based direct mixing
+that maintain independent pathways with minimal-parameter integration.
 """
 
 import math
-from click import group
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -17,12 +16,12 @@ from torch.nn.modules.utils import _pair, _reverse_repeat_tuple
 from typing import Optional, Union
 
 
-class _LIConvNd(nn.Module):
+class _DMConvNd(nn.Module):
     """
-    Linear Integration convolution base class - follows PyTorch's _ConvNd pattern exactly.
+    Direct Mixing convolution base class - follows PyTorch's _ConvNd pattern exactly.
 
-    This is the base class for linear integration convolution layers, mirroring PyTorch's
-    _ConvNd but adapted for N-stream processing with dynamic stream handling.
+    This is the base class for direct mixing convolution layers, mirroring PyTorch's
+    _ConvNd but adapted for N-stream processing with scalar-based integration.
     """
 
     __constants__ = [
@@ -40,8 +39,8 @@ class _LIConvNd(nn.Module):
         stream_inputs: list[Tensor],
         integrated_input: Optional[Tensor],
         stream_weights: list[Tensor],
-        integrated_weight: Optional[Tensor],
-        integration_from_streams_weights: list[Tensor],
+        stream_mixing_scalars: list[Tensor],
+        integrated_mixing_scalar: Tensor,
         stream_biases: list[Optional[Tensor]],
         integrated_bias: Optional[Tensor]
     ) -> tuple[list[Tensor], Tensor]:
@@ -62,8 +61,8 @@ class _LIConvNd(nn.Module):
     groups: int
     padding_mode: str
     stream_weights: nn.ParameterList
-    integrated_weight: Tensor
-    integration_from_streams: nn.ParameterList
+    stream_mixing_scalars: nn.ParameterList  # Scalar weights for stream contributions
+    integrated_mixing_scalar: Tensor  # Scalar weight for previous integrated (no Conv1x1, just scalar γ)
     stream_biases: Optional[nn.ParameterList]
     integrated_bias: Optional[Tensor]
     _reversed_padding_repeated_twice: list[int]
@@ -177,14 +176,7 @@ class _LIConvNd(nn.Module):
                 ))
                 for i in range(num_streams)
             ])
-            # Integrated weight is always 1x1 (channel-wise only)
-            # Note: Can have shape (0, out_channels, 1, 1) when integrated_in_channels=0 (first layer)
-            self.integrated_weight = Parameter(
-                torch.empty(
-                    (integrated_in_channels, integrated_out_channels // groups, 1, 1),
-                    **factory_kwargs,
-                )
-            )
+            # Note: No integrated_weight for direct_mixing_activation (we use scalar γ instead of Conv1x1)
         else:
             self.stream_weights = nn.ParameterList([
                 Parameter(torch.empty(
@@ -193,14 +185,7 @@ class _LIConvNd(nn.Module):
                 ))
                 for i in range(num_streams)
             ])
-            # Integrated weight is always 1x1 (channel-wise only)
-            # Note: Can have shape (out_channels, 0, 1, 1) when integrated_in_channels=0 (first layer)
-            self.integrated_weight = Parameter(
-                torch.empty(
-                    (integrated_out_channels, integrated_in_channels // groups, 1, 1),
-                    **factory_kwargs,
-                )
-            )
+            # Note: No integrated_weight for direct_mixing_activation (we use scalar γ instead of Conv1x1)
 
         # Create bias parameters for all N streams
         if bias:
@@ -213,15 +198,20 @@ class _LIConvNd(nn.Module):
             self.register_parameter("stream_biases", None)
             self.register_parameter("integrated_bias", None)
 
-        # Create 1x1 integration weights for Linear Integration (channel-wise mixing)
-        # These weights learn how to combine all stream outputs into the integrated stream
-        self.integration_from_streams = nn.ParameterList([
-            Parameter(torch.empty(
-                (integrated_out_channels, stream_out_channels[i], 1, 1),
-                **factory_kwargs,
-            ))
+        # Create scalar mixing weights for Direct Mixing + Activation
+        # Formula: integrated_l = Σ(α_i · stream_i_l) + γ · integrated_{l-1} + b_integrated
+
+        # Scalar weight for each stream's OUTPUT contribution to integrated
+        # One scalar per stream (controls how much each stream contributes)
+        self.stream_mixing_scalars = nn.ParameterList([
+            Parameter(torch.ones(1, **factory_kwargs))  # Initialize to 1.0
             for i in range(num_streams)
         ])
+
+        # Scalar weight for PREVIOUS integrated stream (recurrent connection)
+        # Single scalar (controls how much previous integrated carries forward)
+        # Initialize to 0.2 (prevents gradient explosion, allows gradual integrated stream buildup)
+        self.integrated_mixing_scalar = Parameter(torch.tensor(0.2, **factory_kwargs))
 
         self.reset_parameters()
     
@@ -242,17 +232,17 @@ class _LIConvNd(nn.Module):
                     bound = 1 / math.sqrt(fan_in)
                     init.uniform_(stream_bias, -bound, bound)
 
-        # Initialize integrated pathway weights
-        init.kaiming_uniform_(self.integrated_weight, a=math.sqrt(5))
+        # Note: No integrated_weight for direct_mixing_activation (we use scalar γ instead)
+        # Initialize integrated_bias using uniform distribution based on integrated_out_channels
         if self.integrated_bias is not None:
-            fan_in, _ = init._calculate_fan_in_and_fan_out(self.integrated_weight)
-            if fan_in != 0:
-                bound = 1 / math.sqrt(fan_in)
-                init.uniform_(self.integrated_bias, -bound, bound)
+            # Use integrated_out_channels as fan_in for bias initialization
+            bound = 1 / math.sqrt(self.integrated_out_channels)
+            init.uniform_(self.integrated_bias, -bound, bound)
 
-        # Initialize integration weights (1x1 convolutions for stream mixing)
-        for integration_weight in self.integration_from_streams:
-            init.kaiming_uniform_(integration_weight, a=math.sqrt(5))
+        # Scalar mixing weights are already initialized in __init__
+        # stream_mixing_scalars: initialized to 1.0
+        # integrated_mixing_scalar: initialized to 0.2
+        # No additional initialization needed here
     
     def extra_repr(self):
         """String representation exactly like _ConvNd."""
@@ -285,11 +275,11 @@ class _LIConvNd(nn.Module):
             self.padding_mode = "zeros"
 
 
-class LIConv2d(_LIConvNd):
+class DMConv2d(_DMConvNd):
     """
-    Linear Integration 2D Convolution layer - follows PyTorch's Conv2d pattern exactly.
+    Direct Mixing 2D Convolution layer - follows PyTorch's Conv2d pattern exactly.
 
-    This layer processes N input streams and integrated stream with learned integration,
+    This layer processes N input streams and integrated stream with scalar-based direct mixing,
     maintaining full compatibility with PyTorch's Conv2d interface.
     """
 
@@ -336,21 +326,24 @@ class LIConv2d(_LIConvNd):
         stream_inputs: list[Tensor],
         integrated_input: Optional[Tensor],
         stream_weights: list[Tensor],
-        integrated_weight: Optional[Tensor],
-        integration_from_streams_weights: list[Tensor],
+        stream_mixing_scalars: list[Tensor],
+        integrated_mixing_scalar: Tensor,
         stream_biases: list[Optional[Tensor]],
         integrated_bias: Optional[Tensor]
     ) -> tuple[list[Tensor], Tensor]:
         """
-        Forward pass with biologically-inspired integration.
+        Forward pass with Direct Mixing + Activation integration.
 
         Biological analogy:
         - Dendritic filtering: Conv operation (spatial processing without bias)
         - Stream outputs: Conv + bias (pathway-specific baseline potential)
-        - Soma integration: Integrates RAW conv outputs (without stream biases)
-        - Soma threshold: integrated_bias (neuron's firing threshold)
+        - Soma integration: Scalar mixing of RAW conv outputs (without stream biases)
+        - Soma threshold: ReLU applied in blocks.py (firing threshold)
 
-        This separates pathway-specific biases from the integration threshold.
+        Key differences from direct_mixing:
+        1. NO Conv1x1 on integrated_prev (just scalar γ multiplication)
+        2. NO BN on integrated (just ReLU in blocks.py)
+        3. Integrated stream is simpler: raw mixing, then activation
         """
         # Process all stream pathways
         # Compute RAW conv outputs (dendritic filtering, no bias)
@@ -388,62 +381,60 @@ class LIConv2d(_LIConvNd):
             stream_outputs_raw.append(stream_out_raw)  # Raw output for integration
 
         # ===== Process integrated pathway (Soma Integration) =====
-        # Apply Linear Integration on RAW conv outputs (dendritic signals without bias)
-        # integrated_out = W_prev·integrated_prev + Σ(Wi·stream_i_raw) + bias_integrated
-        # This ensures only the soma has its own threshold bias, not redundant with stream biases
+        # Apply Direct Mixing on RAW conv outputs (dendritic signals without bias)
+        # integrated_out = Σ(α_i · stream_i_raw) + γ · integrated_prev + bias_integrated
+        # Key differences from direct_mixing: NO Conv1x1 on integrated_prev, ReLU applied in blocks.py
 
-        # Process previous integrated (if exists) using 1x1 conv with stride matching
-        # IMPORTANT: integrated_weight is 1x1, but stride must match main conv for spatial alignment
+        # Process previous integrated (if exists) using SCALAR multiplication only
+        # NO Conv1x1 - just scalar γ for recurrent connection strength
         if integrated_input is not None:
-            integrated_from_prev = F.conv2d(
-                integrated_input, integrated_weight, None,  # No bias here
-                stride=self.stride, padding=0  # 1x1 conv, stride matches main conv
-            )
+            # Simple scalar multiplication (no spatial convolution)
+            integrated_from_prev = integrated_mixing_scalar * integrated_input
         else:
             # First layer: no previous integrated stream
             integrated_from_prev = 0
 
-        # Integration step: combine RAW stream outputs using 1x1 convs (soma integrates dendritic signals)
+        # Direct Mixing: combine RAW stream outputs using SCALAR multiplication
         # Key difference: Use stream_outputs_raw (without bias) instead of stream_outputs (with bias)
+        # Each stream_scalar_i is a single learnable scalar that scales the entire stream output
         integrated_from_streams = []
-        for stream_out_raw, integration_weight in zip(stream_outputs_raw, integration_from_streams_weights):
-            integrated_contrib = F.conv2d(
-                stream_out_raw, integration_weight, None,  # Integrate RAW dendritic signals
-                stride=1, padding=0  # 1x1 conv, stride=1 (already spatially aligned)
-            )
+        for stream_out_raw, stream_scalar in zip(stream_outputs_raw, stream_mixing_scalars):
+            # Scalar multiplication: stream_scalar · stream_out_raw (integrate RAW dendritic signals)
+            integrated_contrib = stream_scalar * stream_out_raw
             integrated_from_streams.append(integrated_contrib)
 
-        # Combine all contributions to create integrated output
+        # Combine all contributions to create integrated output (pre-activation)
         integrated_out = integrated_from_prev + sum(integrated_from_streams)
 
-        # Add integrated bias (soma's firing threshold)
-        # This is the ONLY bias for integration, representing the membrane potential threshold
+        # Add integrated bias (soma's baseline potential)
         if integrated_bias is not None:
             integrated_out = integrated_out + integrated_bias.view(1, -1, 1, 1)
 
+        # Return pre-activation integrated output
+        # ReLU will be applied in blocks.py (consistent with ResNet pattern)
         return stream_outputs, integrated_out
     
     def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
-        """Forward pass through all N convolution streams with Linear Integration."""
+        """Forward pass through all N convolution streams with Direct Mixing."""
         # Convert ParameterList to list of tensors for _conv_forward
         stream_weights_list = list(self.stream_weights)
-        integration_from_streams_weights_list = list(self.integration_from_streams)
+        stream_scalars_list = list(self.stream_mixing_scalars)
         stream_biases_list = list(self.stream_biases) if self.stream_biases is not None else [None] * self.num_streams
 
         return self._conv_forward(
             stream_inputs,
             integrated_input,
             stream_weights_list,
-            self.integrated_weight,
-            integration_from_streams_weights_list,
+            stream_scalars_list,
+            self.integrated_mixing_scalar,
             stream_biases_list,
             self.integrated_bias
         )
     
 
 
-class _LINormBase(nn.Module):
-    """Common base for Linear Integration normalization - follows PyTorch's _NormBase pattern exactly."""
+class _DMNormBase(nn.Module):
+    """Common base for Direct Mixing normalization - follows PyTorch's _NormBase pattern exactly."""
 
     _version = 2
     __constants__ = ["track_running_stats", "momentum", "eps", "num_streams", "stream_num_features", "integrated_num_features", "affine"]
@@ -458,11 +449,10 @@ class _LINormBase(nn.Module):
     # Following PyTorch's pattern from https://github.com/pytorch/pytorch/issues/39670
 
     # Type annotations for buffers that are always present
-    integrated_running_mean: Optional[Tensor]
-    integrated_running_var: Optional[Tensor]
     num_batches_tracked: Optional[Tensor]
     # NOTE: Per-stream buffers (stream{i}_running_mean, stream{i}_running_var) are registered
     # dynamically at runtime for i in range(num_streams), so they cannot be statically typed here.
+    # NOTE: No integrated BN buffers for direct_mixing_activation (integrated gets only ReLU, no BN)
     
     def __init__(
         self,
@@ -495,13 +485,10 @@ class _LINormBase(nn.Module):
                 Parameter(torch.empty(num_features, **factory_kwargs))
                 for num_features in stream_num_features
             ])
-            self.integrated_weight = Parameter(torch.empty(integrated_num_features, **factory_kwargs))
-            self.integrated_bias = Parameter(torch.empty(integrated_num_features, **factory_kwargs))
+            # Note: No integrated_weight/bias for direct_mixing_activation (integrated gets no BN)
         else:
             self.register_parameter("stream_weights", None)
             self.register_parameter("stream_biases", None)
-            self.register_parameter("integrated_weight", None)
-            self.register_parameter("integrated_bias", None)
 
         # Create buffers for all N stream pathways
         if self.track_running_stats:
@@ -514,13 +501,7 @@ class _LINormBase(nn.Module):
                     f"stream{i}_running_var", torch.ones(num_features, **factory_kwargs)
                 )
 
-            # Register integrated stream buffers
-            self.register_buffer(
-                "integrated_running_mean", torch.zeros(integrated_num_features, **factory_kwargs)
-            )
-            self.register_buffer(
-                "integrated_running_var", torch.ones(integrated_num_features, **factory_kwargs)
-            )
+            # Note: No integrated_running_mean/var for direct_mixing_activation (integrated gets no BN)
 
             # Register num_batches_tracked (shared across all streams)
             self.register_buffer(
@@ -537,14 +518,13 @@ class _LINormBase(nn.Module):
                 self.register_buffer(f"stream{i}_running_mean", None)
                 self.register_buffer(f"stream{i}_running_var", None)
 
-            self.register_buffer("integrated_running_mean", None)
-            self.register_buffer("integrated_running_var", None)
+            # Note: No integrated buffers for direct_mixing_activation
             self.register_buffer("num_batches_tracked", None)
 
         self.reset_parameters()
     
     def reset_running_stats(self) -> None:
-        """Reset running statistics for all N pathways - exactly like _NormBase but for N streams."""
+        """Reset running statistics for stream pathways only (no integrated BN)."""
         if self.track_running_stats:
             # running_mean/running_var/num_batches... are registered at runtime depending
             # if self.track_running_stats is on
@@ -552,21 +532,19 @@ class _LINormBase(nn.Module):
                 getattr(self, f"stream{i}_running_mean").zero_()  # type: ignore[union-attr]
                 getattr(self, f"stream{i}_running_var").fill_(1)  # type: ignore[union-attr]
 
-            self.integrated_running_mean.zero_()  # type: ignore[union-attr]
-            self.integrated_running_var.fill_(1)  # type: ignore[union-attr]
+            # Note: No integrated running stats (integrated gets no BN)
 
             # Shared batch tracking
             self.num_batches_tracked.zero_()  # type: ignore[union-attr,operator]
 
     def reset_parameters(self) -> None:
-        """Reset parameters for all N pathways - exactly like _NormBase but for N streams."""
+        """Reset parameters for stream pathways only (no integrated BN)."""
         self.reset_running_stats()
         if self.affine:
             for stream_weight, stream_bias in zip(self.stream_weights, self.stream_biases):
                 init.ones_(stream_weight)
                 init.zeros_(stream_bias)
-            init.ones_(self.integrated_weight)
-            init.zeros_(self.integrated_bias)
+            # Note: No integrated weight/bias (integrated gets no BN)
     
     def _check_input_dim(self, input):
         """Check input dimensions - to be implemented by subclasses."""
@@ -618,8 +596,8 @@ class _LINormBase(nn.Module):
         )
 
 
-class _LIBatchNorm(_LINormBase):
-    """Linear Integration BatchNorm - follows PyTorch's _BatchNorm pattern exactly."""
+class _DMBatchNorm(_DMNormBase):
+    """Direct Mixing BatchNorm - follows PyTorch's _BatchNorm pattern exactly."""
 
     def __init__(
         self,
@@ -660,18 +638,9 @@ class _LIBatchNorm(_LINormBase):
             )
             stream_outputs.append(stream_out)
 
-        # Process integrated pathway using the exact _BatchNorm algorithm (if exists)
-        if integrated_input is not None:
-            integrated_out = self._forward_single_pathway(
-                integrated_input,
-                self.integrated_running_mean,
-                self.integrated_running_var,
-                self.integrated_weight,
-                self.integrated_bias,
-                self.num_batches_tracked,
-            )
-        else:
-            integrated_out = None
+        # For direct_mixing_activation: skip BN on integrated stream
+        # Integrated stream gets only ReLU (applied in blocks.py), no BN
+        integrated_out = integrated_input
 
         return stream_outputs, integrated_out
     
@@ -731,12 +700,13 @@ class _LIBatchNorm(_LINormBase):
         )
 
 
-class LIBatchNorm2d(_LIBatchNorm):
-    r"""Applies Linear Integration Batch Normalization over N 4D inputs.
+class DMBatchNorm2d(_DMBatchNorm):
+    r"""Applies Direct Mixing Batch Normalization over N 4D inputs.
 
-    This layer applies Batch Normalization separately to N stream and integrated pathways,
-    following PyTorch's BatchNorm2d pattern exactly but extended for N-stream processing.
-    Each pathway operates independently with its own parameters and running statistics.
+    For direct_mixing_activation: This layer applies Batch Normalization ONLY to stream pathways.
+    The integrated pathway is returned unchanged (no BN applied).
+    This follows the biological model where integrated stream gets only activation threshold (ReLU),
+    not additional normalization.
 
     The 4D inputs are mini-batches of 2D inputs with additional channel dimension.
     Method described in the paper `Batch Normalization: Accelerating Deep Network Training by Reducing
@@ -794,16 +764,16 @@ class LIBatchNorm2d(_LIBatchNorm):
 
     Shape:
         - Stream Inputs: List of :math:`(N, C_{i}, H, W)` where i = 0..N-1
-        - Integrated Input: :math:`(N, C_{integrated}, H, W)`
-        - Stream Outputs: List of :math:`(N, C_{i}, H, W)` (same shape as stream inputs)
-        - Integrated Output: :math:`(N, C_{integrated}, H, W)` (same shape as integrated input)
+        - Integrated Input: :math:`(N, C_{integrated}, H, W)` (optional)
+        - Stream Outputs: List of :math:`(N, C_{i}, H, W)` (normalized)
+        - Integrated Output: :math:`(N, C_{integrated}, H, W)` (unchanged, no BN applied)
 
     Examples::
 
         >>> # With Learnable Parameters for 3 streams
-        >>> m = LIBatchNorm2d([64, 64, 64], 64)
+        >>> m = DMBatchNorm2d([64, 64, 64], 64)
         >>> # Without Learnable Parameters
-        >>> m = LIBatchNorm2d([64, 64, 64], 64, affine=False)
+        >>> m = DMBatchNorm2d([64, 64, 64], 64, affine=False)
         >>> stream_inputs = [torch.randn(20, 64, 35, 45) for _ in range(3)]
         >>> integrated_input = torch.randn(20, 64, 35, 45)
         >>> stream_outputs, integrated_output = m(stream_inputs, integrated_input)
