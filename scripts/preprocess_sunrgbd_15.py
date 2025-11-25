@@ -28,7 +28,7 @@ from PIL import Image
 import numpy as np
 from collections import Counter
 from tqdm import tqdm
-from sunrgbd_15_category_mapping import map_raw_scene_to_15, SUNRGBD_15_CATEGORIES, get_class_idx
+from scripts.sunrgbd_15_category_mapping import map_raw_scene_to_15, SUNRGBD_15_CATEGORIES, get_class_idx
 
 # Paths
 SUNRGBD_BASE = "data/sunrgbd/SUNRGBD"
