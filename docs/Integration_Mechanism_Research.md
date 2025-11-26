@@ -249,6 +249,17 @@ Once a winning mechanism emerges:
 3. Test scalability to 5+ modalities
 4. Collaborate with neuroscientists for biological validation
 
+### Long-term Vision: Multi-Modal Language Models
+
+The ultimate test of universal integration is applying these mechanisms to multi-modal language models. If integration mechanisms generalize, they should enable **parameter-efficient multi-modal understanding** - achieving large-model performance with smaller architectures through better integration rather than brute-force scaling.
+
+**Key hypothesis**: Vision + Language models (like CLIP, GPT-4V, LLaVA) currently use ad-hoc fusion strategies. Our biologically-inspired integration mechanisms could provide:
+1. **Efficiency**: Match large-model performance with fewer parameters via superior integration
+2. **Interpretability**: Learnable α weights reveal how vision vs. language contributes to each prediction
+3. **Sample efficiency**: Better integration means learning from less multi-modal training data
+
+This represents the natural culmination of testing integration mechanisms across increasing complexity: single modality (vision) → multi-representation (NLP) → true multi-modal (vision+language). See [Multi-Modal LM Roadmap](Multi_Modal_LM_Roadmap.md) for detailed progression.
+
 ---
 
 ## Key Insight
