@@ -634,7 +634,7 @@ class DMNet(BaseModel):
         val_loader: Optional[DataLoader] = None,
         epochs: int = 10,
         callbacks: Optional[list] = None,
-        verbose: bool = True,
+        verbose: bool = False,
         save_path: Optional[str] = None,
         early_stopping: bool = False,
         patience: int = 10,
