@@ -175,16 +175,18 @@ class SUNRGBDDataset(Dataset):
                 contrast_factor = np.random.uniform(0.75, 1.25)    # ±25%
 
                 # Apply contrast then brightness (same order as ColorJitter)
-                depth_array = (depth_array - 127.5) * contrast_factor + 127.5
+                # Note: depth_array is in [0, 1] range, so use 0.5 as midpoint
+                depth_array = (depth_array - 0.5) * contrast_factor + 0.5
                 depth_array = depth_array * brightness_factor
 
                 # Add Gaussian noise (simulates sensor noise)
                 # Moderate std to avoid excessive noise while providing robustness
-                noise = np.random.normal(0, 15, depth_array.shape)
+                # Scale noise to [0, 1] range (15/255 ≈ 0.059)
+                noise = np.random.normal(0, 0.059, depth_array.shape).astype(np.float32)
                 depth_array = depth_array + noise
 
-                depth_array = np.clip(depth_array, 0, 255)
-                depth = Image.fromarray(depth_array.astype(np.uint8), mode='L')
+                depth_array = np.clip(depth_array, 0.0, 1.0).astype(np.float32)
+                depth = Image.fromarray(depth_array, mode='F')
 
         else:
             # Validation: just resize (no augmentation)
