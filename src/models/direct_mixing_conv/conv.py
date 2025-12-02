@@ -420,14 +420,12 @@ class DMConv2d(_DMConvNd):
         # Direct Mixing: combine RAW stream outputs using SCALAR multiplication
         # Key difference: Use stream_outputs_raw (without bias) instead of stream_outputs (with bias)
         # Each stream_scalar_i is a single learnable scalar that scales the entire stream output
-        integrated_from_streams = []
+        # MEMORY OPTIMIZATION: Accumulate directly instead of building list of intermediate tensors
+        integrated_out = integrated_from_prev
         for stream_out_raw, stream_scalar in zip(stream_outputs_raw, stream_mixing_scalars):
             # Scalar multiplication: stream_scalar · stream_out_raw (integrate RAW dendritic signals)
-            integrated_contrib = stream_scalar * stream_out_raw
-            integrated_from_streams.append(integrated_contrib)
-
-        # Combine all contributions to create integrated output
-        integrated_out = integrated_from_prev + sum(integrated_from_streams)
+            # Accumulate directly: integrated_out = integrated_out + (stream_scalar * stream_out_raw)
+            integrated_out = integrated_out + stream_scalar * stream_out_raw
 
         # Add integrated bias (soma's firing threshold)
         # This is the ONLY bias for integration, representing the membrane potential threshold
