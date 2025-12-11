@@ -282,6 +282,22 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
                         f"List parameters must have length equal to number of param groups."
                     )
 
+        # Add required parameters with defaults if not provided
+        # Ensures each scheduler gets all required parameters
+        required_params = {
+            'cosine': {'t_max': epochs},
+            'decaying_cosine': {'t_max': epochs},
+            'quadratic_inout': {'t_max': epochs},
+            'cubic_inout': {'t_max': epochs},
+            'cosine_restarts': {'t_0': max(10, epochs // 4)},  # Default: 1/4 of total epochs, min 10
+            'decaying_cosine_restarts': {'t_0': max(10, epochs // 4)},  # Default: 1/4 of total epochs, min 10
+        }
+
+        if scheduler_type in required_params:
+            for param_name, default_value in required_params[scheduler_type].items():
+                if param_name not in scheduler_kwargs:
+                    scheduler_kwargs[param_name] = default_value
+
         scheduler_kwargs_list = []
 
         for i in range(num_groups):

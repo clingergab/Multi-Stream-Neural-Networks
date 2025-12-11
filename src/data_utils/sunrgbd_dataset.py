@@ -289,6 +289,7 @@ def get_sunrgbd_dataloaders(
     num_workers=4,
     target_size=(416, 544),
     use_class_weights=False,
+    seed=None,
 ):
     """
     Create train and validation dataloaders for SUN RGB-D.
@@ -299,9 +300,17 @@ def get_sunrgbd_dataloaders(
         num_workers: Number of dataloader workers
         target_size: Target image size (H, W)
         use_class_weights: If True, return class weights for loss
+        seed: Random seed for reproducible data loading. If None, non-reproducible.
+              When set, ensures reproducible shuffle order and worker initialization.
 
     Returns:
         train_loader, val_loader, (optional) class_weights
+
+    Example:
+        >>> # Reproducible dataloaders
+        >>> from src.utils.seed import set_seed
+        >>> set_seed(42)
+        >>> train_loader, val_loader = get_sunrgbd_dataloaders(seed=42)
     """
     # Create datasets
     train_dataset = SUNRGBDDataset(
@@ -316,6 +325,21 @@ def get_sunrgbd_dataloaders(
         target_size=target_size,
     )
 
+    # Setup reproducibility if seed is provided
+    worker_init_fn = None
+    generator = None
+
+    if seed is not None:
+        # Create worker init function for reproducible workers
+        def worker_init_fn(worker_id):
+            import numpy as np
+            import random
+            worker_seed = seed + worker_id
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+
+        generator = torch.Generator().manual_seed(seed)
+
     # Create dataloaders
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -323,7 +347,9 @@ def get_sunrgbd_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=True if num_workers > 0 else False,
+        worker_init_fn=worker_init_fn,
+        generator=generator
     )
 
     val_loader = torch.utils.data.DataLoader(
@@ -332,7 +358,9 @@ def get_sunrgbd_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=True if num_workers > 0 else False,
+        worker_init_fn=worker_init_fn,
+        generator=generator
     )
 
     print(f"\nDataLoader Info:")
