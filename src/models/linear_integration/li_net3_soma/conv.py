@@ -499,6 +499,11 @@ class _LINormBase(nn.Module):
             self.register_parameter("stream_weights", None)
             self.register_parameter("stream_biases", None)
 
+        # GroupNorm(1) for integrated stream = LayerNorm over channels
+        # This provides scale stability without batch statistics (biologically plausible)
+        # Using affine=True to allow learnable scale/shift for the integrated stream
+        self.integrated_groupnorm = nn.GroupNorm(1, integrated_num_features, eps=eps, **factory_kwargs)
+
         # Create buffers for all N stream pathways
         if self.track_running_stats:
             # Register running stats for each stream
@@ -647,9 +652,13 @@ class _LIBatchNorm(_LINormBase):
             )
             stream_outputs.append(stream_out)
 
-        # For li_net3_soma: skip BN on integrated stream
-        # Integrated stream gets only ReLU (applied in blocks.py), no BN
-        integrated_out = integrated_input
+        # For li_net3_soma: apply GroupNorm(1) = LayerNorm over channels
+        # This provides scale stability without batch statistics (no batch dependency)
+        # Biologically: soma normalizes its own activation per-sample, not across batch
+        if integrated_input is not None:
+            integrated_out = self.integrated_groupnorm(integrated_input)
+        else:
+            integrated_out = None
 
         return stream_outputs, integrated_out
     
@@ -712,10 +721,10 @@ class _LIBatchNorm(_LINormBase):
 class LIBatchNorm2d(_LIBatchNorm):
     r"""Applies Linear Integration Batch Normalization over N 4D inputs.
 
-    For li_net3_soma: This layer applies Batch Normalization ONLY to stream pathways.
-    The integrated pathway is returned unchanged (no BN applied).
-    This follows the biological model where integrated stream gets only activation threshold (ReLU),
-    not additional normalization.
+    For li_net3_soma: This layer applies Batch Normalization to stream pathways and
+    GroupNorm(1) (equivalent to LayerNorm over channels) to the integrated pathway.
+    This provides scale stability for the integrated stream without batch statistics,
+    following the biological model where soma normalizes per-sample rather than across batch.
 
     The 4D inputs are mini-batches of 2D inputs with additional channel dimension.
     Method described in the paper `Batch Normalization: Accelerating Deep Network Training by Reducing
