@@ -90,6 +90,10 @@ class LINet(BaseModel):
         self.stream2_input_channels = stream2_input_channels
         self.dropout_p = dropout_p
 
+        # Initialize inplanes for 2-stream architecture (used by _build_network)
+        self.stream1_inplanes = 64
+        self.stream2_inplanes = 64
+
         # Set LINet default norm layer if not specified
         if norm_layer is None:
             norm_layer = LIBatchNorm2d
@@ -116,7 +120,7 @@ class LINet(BaseModel):
         replace_stride_with_dilation: list[bool]
     ):
         """Build the Linear Integration ResNet network architecture."""
-        # BaseModel already initialized self.stream1_inplanes and self.stream2_inplanes to 64
+        # stream1_inplanes and stream2_inplanes are initialized in __init__ before super().__init__
         # Now add integrated_inplanes tracking for 3rd stream
         self.integrated_inplanes = 64
 
@@ -1544,7 +1548,23 @@ class LINet(BaseModel):
             A string representing the fusion type.
         """
         return "linear_integration"
-    
+
+    def _forward_stream_pathway(self, stream_idx: int, stream_input: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through a single stream pathway.
+
+        Args:
+            stream_idx: Index of the stream (0 for stream1, 1 for stream2)
+            stream_input: The input tensor for this stream
+
+        Returns:
+            The stream pathway output tensor (flattened features).
+        """
+        if stream_idx == 0:
+            return self._forward_stream1_pathway(stream_input)
+        else:
+            return self._forward_stream2_pathway(stream_input)
+
     def _forward_stream1_pathway(self, stream1_input: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the stream1 pathway only.
