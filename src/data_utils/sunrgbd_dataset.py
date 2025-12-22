@@ -5,6 +5,7 @@ Loads preprocessed SUN RGB-D dataset with RGB and depth images.
 """
 
 import os
+import random
 import numpy as np
 from PIL import Image
 import torch
@@ -283,6 +284,22 @@ class SUNRGBDDataset(Dataset):
         return distribution
 
 
+class _WorkerInitFn:
+    """
+    Callable class for DataLoader worker initialization.
+
+    This is a class instead of a nested function to allow pickling
+    for multiprocessing when num_workers > 0.
+    """
+    def __init__(self, seed: int):
+        self.seed = seed
+
+    def __call__(self, worker_id: int):
+        worker_seed = self.seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+
 def get_sunrgbd_dataloaders(
     data_root='data/sunrgbd_15',
     batch_size=32,
@@ -330,14 +347,7 @@ def get_sunrgbd_dataloaders(
     generator = None
 
     if seed is not None:
-        # Create worker init function for reproducible workers
-        def worker_init_fn(worker_id):
-            import numpy as np
-            import random
-            worker_seed = seed + worker_id
-            np.random.seed(worker_seed)
-            random.seed(worker_seed)
-
+        worker_init_fn = _WorkerInitFn(seed)
         generator = torch.Generator().manual_seed(seed)
 
     # Create dataloaders

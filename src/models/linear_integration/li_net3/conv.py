@@ -404,17 +404,15 @@ class LIConv2d(_LIConvNd):
             integrated_from_prev = 0
 
         # Integration step: combine RAW stream outputs using 1x1 convs (soma integrates dendritic signals)
-        # Key difference: Use stream_outputs_raw (without bias) instead of stream_outputs (with bias)
-        integrated_from_streams = []
+        # Key difference from Original: Use stream_outputs_raw (without bias) instead of stream_outputs (with bias)
+        # Use sequential addition (not sum()) to match Original's floating-point behavior
+        integrated_out = integrated_from_prev
         for stream_out_raw, integration_weight in zip(stream_outputs_raw, integration_from_streams_weights):
             integrated_contrib = F.conv2d(
                 stream_out_raw, integration_weight, None,  # Integrate RAW dendritic signals
                 stride=1, padding=0  # 1x1 conv, stride=1 (already spatially aligned)
             )
-            integrated_from_streams.append(integrated_contrib)
-
-        # Combine all contributions to create integrated output
-        integrated_out = integrated_from_prev + sum(integrated_from_streams)
+            integrated_out = integrated_out + integrated_contrib
 
         # Add integrated bias (soma's firing threshold)
         # This is the ONLY bias for integration, representing the membrane potential threshold
@@ -439,7 +437,42 @@ class LIConv2d(_LIConvNd):
             stream_biases_list,
             self.integrated_bias
         )
-    
+
+    def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:
+        """
+        Forward pass through a single stream pathway only.
+
+        This method processes ONLY the specified stream without processing other streams
+        or the integrated stream. Used for stream monitoring during training to avoid
+        running forward passes with dummy/zero data for other streams.
+
+        Args:
+            stream_idx: Index of the stream to forward (0-indexed)
+            stream_input: The input tensor for this stream
+
+        Returns:
+            The convolution output for this stream only (with bias if applicable)
+        """
+        stream_weight = self.stream_weights[stream_idx]
+        stream_bias = self.stream_biases[stream_idx] if self.stream_biases is not None else None
+
+        # Compute conv output with bias (matching main forward)
+        if self.padding_mode != "zeros":
+            return F.conv2d(
+                F.pad(
+                    stream_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
+                ),
+                stream_weight,
+                stream_bias,
+                self.stride,
+                _pair(0),
+                self.dilation,
+                self.groups,
+            )
+        else:
+            return F.conv2d(
+                stream_input, stream_weight, stream_bias, self.stride, self.padding, self.dilation, self.groups
+            )
 
 
 class _LINormBase(nn.Module):
@@ -808,3 +841,43 @@ class LIBatchNorm2d(_LIBatchNorm):
         """Check input dimensions - same as BatchNorm2d."""
         if input.dim() != 4:
             raise ValueError(f"expected 4D input (got {input.dim()}D input)")
+
+    def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:
+        """
+        Forward pass through a single stream pathway only.
+
+        This method processes ONLY the specified stream without affecting other streams'
+        running statistics. Used for stream monitoring during training to avoid
+        corrupting BN stats for other streams.
+
+        Args:
+            stream_idx: Index of the stream to forward (0-indexed)
+            stream_input: The input tensor for this stream
+
+        Returns:
+            The batch-normalized output for this stream
+        """
+        self._check_input_dim(stream_input)
+
+        # Compute exponential_average_factor for single-stream forward
+        if self.momentum is None:
+            exponential_average_factor = 0.0
+        else:
+            exponential_average_factor = self.momentum
+
+        if self.training and self.track_running_stats:
+            if self.num_batches_tracked is not None:
+                self.num_batches_tracked.add_(1)
+                if self.momentum is None:
+                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+                else:
+                    exponential_average_factor = self.momentum
+
+        return self._forward_single_pathway(
+            stream_input,
+            getattr(self, f"stream{stream_idx}_running_mean"),
+            getattr(self, f"stream{stream_idx}_running_var"),
+            self.stream_weights[stream_idx] if self.affine else None,
+            self.stream_biases[stream_idx] if self.affine else None,
+            exponential_average_factor,
+        )

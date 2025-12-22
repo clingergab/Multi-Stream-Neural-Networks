@@ -91,6 +91,35 @@ def get_worker_seed(worker_id: int, base_seed: int) -> int:
     return base_seed + worker_id
 
 
+class WorkerInitFn:
+    """
+    Callable class for DataLoader worker initialization.
+
+    This is a class instead of a nested function to allow pickling
+    for multiprocessing when num_workers > 0.
+
+    Example:
+        >>> from src.utils.seed import set_seed, WorkerInitFn
+        >>>
+        >>> set_seed(42)
+        >>> worker_init_fn = WorkerInitFn(42)
+        >>>
+        >>> train_loader = DataLoader(
+        ...     dataset, batch_size=32, num_workers=4, shuffle=True,
+        ...     worker_init_fn=worker_init_fn,
+        ...     generator=torch.Generator().manual_seed(42)
+        ... )
+    """
+
+    def __init__(self, base_seed: int):
+        self.base_seed = base_seed
+
+    def __call__(self, worker_id: int):
+        worker_seed = get_worker_seed(worker_id, self.base_seed)
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+
 def make_reproducible_dataloader(base_seed: int):
     """
     Create a worker_init_fn for reproducible DataLoader.
@@ -99,7 +128,7 @@ def make_reproducible_dataloader(base_seed: int):
         base_seed: Base random seed
 
     Returns:
-        worker_init_fn function to pass to DataLoader
+        WorkerInitFn instance to pass to DataLoader
 
     Example:
         >>> from src.utils.seed import set_seed, make_reproducible_dataloader
@@ -113,9 +142,4 @@ def make_reproducible_dataloader(base_seed: int):
         ...     generator=torch.Generator().manual_seed(42)
         ... )
     """
-    def worker_init_fn(worker_id):
-        worker_seed = get_worker_seed(worker_id, base_seed)
-        np.random.seed(worker_seed)
-        random.seed(worker_seed)
-
-    return worker_init_fn
+    return WorkerInitFn(base_seed)

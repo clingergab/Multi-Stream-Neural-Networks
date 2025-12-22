@@ -1267,8 +1267,14 @@ class LINet(BaseModel):
             # This happens AFTER main optimizer.step() so auxiliary classifiers can learn independently
             # Note: Full gradients used (no scaling) for accurate monitoring
             if stream_monitoring:
-                # === TRAINING PHASE: Train auxiliary classifiers ===
-                # Forward through stream pathways
+                # === STREAM MONITORING: Pure observation without side effects ===
+                # CRITICAL: Use eval mode during stream pathway forwards to prevent
+                # any modification to BN running stats. Monitoring should be pure
+                # observation - it must not affect the main model's training dynamics.
+                was_training = self.training
+                self.eval()  # Prevent BN stats updates during monitoring
+
+                # Forward through stream pathways (no BN stats updates in eval mode)
                 stream1_features = self._forward_stream1_pathway(stream1_batch)
                 stream2_features = self._forward_stream2_pathway(stream2_batch)
 
@@ -1283,6 +1289,10 @@ class LINet(BaseModel):
                 # Compute auxiliary losses (full gradient, no scaling)
                 stream1_aux_loss = self.criterion(stream1_outputs, targets)
                 stream2_aux_loss = self.criterion(stream2_outputs, targets)
+
+                # Restore training mode for auxiliary classifier backward pass
+                # (fc_stream1/2 don't have BN, so this is safe)
+                self.train(was_training)
 
                 # Backward pass for auxiliary classifiers only (detached features ensure no gradient to streams)
                 # Each stream's classifier learns independently with full gradients
@@ -1304,7 +1314,6 @@ class LINet(BaseModel):
 
                 # === ACCURACY MEASUREMENT PHASE: Calculate stream accuracies ===
                 with torch.no_grad():
-                    was_training = self.training
                     self.eval()  # Disable dropout, use BN running stats
 
                     stream1_features = self._forward_stream1_pathway(stream1_batch)
