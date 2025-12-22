@@ -1715,7 +1715,10 @@ class LINet(BaseModel):
         loss_dict = {'full_model': avg_full_loss}
         for i in range(self.num_streams):
             loss_dict[f'stream{i}_only'] = avg_stream_losses[i]
+            # Contribution = ratio of stream loss to full model loss (lower is better)
+            loss_dict[f'stream{i}_contribution'] = avg_stream_losses[i] / avg_full_loss if avg_full_loss > 0 else 0
         loss_dict['integrated_only'] = avg_integrated_loss
+        loss_dict['integrated_contribution'] = avg_integrated_loss / avg_full_loss if avg_full_loss > 0 else 0
 
         # Build feature norms dictionary
         feature_norms_dict = {}
