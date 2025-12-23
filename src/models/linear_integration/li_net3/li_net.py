@@ -183,12 +183,18 @@ class LINet(BaseModel):
         # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
         if zero_init_residual:
             for m in self.modules():
-                if isinstance(m, LIBottleneck) and hasattr(m.bn3, 'integrated_bn'):
+                if isinstance(m, LIBottleneck):
+                    # Zero-init all stream BN weights
+                    for stream_weight in m.bn3.stream_weights:
+                        nn.init.constant_(stream_weight, 0)
                     # Zero-init integrated stream's last BN weight
-                    nn.init.constant_(m.bn3.integrated_bn.weight, 0)
-                elif isinstance(m, LIBasicBlock) and hasattr(m.bn2, 'integrated_bn'):
+                    nn.init.constant_(m.bn3.integrated_weight, 0)
+                elif isinstance(m, LIBasicBlock):
+                    # Zero-init all stream BN weights
+                    for stream_weight in m.bn2.stream_weights:
+                        nn.init.constant_(stream_weight, 0)
                     # Zero-init integrated stream's last BN weight
-                    nn.init.constant_(m.bn2.integrated_bn.weight, 0)
+                    nn.init.constant_(m.bn2.integrated_weight, 0)
 
     def _make_layer(
         self,

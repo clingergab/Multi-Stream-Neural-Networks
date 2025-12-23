@@ -1250,11 +1250,17 @@ class DMNet(BaseModel):
             # This happens AFTER main optimizer.step() so auxiliary classifiers can learn independently
             # Note: Full gradients used (no scaling) for accurate monitoring
             if stream_monitoring:
-                # === TRAINING PHASE: Train auxiliary classifiers ===
+                # === STREAM MONITORING: Pure observation without side effects ===
+                # CRITICAL: Use eval mode during stream pathway forwards to prevent
+                # any modification to BN running stats. Monitoring should be pure
+                # observation - it must not affect the main model's training dynamics.
+                was_training = self.training
+                self.eval()  # Prevent BN stats updates during monitoring
+
                 # Forward through stream pathways and compute auxiliary losses
                 aux_losses = []
                 for i in range(self.num_streams):
-                    # Forward through this stream's pathway
+                    # Forward through this stream's pathway (no BN stats updates in eval mode)
                     stream_features = self._forward_stream_pathway(i, stream_batches[i])
 
                     # DETACH features - stops gradient flow to stream weights!
@@ -1266,6 +1272,10 @@ class DMNet(BaseModel):
                     # Compute auxiliary loss (full gradient, no scaling)
                     aux_loss = self.criterion(stream_outputs, targets)
                     aux_losses.append(aux_loss)
+
+                # Restore training mode for auxiliary classifier backward pass
+                # (fc_streams don't have BN, so this is safe)
+                self.train(was_training)
 
                 # Backward pass for auxiliary classifiers only (detached features ensure no gradient to streams)
                 # Each stream's classifier learns independently with full gradients
@@ -1287,7 +1297,6 @@ class DMNet(BaseModel):
 
                 # === ACCURACY MEASUREMENT PHASE: Calculate stream accuracies ===
                 with torch.no_grad():
-                    was_training = self.training
                     self.eval()  # Disable dropout, use BN running stats
 
                     for i in range(self.num_streams):
@@ -1529,6 +1538,9 @@ class DMNet(BaseModel):
         """
         Forward pass through a single stream pathway.
 
+        Uses dedicated forward_stream() methods on each layer to process ONLY the
+        specified stream without corrupting BN running stats for other streams.
+
         Args:
             stream_idx: Index of the stream to forward through (0-indexed)
             stream_input: The stream input tensor [batch_size, channels, height, width]
@@ -1536,44 +1548,20 @@ class DMNet(BaseModel):
         Returns:
             The stream pathway output tensor (flattened features) [batch_size, feature_dim]
         """
-        # Create dummy inputs for other streams (they won't be used but needed for layer signature)
-        # We'll only extract the output for the stream we care about
-        batch_size = stream_input.size(0)
+        # Use forward_stream() methods that process ONLY this stream
+        # This avoids corrupting BN running stats for other streams
+        stream_x = self.conv1.forward_stream(stream_idx, stream_input)
+        stream_x = self.bn1.forward_stream(stream_idx, stream_x)
+        stream_x = self.relu.forward_stream(stream_idx, stream_x)
+        stream_x = self.maxpool.forward_stream(stream_idx, stream_x)
 
-        # Create list of None placeholders, then insert our stream at the correct index
-        stream_inputs = [None] * self.num_streams
-        stream_inputs[stream_idx] = stream_input
+        # ResNet layers (each layer has forward_stream that processes all blocks)
+        stream_x = self.layer1.forward_stream(stream_idx, stream_x)
+        stream_x = self.layer2.forward_stream(stream_idx, stream_x)
+        stream_x = self.layer3.forward_stream(stream_idx, stream_x)
+        stream_x = self.layer4.forward_stream(stream_idx, stream_x)
 
-        # For other streams, create dummy tensors with correct shape
-        # These won't affect computation for our target stream
-        for i in range(self.num_streams):
-            if i != stream_idx:
-                # Get expected input channels for this stream
-                dummy_channels = self.stream_input_channels[i]
-                # Get spatial dimensions from our target stream
-                h, w = stream_input.size(2), stream_input.size(3)
-                stream_inputs[i] = torch.zeros(
-                    batch_size, dummy_channels, h, w,
-                    device=stream_input.device, dtype=stream_input.dtype
-                )
-
-        # Forward through all layers (they process all streams but we only use one)
-        # No integrated stream initially
-        stream_outputs, _ = self.conv1(stream_inputs, None)
-        stream_outputs, _ = self.bn1(stream_outputs, None)
-        stream_outputs, _ = self.relu(stream_outputs, None)
-        stream_outputs, _ = self.maxpool(stream_outputs, None)
-
-        # ResNet layers (no integrated stream for monitoring)
-        stream_outputs, _ = self.layer1(stream_outputs, None)
-        stream_outputs, _ = self.layer2(stream_outputs, None)
-        stream_outputs, _ = self.layer3(stream_outputs, None)
-        stream_outputs, _ = self.layer4(stream_outputs, None)
-
-        # Extract only the target stream's output
-        stream_x = stream_outputs[stream_idx]
-
-        # Global average pooling
+        # Global average pooling (standard nn.AdaptiveAvgPool2d)
         stream_x = self.avgpool(stream_x)
 
         # Flatten

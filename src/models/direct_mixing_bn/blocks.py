@@ -148,6 +148,37 @@ class DMBasicBlock(nn.Module):
 
         return stream_outputs, integrated
 
+    def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:
+        """
+        Forward pass for a single stream through the BasicBlock.
+
+        This processes only the specified stream without affecting other streams'
+        BN running statistics. Used for stream monitoring.
+        """
+        identity = stream_input
+
+        # First conv block
+        out = self.conv1.forward_stream(stream_idx, stream_input)
+        out = self.bn1.forward_stream(stream_idx, out)
+        out = self.relu.forward_stream(stream_idx, out)
+
+        # Second conv block
+        out = self.conv2.forward_stream(stream_idx, out)
+        out = self.bn2.forward_stream(stream_idx, out)
+
+        # Apply downsampling to identity if needed
+        if self.downsample is not None:
+            identity = self.downsample.forward_stream(stream_idx, identity)
+
+        # Residual connection
+        out = out + identity
+
+        # Final activation
+        out = self.relu.forward_stream(stream_idx, out)
+
+        return out
+
+
 class DMBottleneck(nn.Module):
     """
     Direct Mixing version of ResNet Bottleneck block.
@@ -250,3 +281,36 @@ class DMBottleneck(nn.Module):
         stream_outputs, integrated = self.relu(stream_outputs, integrated)
 
         return stream_outputs, integrated
+
+    def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:
+        """
+        Forward pass for a single stream through the Bottleneck block.
+
+        This processes only the specified stream without affecting other streams'
+        BN running statistics. Used for stream monitoring.
+        """
+        identity = stream_input
+
+        # Three conv blocks
+        out = self.conv1.forward_stream(stream_idx, stream_input)
+        out = self.bn1.forward_stream(stream_idx, out)
+        out = self.relu.forward_stream(stream_idx, out)
+
+        out = self.conv2.forward_stream(stream_idx, out)
+        out = self.bn2.forward_stream(stream_idx, out)
+        out = self.relu.forward_stream(stream_idx, out)
+
+        out = self.conv3.forward_stream(stream_idx, out)
+        out = self.bn3.forward_stream(stream_idx, out)
+
+        # Apply downsampling to identity if needed
+        if self.downsample is not None:
+            identity = self.downsample.forward_stream(stream_idx, identity)
+
+        # Residual connection
+        out = out + identity
+
+        # Final activation
+        out = self.relu.forward_stream(stream_idx, out)
+
+        return out

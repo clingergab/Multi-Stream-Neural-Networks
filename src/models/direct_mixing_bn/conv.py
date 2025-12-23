@@ -416,14 +416,12 @@ class DMConv2d(_DMConvNd):
         # Direct Mixing: combine RAW stream outputs using SCALAR multiplication
         # Key difference: Use stream_outputs_raw (without bias) instead of stream_outputs (with bias)
         # Each stream_scalar_i is a single learnable scalar that scales the entire stream output
-        integrated_from_streams = []
+        # MEMORY OPTIMIZATION: Accumulate directly instead of building list of intermediate tensors
+        integrated_out = integrated_from_prev
         for stream_out_raw, stream_scalar in zip(stream_outputs_raw, stream_mixing_scalars):
             # Scalar multiplication: stream_scalar · stream_out_raw (integrate RAW dendritic signals)
-            integrated_contrib = stream_scalar * stream_out_raw
-            integrated_from_streams.append(integrated_contrib)
-
-        # Combine all contributions to create integrated output
-        integrated_out = integrated_from_prev + sum(integrated_from_streams)
+            # Accumulate directly: integrated_out = integrated_out + (stream_scalar * stream_out_raw)
+            integrated_out = integrated_out + stream_scalar * stream_out_raw
 
         # Add integrated bias (soma's firing threshold)
         # This is the ONLY bias for integration, representing the membrane potential threshold
@@ -449,7 +447,42 @@ class DMConv2d(_DMConvNd):
             stream_biases_list,
             self.integrated_bias
         )
-    
+
+    def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:
+        """
+        Forward pass through a single stream pathway only.
+
+        This method processes ONLY the specified stream without processing other streams
+        or the integrated stream. Used for stream monitoring during training to avoid
+        running forward passes with dummy/zero data for other streams.
+
+        Args:
+            stream_idx: Index of the stream to forward (0-indexed)
+            stream_input: The input tensor for this stream
+
+        Returns:
+            The convolution output for this stream only (with bias if applicable)
+        """
+        stream_weight = self.stream_weights[stream_idx]
+        stream_bias = self.stream_biases[stream_idx] if self.stream_biases is not None else None
+
+        # Compute conv output with bias (matching main forward)
+        if self.padding_mode != "zeros":
+            return F.conv2d(
+                F.pad(
+                    stream_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
+                ),
+                stream_weight,
+                stream_bias,
+                self.stride,
+                _pair(0),
+                self.dilation,
+                self.groups,
+            )
+        else:
+            return F.conv2d(
+                stream_input, stream_weight, stream_bias, self.stride, self.padding, self.dilation, self.groups
+            )
 
 
 class _DMNormBase(nn.Module):
@@ -657,6 +690,21 @@ class _DMBatchNorm(_DMNormBase):
         if integrated_input is not None:
             self._check_input_dim(integrated_input)
 
+        # Compute exponential_average_factor ONCE per forward pass (not per stream!)
+        # This fixes a bug where num_batches_tracked was incremented N+1 times per batch
+        if self.momentum is None:
+            exponential_average_factor = 0.0
+        else:
+            exponential_average_factor = self.momentum
+
+        if self.training and self.track_running_stats:
+            if self.num_batches_tracked is not None:
+                self.num_batches_tracked.add_(1)  # Increment ONCE per forward pass
+                if self.momentum is None:  # use cumulative moving average
+                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+                else:  # use exponential moving average
+                    exponential_average_factor = self.momentum
+
         # Process all stream pathways using the exact _BatchNorm algorithm
         stream_outputs = []
         for i, stream_input in enumerate(stream_inputs):
@@ -666,7 +714,7 @@ class _DMBatchNorm(_DMNormBase):
                 getattr(self, f"stream{i}_running_var"),
                 self.stream_weights[i] if self.affine else None,
                 self.stream_biases[i] if self.affine else None,
-                self.num_batches_tracked,
+                exponential_average_factor,
             )
             stream_outputs.append(stream_out)
 
@@ -678,13 +726,13 @@ class _DMBatchNorm(_DMNormBase):
                 self.integrated_running_var,
                 self.integrated_weight,
                 self.integrated_bias,
-                self.num_batches_tracked,
+                exponential_average_factor,
             )
         else:
             integrated_out = None
 
         return stream_outputs, integrated_out
-    
+
     def _forward_single_pathway(
         self,
         input: Tensor,
@@ -692,42 +740,22 @@ class _DMBatchNorm(_DMNormBase):
         running_var: Optional[Tensor],
         weight: Optional[Tensor],
         bias: Optional[Tensor],
-        num_batches_tracked: Optional[Tensor],
+        exponential_average_factor: float,
     ) -> Tensor:
         """
-        Forward pass for a single pathway - exact copy of _BatchNorm.forward() algorithm
-        """
-        # exponential_average_factor is set to self.momentum
-        # (when it is available) only so that it gets updated
-        # in ONNX graph when this node is exported to ONNX.
-        if self.momentum is None:
-            exponential_average_factor = 0.0
-        else:
-            exponential_average_factor = self.momentum
+        Forward pass for a single pathway - applies batch normalization.
 
-        if self.training and self.track_running_stats:
-            # TODO: if statement only here to tell the jit to skip emitting this when it is None
-            if num_batches_tracked is not None:  # type: ignore[has-type]
-                num_batches_tracked.add_(1)  # type: ignore[has-type]
-                if self.momentum is None:  # use cumulative moving average
-                    exponential_average_factor = 1.0 / float(num_batches_tracked)
-                else:  # use exponential moving average
-                    exponential_average_factor = self.momentum
-
-        r"""
-        Decide whether the mini-batch stats should be used for normalization rather than the buffers.
-        Mini-batch stats are used in training mode, and in eval mode when buffers are None.
+        Note: exponential_average_factor is pre-computed in forward() to ensure
+        num_batches_tracked is only incremented once per forward pass, not per stream.
         """
+        # Decide whether the mini-batch stats should be used for normalization rather than the buffers.
+        # Mini-batch stats are used in training mode, and in eval mode when buffers are None.
         if self.training:
             bn_training = True
         else:
             bn_training = (running_mean is None) and (running_var is None)
 
-        r"""
-        Buffers are only updated if they are to be tracked and we are in training mode. Thus they only need to be
-        passed when the update should occur (i.e. in training mode when they are tracked), or when buffer stats are
-        used for normalization (i.e. in eval mode when buffers are not None).
-        """
+        # Buffers are only updated if they are to be tracked and we are in training mode.
         return F.batch_norm(
             input,
             # If buffers are not to be tracked, ensure that they won't be updated
@@ -818,8 +846,48 @@ class DMBatchNorm2d(_DMBatchNorm):
         >>> integrated_input = torch.randn(20, 64, 35, 45)
         >>> stream_outputs, integrated_output = m(stream_inputs, integrated_input)
     """
-    
+
     def _check_input_dim(self, input):
         """Check input dimensions - same as BatchNorm2d."""
         if input.dim() != 4:
             raise ValueError(f"expected 4D input (got {input.dim()}D input)")
+
+    def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:
+        """
+        Forward pass through a single stream pathway only.
+
+        This method processes ONLY the specified stream without affecting other streams'
+        running statistics. Used for stream monitoring during training to avoid
+        corrupting BN stats for other streams.
+
+        Args:
+            stream_idx: Index of the stream to forward (0-indexed)
+            stream_input: The input tensor for this stream
+
+        Returns:
+            The batch-normalized output for this stream
+        """
+        self._check_input_dim(stream_input)
+
+        # Compute exponential_average_factor for single-stream forward
+        if self.momentum is None:
+            exponential_average_factor = 0.0
+        else:
+            exponential_average_factor = self.momentum
+
+        if self.training and self.track_running_stats:
+            if self.num_batches_tracked is not None:
+                self.num_batches_tracked.add_(1)
+                if self.momentum is None:
+                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+                else:
+                    exponential_average_factor = self.momentum
+
+        return self._forward_single_pathway(
+            stream_input,
+            getattr(self, f"stream{stream_idx}_running_mean"),
+            getattr(self, f"stream{stream_idx}_running_var"),
+            self.stream_weights[stream_idx] if self.affine else None,
+            self.stream_biases[stream_idx] if self.affine else None,
+            exponential_average_factor,
+        )

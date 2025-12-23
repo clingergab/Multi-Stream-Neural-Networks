@@ -180,14 +180,21 @@ class DMNet(BaseModel):
         # Zero-initialize the last BN in each residual branch,
         # so that the residual branch starts with zeros, and each residual block behaves like an identity.
         # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
+        # NOTE: direct_mixing_bn has BN for both streams AND integrated, so zero-init all
         if zero_init_residual:
             for m in self.modules():
-                if isinstance(m, DMBottleneck) and hasattr(m.bn3, 'integrated_bn'):
+                if isinstance(m, DMBottleneck):
+                    # Zero-init last BN weight for each stream pathway
+                    for stream_weight in m.bn3.stream_weights:
+                        nn.init.constant_(stream_weight, 0)
                     # Zero-init integrated stream's last BN weight
-                    nn.init.constant_(m.bn3.integrated_bn.weight, 0)
-                elif isinstance(m, DMBasicBlock) and hasattr(m.bn2, 'integrated_bn'):
+                    nn.init.constant_(m.bn3.integrated_weight, 0)
+                elif isinstance(m, DMBasicBlock):
+                    # Zero-init last BN weight for each stream pathway
+                    for stream_weight in m.bn2.stream_weights:
+                        nn.init.constant_(stream_weight, 0)
                     # Zero-init integrated stream's last BN weight
-                    nn.init.constant_(m.bn2.integrated_bn.weight, 0)
+                    nn.init.constant_(m.bn2.integrated_weight, 0)
 
     def _make_layer(
         self,
@@ -631,7 +638,7 @@ class DMNet(BaseModel):
         val_loader: Optional[DataLoader] = None,
         epochs: int = 10,
         callbacks: Optional[list] = None,
-        verbose: bool = True,
+        verbose: bool = False,
         save_path: Optional[str] = None,
         early_stopping: bool = False,
         patience: int = 10,
@@ -1247,11 +1254,17 @@ class DMNet(BaseModel):
             # This happens AFTER main optimizer.step() so auxiliary classifiers can learn independently
             # Note: Full gradients used (no scaling) for accurate monitoring
             if stream_monitoring:
-                # === TRAINING PHASE: Train auxiliary classifiers ===
+                # === STREAM MONITORING: Pure observation without side effects ===
+                # CRITICAL: Use eval mode during stream pathway forwards to prevent
+                # any modification to BN running stats. Monitoring should be pure
+                # observation - it must not affect the main model's training dynamics.
+                was_training = self.training
+                self.eval()  # Prevent BN stats updates during monitoring
+
                 # Forward through stream pathways and compute auxiliary losses
                 aux_losses = []
                 for i in range(self.num_streams):
-                    # Forward through this stream's pathway
+                    # Forward through this stream's pathway (no BN stats updates in eval mode)
                     stream_features = self._forward_stream_pathway(i, stream_batches[i])
 
                     # DETACH features - stops gradient flow to stream weights!
@@ -1263,6 +1276,10 @@ class DMNet(BaseModel):
                     # Compute auxiliary loss (full gradient, no scaling)
                     aux_loss = self.criterion(stream_outputs, targets)
                     aux_losses.append(aux_loss)
+
+                # Restore training mode for auxiliary classifier backward pass
+                # (fc_streams don't have BN, so this is safe)
+                self.train(was_training)
 
                 # Backward pass for auxiliary classifiers only (detached features ensure no gradient to streams)
                 # Each stream's classifier learns independently with full gradients
@@ -1284,7 +1301,6 @@ class DMNet(BaseModel):
 
                 # === ACCURACY MEASUREMENT PHASE: Calculate stream accuracies ===
                 with torch.no_grad():
-                    was_training = self.training
                     self.eval()  # Disable dropout, use BN running stats
 
                     for i in range(self.num_streams):
@@ -1526,6 +1542,9 @@ class DMNet(BaseModel):
         """
         Forward pass through a single stream pathway.
 
+        Uses dedicated forward_stream() methods on each layer to process ONLY the
+        specified stream without corrupting BN running stats for other streams.
+
         Args:
             stream_idx: Index of the stream to forward through (0-indexed)
             stream_input: The stream input tensor [batch_size, channels, height, width]
@@ -1533,44 +1552,20 @@ class DMNet(BaseModel):
         Returns:
             The stream pathway output tensor (flattened features) [batch_size, feature_dim]
         """
-        # Create dummy inputs for other streams (they won't be used but needed for layer signature)
-        # We'll only extract the output for the stream we care about
-        batch_size = stream_input.size(0)
+        # Use forward_stream() methods that process ONLY this stream
+        # This avoids corrupting BN running stats for other streams
+        stream_x = self.conv1.forward_stream(stream_idx, stream_input)
+        stream_x = self.bn1.forward_stream(stream_idx, stream_x)
+        stream_x = self.relu.forward_stream(stream_idx, stream_x)
+        stream_x = self.maxpool.forward_stream(stream_idx, stream_x)
 
-        # Create list of None placeholders, then insert our stream at the correct index
-        stream_inputs = [None] * self.num_streams
-        stream_inputs[stream_idx] = stream_input
+        # ResNet layers (each layer has forward_stream that processes all blocks)
+        stream_x = self.layer1.forward_stream(stream_idx, stream_x)
+        stream_x = self.layer2.forward_stream(stream_idx, stream_x)
+        stream_x = self.layer3.forward_stream(stream_idx, stream_x)
+        stream_x = self.layer4.forward_stream(stream_idx, stream_x)
 
-        # For other streams, create dummy tensors with correct shape
-        # These won't affect computation for our target stream
-        for i in range(self.num_streams):
-            if i != stream_idx:
-                # Get expected input channels for this stream
-                dummy_channels = self.stream_input_channels[i]
-                # Get spatial dimensions from our target stream
-                h, w = stream_input.size(2), stream_input.size(3)
-                stream_inputs[i] = torch.zeros(
-                    batch_size, dummy_channels, h, w,
-                    device=stream_input.device, dtype=stream_input.dtype
-                )
-
-        # Forward through all layers (they process all streams but we only use one)
-        # No integrated stream initially
-        stream_outputs, _ = self.conv1(stream_inputs, None)
-        stream_outputs, _ = self.bn1(stream_outputs, None)
-        stream_outputs, _ = self.relu(stream_outputs, None)
-        stream_outputs, _ = self.maxpool(stream_outputs, None)
-
-        # ResNet layers (no integrated stream for monitoring)
-        stream_outputs, _ = self.layer1(stream_outputs, None)
-        stream_outputs, _ = self.layer2(stream_outputs, None)
-        stream_outputs, _ = self.layer3(stream_outputs, None)
-        stream_outputs, _ = self.layer4(stream_outputs, None)
-
-        # Extract only the target stream's output
-        stream_x = stream_outputs[stream_idx]
-
-        # Global average pooling
+        # Global average pooling (standard nn.AdaptiveAvgPool2d)
         stream_x = self.avgpool(stream_x)
 
         # Flatten
@@ -1735,18 +1730,23 @@ class DMNet(BaseModel):
         """
         Analyze the weight distributions and magnitudes across all N stream pathways + integrated pathway.
 
+        For direct_mixing_conv:
+        - Stream weights: Full convolution kernels
+        - Integrated_weight: Conv1x1 for integrated pathway recurrence
+        - Scalar mixing weights: α_i (stream contribution), γ (recurrent connection)
+
         Returns:
             Dictionary containing weight analysis for all stream pathways and integrated pathway
         """
         # Initialize dictionaries for N streams + integrated
         stream_weights = [{} for _ in range(self.num_streams)]
         integrated_weights = {}
-        integration_weights = {}
+        scalar_mixing_weights = {}
 
-        # Analyze LI layers - look for modules with stream_weights and integrated_weight
+        # Analyze DM layers - look for modules with stream_weights and integrated_weight
         for name, module in self.named_modules():
             if hasattr(module, 'stream_weights') and hasattr(module, 'integrated_weight'):
-                # LIConv2d modules
+                # DMConv2d modules
                 integrated_weight = module.integrated_weight
 
                 # Analyze each stream's weights
@@ -1766,16 +1766,22 @@ class DMNet(BaseModel):
                     'shape': list(integrated_weight.shape)
                 }
 
-                # Integration weights (from all streams to integrated)
-                if hasattr(module, 'integration_from_streams'):
-                    integration_weights[name] = {}
+                # Analyze scalar mixing weights (α and γ)
+                if hasattr(module, 'stream_mixing_scalars'):
+                    scalar_mixing_weights[name] = {}
                     for i in range(self.num_streams):
-                        int_from_stream = module.integration_from_streams[i]
-                        integration_weights[name][f'from_stream{i}'] = {
-                            'mean': int_from_stream.mean().item(),
-                            'std': int_from_stream.std().item(),
-                            'norm': torch.norm(int_from_stream).item(),
-                            'shape': list(int_from_stream.shape)
+                        alpha_i = module.stream_mixing_scalars[i]
+                        scalar_mixing_weights[name][f'alpha_{i}'] = {
+                            'value': alpha_i.item(),
+                            'interpretation': f'Stream {i} contribution weight'
+                        }
+
+                    # Recurrent connection scalar (γ)
+                    if hasattr(module, 'integrated_mixing_scalar'):
+                        gamma = module.integrated_mixing_scalar
+                        scalar_mixing_weights[name]['gamma'] = {
+                            'value': gamma.item(),
+                            'interpretation': 'Recurrent connection weight (integrated prev)'
                         }
 
         # Calculate overall statistics for each stream
@@ -1802,8 +1808,8 @@ class DMNet(BaseModel):
             'num_layers': len(integrated_weights)
         }
 
-        # Add integration weights
-        result['integration_weights'] = integration_weights
+        # Add scalar mixing weights analysis
+        result['scalar_mixing_weights'] = scalar_mixing_weights
 
         # Ratio analysis - compare streams pairwise and integrated to first stream
         ratio_analysis = {}
@@ -1942,8 +1948,9 @@ class DMNet(BaseModel):
         """
         Calculate how much each input stream contributes to the integrated stream.
 
-        This method measures architectural contribution by analyzing integration weight magnitudes:
-        ||integration_from_streams[i]|| for i in 0..N-1
+        For direct_mixing_conv, this analyzes scalar mixing weights (α_i):
+        - Each stream has a learned scalar α_i that controls its contribution
+        - Integration formula: integrated = Σ(α_i · stream_i) + γ · Conv1x1(integrated_prev)
 
         This directly answers: "How much does the model architecture favor each stream?"
 
@@ -1957,44 +1964,42 @@ class DMNet(BaseModel):
 
         Returns:
             Dictionary containing:
-            - stream{i}_contribution: float (0-1) - proportion from stream i based on integration weights
-            - raw_norms: dict with actual weight norms for each stream
+            - stream{i}_contribution: float (0-1) - proportion from stream i based on scalar mixing weights
+            - raw_scalars: dict with actual scalar values for each stream
         """
-        # Analyze integration weight magnitudes across all LIConv2d layers
-        stream_weight_norms = [0.0] * self.num_streams
+        # Analyze scalar mixing weights (α_i) across all DMConv2d layers
+        stream_scalar_sums = [0.0] * self.num_streams
 
-        for name, param in self.named_parameters():
-            # Check if this is an integration weight parameter
-            if 'integration_from_streams' in name:
-                # Extract stream index from parameter name
-                # Parameter names look like: "layer.integration_from_streams.0", "layer.integration_from_streams.1", etc.
+        for name, module in self.named_modules():
+            if hasattr(module, 'stream_mixing_scalars'):
+                # DMConv2d layer - extract α_i scalars
                 for i in range(self.num_streams):
-                    if f'integration_from_streams.{i}' in name:
-                        stream_weight_norms[i] += torch.norm(param).item()
-                        break
+                    alpha_i = module.stream_mixing_scalars[i]
+                    # Use absolute value since sign doesn't affect magnitude of contribution
+                    stream_scalar_sums[i] += abs(alpha_i.item())
 
-        total_weight_norm = sum(stream_weight_norms)
+        total_scalar_sum = sum(stream_scalar_sums)
 
         # Build result dictionary
         result = {
-            'method': 'integration_weights',
-            'raw_norms': {'total': total_weight_norm},
+            'method': 'scalar_mixing_weights',
+            'raw_scalars': {'total': total_scalar_sum},
             'interpretation': {}
         }
 
         # Add contribution and interpretation for each stream
         for i in range(self.num_streams):
             result[f'stream{i}_contribution'] = (
-                stream_weight_norms[i] / total_weight_norm if total_weight_norm > 0 else 1.0 / self.num_streams
+                stream_scalar_sums[i] / total_scalar_sum if total_scalar_sum > 0 else 1.0 / self.num_streams
             )
-            result['raw_norms'][f'stream{i}_integration_weights'] = stream_weight_norms[i]
+            result['raw_scalars'][f'stream{i}_alpha_sum'] = stream_scalar_sums[i]
             result['interpretation'][f'stream{i}_percentage'] = (
-                f"{100 * stream_weight_norms[i] / total_weight_norm:.1f}%" if total_weight_norm > 0
+                f"{100 * stream_scalar_sums[i] / total_scalar_sum:.1f}%" if total_scalar_sum > 0
                 else f"{100.0 / self.num_streams:.1f}%"
             )
 
         result['note'] = (
-            'Measures architectural contribution based on integration weight magnitudes. '
+            'Measures architectural contribution based on scalar mixing weight (α_i) magnitudes. '
             f'Reflects how the trained model structurally combines the {self.num_streams} input streams.'
         )
 

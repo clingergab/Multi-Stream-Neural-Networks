@@ -176,6 +176,18 @@ class DMMaxPool2d(_DMMaxPoolNd):
 
         return stream_outputs, integrated_output
 
+    def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:
+        """Apply max pooling to a single stream pathway."""
+        return F.max_pool2d(
+            stream_input,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation,
+            ceil_mode=self.ceil_mode,
+            return_indices=self.return_indices,
+        )
+
 
 class _DMAdaptiveAvgPoolNd(Module):
     """
