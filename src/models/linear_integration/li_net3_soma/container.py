@@ -64,6 +64,10 @@ class LIReLU(nn.Module):
 
         return stream_outputs, integrated_out
 
+    def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:
+        """Apply ReLU to a single stream pathway."""
+        return F.relu(stream_input, inplace=self.inplace)
+
     def extra_repr(self) -> str:
         inplace_str = 'inplace=True' if self.inplace else ''
         return inplace_str
@@ -235,6 +239,20 @@ class LISequential(Module):
         for module in self:
             stream_inputs, integrated_input = module(stream_inputs, integrated_input)
         return stream_inputs, integrated_input
+
+    def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:
+        """
+        Forward pass for a single stream through the sequential container.
+
+        Each module must have a forward_stream method that accepts
+        (stream_idx: int, stream_input: Tensor) and returns Tensor.
+
+        This is used for stream monitoring to avoid corrupting BN stats
+        for other streams.
+        """
+        for module in self:
+            stream_input = module.forward_stream(stream_idx, stream_input)
+        return stream_input
 
     def append(self, module: Module) -> "LISequential":
         r"""Append a given module to the end.
