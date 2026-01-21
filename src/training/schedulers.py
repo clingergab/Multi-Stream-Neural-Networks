@@ -208,7 +208,7 @@ class PerGroupSchedulerWrapper:
         )
 
 
-def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_len: int, **scheduler_kwargs):
+def setup_scheduler(optimizer, scheduler_type: str, epochs: int = None, train_loader_len: int = None, **scheduler_kwargs):
     """
     Set up and return the learning rate scheduler based on the scheduler type.
 
@@ -282,21 +282,31 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
                         f"List parameters must have length equal to number of param groups."
                     )
 
-        # Add required parameters with defaults if not provided
-        # Ensures each scheduler gets all required parameters
-        required_params = {
-            'cosine': {'t_max': epochs},
-            'decaying_cosine': {'t_max': epochs},
-            'quadratic_inout': {'t_max': epochs},
-            'cubic_inout': {'t_max': epochs},
-            'cosine_restarts': {'t_0': max(10, epochs // 4)},  # Default: 1/4 of total epochs, min 10
-            'decaying_cosine_restarts': {'t_0': max(10, epochs // 4)},  # Default: 1/4 of total epochs, min 10
+        # Validate required parameters for each scheduler type
+        # Logic: use scheduler-specific param if provided, else fall back to epochs, else error
+        required_param_info = {
+            'cosine': 't_max',
+            'decaying_cosine': 't_max',
+            'quadratic_inout': 't_max',
+            'cubic_inout': 't_max',
+            'cosine_restarts': 't_0',
+            'decaying_cosine_restarts': 't_0',
         }
 
-        if scheduler_type in required_params:
-            for param_name, default_value in required_params[scheduler_type].items():
-                if param_name not in scheduler_kwargs:
-                    scheduler_kwargs[param_name] = default_value
+        if scheduler_type in required_param_info:
+            param_name = required_param_info[scheduler_type]
+            if param_name not in scheduler_kwargs:
+                # Fall back to epochs if available
+                if epochs is not None:
+                    if param_name == 't_max':
+                        scheduler_kwargs['t_max'] = epochs
+                    elif param_name == 't_0':
+                        scheduler_kwargs['t_0'] = max(10, epochs // 4)
+                else:
+                    raise ValueError(
+                        f"Scheduler '{scheduler_type}' requires '{param_name}' parameter. "
+                        f"Either pass '{param_name}' directly or pass 'epochs' as a fallback."
+                    )
 
         scheduler_kwargs_list = []
 
@@ -350,15 +360,39 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
 
     else:
         # Standard single-scheduler path (no per-group parameters)
+        # Helper to get t_max with fallback to epochs
+        def get_t_max():
+            if 't_max' in scheduler_kwargs:
+                return scheduler_kwargs['t_max']
+            elif epochs is not None:
+                return epochs
+            else:
+                raise ValueError(
+                    f"Scheduler '{scheduler_type}' requires 't_max' parameter. "
+                    f"Either pass 't_max' directly or pass 'epochs' as a fallback."
+                )
+
+        # Helper to get t_0 with fallback to epochs
+        def get_t_0():
+            if 't_0' in scheduler_kwargs:
+                return scheduler_kwargs['t_0']
+            elif epochs is not None:
+                return max(10, epochs // 4)
+            else:
+                raise ValueError(
+                    f"Scheduler '{scheduler_type}' requires 't_0' parameter. "
+                    f"Either pass 't_0' directly or pass 'epochs' as a fallback."
+                )
+
         # Create the main scheduler based on type
         if scheduler_type == 'cosine':
             # T_max is in epochs (scheduler steps per epoch, not per batch)
-            t_max = scheduler_kwargs.get('t_max', epochs)
+            t_max = get_t_max()
             eta_min = scheduler_kwargs.get('eta_min', 0)
             main_scheduler = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
         elif scheduler_type == 'decaying_cosine':
             # DecayingCosineAnnealingLR - cosine annealing with dual decay (max and min)
-            t_max = scheduler_kwargs.get('t_max', epochs)
+            t_max = get_t_max()
             eta_min = scheduler_kwargs.get('eta_min', 0)
             max_factor = scheduler_kwargs.get('max_factor', 1.0)
             min_factor = scheduler_kwargs.get('min_factor', 1.0)
@@ -372,7 +406,7 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         elif scheduler_type == 'cosine_restarts':
             # CosineAnnealingWarmRestarts - multiple cycles with warm restarts
             # User always specifies t_0 in EPOCHS (intuitive)
-            t_0_epochs = scheduler_kwargs.get('t_0', 20)  # First cycle length in epochs (user-facing)
+            t_0_epochs = get_t_0()
             t_mult = scheduler_kwargs.get('t_mult', 1)  # Cycle length multiplier (1 = equal cycles)
             eta_min = scheduler_kwargs.get('eta_min', 1e-7)  # Minimum learning rate
             step_per_batch = scheduler_kwargs.get('step_per_batch', False)  # Step per batch or per epoch
@@ -391,7 +425,7 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
         elif scheduler_type == 'decaying_cosine_restarts':
             # DecayingCosineAnnealingWarmRestarts - warm restarts with decaying peak LR
             # User always specifies t_0 in EPOCHS (intuitive)
-            t_0_epochs = scheduler_kwargs.get('t_0', 20)  # First cycle length in epochs (user-facing)
+            t_0_epochs = get_t_0()
             t_mult = scheduler_kwargs.get('t_mult', 1)  # Cycle length multiplier (1 = equal cycles)
             eta_min = scheduler_kwargs.get('eta_min', 1e-7)  # Minimum learning rate
             restart_decay = scheduler_kwargs.get('restart_decay', 0.8)  # Decay factor (0.8 = 80% of previous peak)
@@ -434,12 +468,12 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
             )
         elif scheduler_type == 'quadratic_inout':
             # Quadratic InOut easing - smooth S-curve with quadratic acceleration/deceleration
-            t_max = scheduler_kwargs.get('t_max', epochs)
+            t_max = get_t_max()
             eta_min = scheduler_kwargs.get('eta_min', 0)
             main_scheduler = QuadraticInOutLR(optimizer, T_max=t_max, eta_min=eta_min)
         elif scheduler_type == 'cubic_inout':
             # Cubic InOut easing - very smooth S-curve with cubic acceleration/deceleration
-            t_max = scheduler_kwargs.get('t_max', epochs)
+            t_max = get_t_max()
             eta_min = scheduler_kwargs.get('eta_min', 0)
             main_scheduler = CubicInOutLR(optimizer, T_max=t_max, eta_min=eta_min)
         elif scheduler_type == 'step':
@@ -484,6 +518,7 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int, train_loader_le
                 schedulers=[warmup_scheduler, main_scheduler],
                 milestones=[warmup_epochs]
             )
+
     else:
         # No warmup, use main scheduler directly
         scheduler = main_scheduler
