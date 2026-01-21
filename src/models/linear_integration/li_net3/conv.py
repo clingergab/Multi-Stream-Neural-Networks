@@ -339,7 +339,8 @@ class LIConv2d(_LIConvNd):
         integrated_weight: Optional[Tensor],
         integration_from_streams_weights: list[Tensor],
         stream_biases: list[Optional[Tensor]],
-        integrated_bias: Optional[Tensor]
+        integrated_bias: Optional[Tensor],
+        blanked_mask: Optional[dict[int, Tensor]] = None
     ) -> tuple[list[Tensor], Tensor]:
         """
         Forward pass with biologically-inspired integration.
@@ -351,6 +352,11 @@ class LIConv2d(_LIConvNd):
         - Soma threshold: integrated_bias (neuron's firing threshold)
 
         This separates pathway-specific biases from the integration threshold.
+
+        Args:
+            blanked_mask: Optional per-sample blanking mask for modality dropout.
+                         dict[stream_idx] -> bool tensor [batch_size] where True = blanked.
+                         When a stream is blanked for a sample, its output is zeroed.
         """
         # Process all stream pathways
         # Compute RAW conv outputs (dendritic filtering, no bias)
@@ -383,6 +389,14 @@ class LIConv2d(_LIConvNd):
                 stream_out = stream_out_raw + stream_bias.view(1, -1, 1, 1)
             else:
                 stream_out = stream_out_raw
+
+            # === PER-SAMPLE MASKING: Zero blanked samples for modality dropout ===
+            stream_blanked = blanked_mask.get(i) if blanked_mask else None
+            if stream_blanked is not None and stream_blanked.any():
+                # mask: [batch_size, 1, 1, 1] for broadcasting, 1.0 for active, 0.0 for blanked
+                mask = (~stream_blanked).float().view(-1, 1, 1, 1)
+                stream_out = stream_out * mask
+                stream_out_raw = stream_out_raw * mask  # Critical: zeros for integration
 
             stream_outputs.append(stream_out)  # Biased output for stream pathway
             stream_outputs_raw.append(stream_out_raw)  # Raw output for integration
@@ -421,8 +435,20 @@ class LIConv2d(_LIConvNd):
 
         return stream_outputs, integrated_out
     
-    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
-        """Forward pass through all N convolution streams with Linear Integration."""
+    def forward(
+        self,
+        stream_inputs: list[Tensor],
+        integrated_input: Optional[Tensor] = None,
+        blanked_mask: Optional[dict[int, Tensor]] = None
+    ) -> tuple[list[Tensor], Tensor]:
+        """Forward pass through all N convolution streams with Linear Integration.
+
+        Args:
+            stream_inputs: List of input tensors for each stream
+            integrated_input: Optional integrated stream input (None for first layer)
+            blanked_mask: Optional per-sample blanking mask for modality dropout.
+                         dict[stream_idx] -> bool tensor [batch_size] where True = blanked.
+        """
         # Convert ParameterList to list of tensors for _conv_forward
         stream_weights_list = list(self.stream_weights)
         integration_from_streams_weights_list = list(self.integration_from_streams)
@@ -435,7 +461,8 @@ class LIConv2d(_LIConvNd):
             self.integrated_weight,
             integration_from_streams_weights_list,
             stream_biases_list,
-            self.integrated_bias
+            self.integrated_bias,
+            blanked_mask
         )
 
     def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:
@@ -670,9 +697,21 @@ class _LIBatchNorm(_LINormBase):
             stream_num_features, integrated_num_features, eps, momentum, affine, track_running_stats, **factory_kwargs
         )
     
-    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
+    def forward(
+        self,
+        stream_inputs: list[Tensor],
+        integrated_input: Optional[Tensor] = None,
+        blanked_mask: Optional[dict[int, Tensor]] = None
+    ) -> tuple[list[Tensor], Tensor]:
         """
         Forward pass - implements the exact same algorithm as _BatchNorm.forward() for N streams.
+
+        Args:
+            stream_inputs: List of input tensors for each stream
+            integrated_input: Optional integrated stream input
+            blanked_mask: Optional per-sample blanking mask for modality dropout.
+                         dict[stream_idx] -> bool tensor [batch_size] where True = blanked.
+                         For blanked samples, BN is skipped and zeros are passed through.
         """
         # Check input dimensions for all inputs
         for stream_input in stream_inputs:
@@ -695,20 +734,47 @@ class _LIBatchNorm(_LINormBase):
                 else:  # use exponential moving average
                     exponential_average_factor = self.momentum
 
-        # Process all stream pathways using the exact _BatchNorm algorithm
+        # Process all stream pathways using subset BN approach for modality dropout
         stream_outputs = []
         for i, stream_input in enumerate(stream_inputs):
-            stream_out = self._forward_single_pathway(
-                stream_input,
-                getattr(self, f"stream{i}_running_mean"),
-                getattr(self, f"stream{i}_running_var"),
-                self.stream_weights[i] if self.affine else None,
-                self.stream_biases[i] if self.affine else None,
-                exponential_average_factor,
-            )
+            stream_blanked = blanked_mask.get(i) if blanked_mask else None
+
+            if stream_blanked is None or not stream_blanked.any():
+                # No blanking - standard BN on all samples
+                stream_out = self._forward_single_pathway(
+                    stream_input,
+                    getattr(self, f"stream{i}_running_mean"),
+                    getattr(self, f"stream{i}_running_var"),
+                    self.stream_weights[i] if self.affine else None,
+                    self.stream_biases[i] if self.affine else None,
+                    exponential_average_factor,
+                )
+            elif stream_blanked.all():
+                # All samples blanked - pass through zeros unchanged
+                # (input is already zeros from conv masking)
+                stream_out = stream_input
+            else:
+                # Partial blanking - subset BN on active samples only
+                active_idx = (~stream_blanked).nonzero(as_tuple=True)[0]
+                active_input = stream_input[active_idx]  # [num_active, C, H, W]
+
+                # Standard BN on active samples - this updates running stats correctly
+                active_output = self._forward_single_pathway(
+                    active_input,
+                    getattr(self, f"stream{i}_running_mean"),
+                    getattr(self, f"stream{i}_running_var"),
+                    self.stream_weights[i] if self.affine else None,
+                    self.stream_biases[i] if self.affine else None,
+                    exponential_average_factor,
+                )
+
+                # Scatter back - blanked samples stay as zeros
+                stream_out = torch.zeros_like(stream_input)
+                stream_out[active_idx] = active_output
+
             stream_outputs.append(stream_out)
 
-        # Process integrated pathway using the exact _BatchNorm algorithm (if exists)
+        # Process integrated pathway (no masking - always all samples)
         if integrated_input is not None:
             integrated_out = self._forward_single_pathway(
                 integrated_input,

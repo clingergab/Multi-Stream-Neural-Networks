@@ -135,18 +135,26 @@ class LIMaxPool2d(_LIMaxPoolNd):
     padding: _size_2_t
     dilation: _size_2_t
 
-    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
+    def forward(
+        self,
+        stream_inputs: list[Tensor],
+        integrated_input: Optional[Tensor] = None,
+        blanked_mask: Optional[dict[int, Tensor]] = None
+    ) -> tuple[list[Tensor], Tensor]:
         """
         Forward pass through N-stream max pooling layers.
 
         Args:
             stream_inputs: List of stream input tensors [batch_size, channels, height, width]
             integrated_input: Integrated input tensor [batch_size, channels, height, width] or None
+            blanked_mask: Optional per-sample blanking mask for modality dropout.
+                         Not used directly (MaxPool of zeros = zeros), accepted for API consistency.
 
         Returns:
             Tuple of (stream_outputs, integrated_output) where stream_outputs is a list of tensors
         """
         # Apply max pooling to all stream inputs
+        # Note: MaxPool doesn't need special handling for blanked samples since MaxPool(zeros) = zeros
         stream_outputs = []
         for stream_input in stream_inputs:
             stream_output = F.max_pool2d(
@@ -243,13 +251,20 @@ class LIAdaptiveAvgPool2d(_LIAdaptiveAvgPoolNd):
 
     output_size: _size_2_opt_t
 
-    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
+    def forward(
+        self,
+        stream_inputs: list[Tensor],
+        integrated_input: Optional[Tensor] = None,
+        blanked_mask: Optional[dict[int, Tensor]] = None
+    ) -> tuple[list[Tensor], Tensor]:
         """
         Forward pass through N-stream adaptive average pooling layers.
 
         Args:
             stream_inputs: List of stream input tensors [batch_size, channels, height, width]
             integrated_input: Integrated input tensor [batch_size, channels, height, width] or None
+            blanked_mask: Optional per-sample blanking mask for modality dropout.
+                         Not used directly (AvgPool of zeros = zeros), accepted for API consistency.
 
         Returns:
             Tuple of (stream_outputs, integrated_output) where stream_outputs is a list of tensors

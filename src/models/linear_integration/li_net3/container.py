@@ -53,8 +53,17 @@ class LIReLU(nn.Module):
         super().__init__()
         self.inplace = inplace
 
-    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
-        """Apply ReLU to all N pathways."""
+    def forward(
+        self,
+        stream_inputs: list[Tensor],
+        integrated_input: Optional[Tensor] = None,
+        blanked_mask: Optional[dict[int, Tensor]] = None
+    ) -> tuple[list[Tensor], Tensor]:
+        """Apply ReLU to all N pathways.
+
+        Note: ReLU doesn't need special handling for blanked samples since ReLU(0) = 0.
+        The blanked_mask parameter is accepted for API consistency but not used.
+        """
         stream_outputs = [F.relu(stream_input, inplace=self.inplace) for stream_input in stream_inputs]
 
         if integrated_input is not None:
@@ -226,18 +235,29 @@ class LISequential(Module):
     def __iter__(self) -> Iterator[Module]:
         return iter(self._modules.values())
 
-    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
+    def forward(
+        self,
+        stream_inputs: list[Tensor],
+        integrated_input: Optional[Tensor] = None,
+        blanked_mask: Optional[dict[int, Tensor]] = None
+    ) -> tuple[list[Tensor], Tensor]:
         """
         Forward pass through the sequential container.
 
-        Each module must accept (stream_inputs: list[Tensor], integrated_input: Optional[Tensor])
-        and return (stream_outputs: list[Tensor], integrated_output: Optional[Tensor]).
+        Each module must accept (stream_inputs, integrated_input, blanked_mask)
+        and return (stream_outputs, integrated_output).
 
         This ensures compatibility with LI modules like LIConv2d,
         LIBatchNorm2d, LIReLU, etc.
+
+        Args:
+            stream_inputs: List of input tensors for each stream
+            integrated_input: Optional integrated stream input
+            blanked_mask: Optional per-sample blanking mask for modality dropout.
+                         Propagated to all contained modules.
         """
         for module in self:
-            stream_inputs, integrated_input = module(stream_inputs, integrated_input)
+            stream_inputs, integrated_input = module(stream_inputs, integrated_input, blanked_mask)
         return stream_inputs, integrated_input
 
     def forward_stream(self, stream_idx: int, stream_input: Tensor) -> Tensor:

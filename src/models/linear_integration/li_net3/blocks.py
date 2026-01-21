@@ -112,39 +112,53 @@ class LIBasicBlock(nn.Module):
         self.downsample = downsample
         self.stride = stride
 
-    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
+    def forward(
+        self,
+        stream_inputs: list[Tensor],
+        integrated_input: Optional[Tensor] = None,
+        blanked_mask: Optional[dict[int, Tensor]] = None
+    ) -> tuple[list[Tensor], Tensor]:
         """
         Forward pass - MUCH SIMPLER with unified LIConv2d neurons!
 
         The integration now happens INSIDE LIConv2d, so this block
         just needs to do: conv → bn → relu → residual (ResNet pattern)
+
+        Args:
+            stream_inputs: List of input tensors for each stream
+            integrated_input: Optional integrated stream input
+            blanked_mask: Optional per-sample blanking mask for modality dropout.
+                         Propagated to all contained modules.
         """
-        # Save identities
+        # Save identities (already zeros for blanked samples from previous layer)
         stream_identities = stream_inputs.copy()
         integrated_identity = integrated_input
 
         # First conv block (integration happens inside LIConv2d!)
-        stream_outputs, integrated = self.conv1(stream_inputs, integrated_input)
-        stream_outputs, integrated = self.bn1(stream_outputs, integrated)
-        stream_outputs, integrated = self.relu(stream_outputs, integrated)
+        stream_outputs, integrated = self.conv1(stream_inputs, integrated_input, blanked_mask)
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
 
         # Second conv block (integration happens inside LIConv2d!)
-        stream_outputs, integrated = self.conv2(stream_outputs, integrated)
-        stream_outputs, integrated = self.bn2(stream_outputs, integrated)
+        stream_outputs, integrated = self.conv2(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.bn2(stream_outputs, integrated, blanked_mask)
 
         # Apply downsampling to identities if needed (handles all N streams together)
+        # Downsample is an LISequential containing LIConv2d + LIBatchNorm2d - accepts blanked_mask
         if self.downsample is not None:
             stream_identities, integrated_identity = self.downsample(
-                stream_identities, integrated_identity
+                stream_identities, integrated_identity, blanked_mask
             )
 
         # Residual connections (exact ResNet pattern)
+        # Note: for blanked samples, both stream_outputs and stream_identities are zeros
+        # so the result is 0 + 0 = 0 (blanked samples stay zeroed)
         stream_outputs = [s + s_id for s, s_id in zip(stream_outputs, stream_identities)]
         if integrated_identity is not None:
             integrated = integrated + integrated_identity
 
         # Final activation
-        stream_outputs, integrated = self.relu(stream_outputs, integrated)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
 
         return stream_outputs, integrated
 
@@ -248,37 +262,52 @@ class LIBottleneck(nn.Module):
         self.downsample = downsample
         self.stride = stride
     
-    def forward(self, stream_inputs: list[Tensor], integrated_input: Optional[Tensor] = None) -> tuple[list[Tensor], Tensor]:
-        """Forward pass with N-stream processing."""
-        # Save identities
+    def forward(
+        self,
+        stream_inputs: list[Tensor],
+        integrated_input: Optional[Tensor] = None,
+        blanked_mask: Optional[dict[int, Tensor]] = None
+    ) -> tuple[list[Tensor], Tensor]:
+        """Forward pass with N-stream processing.
+
+        Args:
+            stream_inputs: List of input tensors for each stream
+            integrated_input: Optional integrated stream input
+            blanked_mask: Optional per-sample blanking mask for modality dropout.
+                         Propagated to all contained modules.
+        """
+        # Save identities (already zeros for blanked samples from previous layer)
         stream_identities = stream_inputs.copy()
         integrated_identity = integrated_input
 
         # Three conv blocks (integration happens inside LIConv2d!)
-        stream_outputs, integrated = self.conv1(stream_inputs, integrated_input)
-        stream_outputs, integrated = self.bn1(stream_outputs, integrated)
-        stream_outputs, integrated = self.relu(stream_outputs, integrated)
+        stream_outputs, integrated = self.conv1(stream_inputs, integrated_input, blanked_mask)
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
 
-        stream_outputs, integrated = self.conv2(stream_outputs, integrated)
-        stream_outputs, integrated = self.bn2(stream_outputs, integrated)
-        stream_outputs, integrated = self.relu(stream_outputs, integrated)
+        stream_outputs, integrated = self.conv2(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.bn2(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
 
-        stream_outputs, integrated = self.conv3(stream_outputs, integrated)
-        stream_outputs, integrated = self.bn3(stream_outputs, integrated)
+        stream_outputs, integrated = self.conv3(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.bn3(stream_outputs, integrated, blanked_mask)
 
         # Apply downsampling to identities if needed (handles all N streams together)
+        # Downsample is an LISequential containing LIConv2d + LIBatchNorm2d - accepts blanked_mask
         if self.downsample is not None:
             stream_identities, integrated_identity = self.downsample(
-                stream_identities, integrated_identity
+                stream_identities, integrated_identity, blanked_mask
             )
 
         # Residual connections
+        # Note: for blanked samples, both stream_outputs and stream_identities are zeros
+        # so the result is 0 + 0 = 0 (blanked samples stay zeroed)
         stream_outputs = [s + s_id for s, s_id in zip(stream_outputs, stream_identities)]
         if integrated_identity is not None:
             integrated = integrated + integrated_identity
 
         # Final activation
-        stream_outputs, integrated = self.relu(stream_outputs, integrated)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
 
         return stream_outputs, integrated
 

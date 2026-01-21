@@ -20,6 +20,7 @@ from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau, CosineAnneal
 
 from src.models.abstracts.abstract_model import BaseModel
 from src.training.schedulers import setup_scheduler
+from src.training.modality_dropout import get_modality_dropout_prob, generate_per_sample_blanked_mask
 from src.models.common import (
     save_checkpoint,
     create_progress_bar,
@@ -267,7 +268,11 @@ class LINet(BaseModel):
 
         return LISequential(*layers)
     
-    def forward(self, stream_inputs: list[Tensor]) -> Tensor:
+    def forward(
+        self,
+        stream_inputs: list[Tensor],
+        blanked_mask: Optional[dict[int, Tensor]] = None
+    ) -> Tensor:
         """
         Forward pass through the Linear Integration ResNet.
 
@@ -275,23 +280,26 @@ class LINet(BaseModel):
             stream_inputs: List of input tensors, one per stream [batch_size, channels, height, width]
                           For N=2: [RGB, Depth]
                           For N=3: [RGB, Depth, Orthogonal]
+            blanked_mask: Optional per-sample blanking mask for modality dropout.
+                         dict[stream_idx] -> bool tensor [batch_size] where True = blanked.
+                         When a stream is blanked for a sample, its output is zeroed.
 
         Returns:
             Classification logits [batch_size, num_classes] from integrated stream
         """
         # Initial convolution (creates integrated stream from all input streams)
-        stream_outputs, integrated = self.conv1(stream_inputs, None)  # integrated_input=None for first layer
-        stream_outputs, integrated = self.bn1(stream_outputs, integrated)
-        stream_outputs, integrated = self.relu(stream_outputs, integrated)
+        stream_outputs, integrated = self.conv1(stream_inputs, None, blanked_mask)  # integrated_input=None for first layer
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
 
         # Max pooling (all N streams + integrated)
-        stream_outputs, integrated = self.maxpool(stream_outputs, integrated)
+        stream_outputs, integrated = self.maxpool(stream_outputs, integrated, blanked_mask)
 
         # ResNet layers (all N streams, integration happens inside LIConv2d neurons!)
-        stream_outputs, integrated = self.layer1(stream_outputs, integrated)
-        stream_outputs, integrated = self.layer2(stream_outputs, integrated)
-        stream_outputs, integrated = self.layer3(stream_outputs, integrated)
-        stream_outputs, integrated = self.layer4(stream_outputs, integrated)
+        stream_outputs, integrated = self.layer1(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.layer2(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.layer3(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.layer4(stream_outputs, integrated, blanked_mask)
 
         # Global average pooling for integrated stream only
         # (We only use integrated stream for final prediction)
@@ -651,7 +659,12 @@ class LINet(BaseModel):
         stream_monitoring: bool = False,  # Enable stream-specific monitoring (LR, WD, acc per stream)
         stream_early_stopping: bool = False,  # Enable stream-specific early stopping (freezes streams when they plateau)
         stream_patience: Union[int, list[int]] = 10,  # Patience per stream (int for all, or list[int] per stream)
-        stream_min_delta: float = 0.001  # Minimum improvement for stream early stopping
+        stream_min_delta: float = 0.001,  # Minimum improvement for stream early stopping
+        # Modality dropout parameters
+        modality_dropout: bool = False,  # Enable per-sample modality dropout
+        modality_dropout_start: int = 0,  # Epoch to start modality dropout
+        modality_dropout_ramp: int = 20,  # Epochs to ramp dropout from 0 to final rate
+        modality_dropout_rate: float = 0.2,  # Final dropout rate (prob of blanking ANY stream per sample)
     ) -> dict:
         """
         Train the model with optional early stopping.
@@ -686,6 +699,11 @@ class LINet(BaseModel):
                            - int: same patience for all streams
                            - list[int]: individual patience per stream
             stream_min_delta: Minimum improvement for stream metrics to count as progress
+            modality_dropout: Enable per-sample modality dropout. Each sample can have one
+                            stream blanked (zeroed out) to train the model to handle missing streams.
+            modality_dropout_start: Epoch to start modality dropout (default: 0)
+            modality_dropout_ramp: Number of epochs to ramp dropout from 0% to final rate (default: 20)
+            modality_dropout_rate: Final dropout probability (per-sample probability of blanking ANY stream)
 
         Returns:
             Training history dictionary
@@ -793,21 +811,37 @@ class LINet(BaseModel):
                 history[f'stream_{i}_lr'] = []
                 history[f'stream_{i}_frozen_epoch'] = None
 
+        # Add modality dropout tracking (if enabled)
+        if modality_dropout:
+            history['modality_dropout_prob'] = []
+
         # Scheduler is already set by compile(), no need to create it here
 
         for epoch in range(epochs):
+            # Compute modality dropout probability for this epoch
+            modality_dropout_prob = 0.0
+            if modality_dropout:
+                modality_dropout_prob = get_modality_dropout_prob(
+                    epoch=epoch,
+                    start_epoch=modality_dropout_start,
+                    ramp_epochs=modality_dropout_ramp,
+                    final_rate=modality_dropout_rate
+                )
+                history['modality_dropout_prob'].append(modality_dropout_prob)
+
             # Calculate total steps for this epoch (training + validation)
             total_steps = len(train_loader)
             if val_loader:
                 total_steps += len(val_loader)
-            
+
             # Create progress bar for the entire epoch
             pbar = create_progress_bar(verbose, epoch, epochs, total_steps)
-            
+
             # Training phase - use helper method
             avg_train_loss, train_accuracy, stream_train_accs = self._train_epoch(
                 train_loader, history, pbar, gradient_accumulation_steps, grad_clip_norm, clear_cache_per_epoch,
-                stream_monitoring=stream_monitoring, aux_optimizer=aux_optimizer
+                stream_monitoring=stream_monitoring, aux_optimizer=aux_optimizer,
+                modality_dropout_prob=modality_dropout_prob
             )
 
             # Validation phase
@@ -1030,7 +1064,12 @@ class LINet(BaseModel):
 
         return history
 
-    def evaluate(self, data_loader: DataLoader, stream_monitoring: bool = True) -> dict[str, float]:
+    def evaluate(
+        self,
+        data_loader: DataLoader,
+        stream_monitoring: bool = True,
+        blanked_streams: Optional[set[int]] = None
+    ) -> dict[str, float]:
         """
         Evaluate the model on the given data.
 
@@ -1040,6 +1079,10 @@ class LINet(BaseModel):
         Args:
             data_loader: DataLoader containing N-stream input data and targets
             stream_monitoring: Whether to calculate stream-specific metrics (default: True)
+            blanked_streams: Optional set of stream indices to blank for ALL samples.
+                           Use this to test single-stream robustness:
+                           - {0}: blank stream 0 (e.g., RGB), test with stream 1 only
+                           - {1}: blank stream 1 (e.g., Depth), test with stream 0 only
 
         Returns:
             Dictionary containing evaluation metrics (e.g., accuracy, loss, stream accuracies)
@@ -1048,7 +1091,7 @@ class LINet(BaseModel):
             raise ValueError("Model not compiled. Call compile() before evaluate().")
 
         loss, accuracy, stream_val_accs, stream_val_losses = self._validate(
-            data_loader, stream_monitoring=stream_monitoring
+            data_loader, stream_monitoring=stream_monitoring, blanked_streams=blanked_streams
         )
 
         # Build result dictionary with N streams
@@ -1138,7 +1181,8 @@ class LINet(BaseModel):
     def _train_epoch(self, train_loader: DataLoader, history: dict, pbar: Optional['TqdmType'] = None,
                      gradient_accumulation_steps: int = 1, grad_clip_norm: Optional[float] = None,
                      clear_cache_per_epoch: bool = False, stream_monitoring: bool = False,
-                     aux_optimizer: Optional[torch.optim.Optimizer] = None) -> tuple:
+                     aux_optimizer: Optional[torch.optim.Optimizer] = None,
+                     modality_dropout_prob: float = 0.0) -> tuple:
         """
         Train the model for one epoch with GPU optimizations and gradient accumulation.
 
@@ -1152,6 +1196,7 @@ class LINet(BaseModel):
             stream_monitoring: Whether to track stream-specific metrics during training.
                             Auxiliary classifiers are trained with full gradients (gradient-isolated)
                             to provide accurate monitoring without affecting main model.
+            modality_dropout_prob: Per-sample probability of blanking a stream (0.0 = disabled)
 
         Returns:
             Tuple of (average_train_loss, train_accuracy, stream_accs: list[float])
@@ -1164,8 +1209,9 @@ class LINet(BaseModel):
         train_total = 0
 
         # Stream-specific tracking (if monitoring enabled) - N streams
+        # Per-stream active sample counters (accounts for modality dropout)
         stream_train_correct = [0] * self.num_streams
-        stream_train_total = 0
+        stream_train_active = [0] * self.num_streams
         
         # Ensure gradient_accumulation_steps is at least 1 to avoid division by zero
         gradient_accumulation_steps = max(1, gradient_accumulation_steps)
@@ -1181,15 +1227,25 @@ class LINet(BaseModel):
             # GPU optimization: non-blocking transfer for all streams
             stream_batches = [batch.to(self.device, non_blocking=True) for batch in stream_batches]
             targets = targets.to(self.device, non_blocking=True)
-            
+
+            # Generate per-sample blanked mask for modality dropout
+            blanked_mask = None
+            if modality_dropout_prob > 0:
+                blanked_mask = generate_per_sample_blanked_mask(
+                    batch_size=targets.shape[0],
+                    num_streams=self.num_streams,
+                    dropout_prob=modality_dropout_prob,
+                    device=self.device
+                )
+
             # OPTIMIZATION 5: Gradient accumulation - zero gradients only when starting accumulation
             if batch_idx % gradient_accumulation_steps == 0:
                 self.optimizer.zero_grad()
-            
+
             if self.use_amp:
                 # Use automatic mixed precision
                 with autocast(device_type=self.device.type):
-                    outputs = self(stream_batches)
+                    outputs = self(stream_batches, blanked_mask=blanked_mask)
                     loss = self.criterion(outputs, targets)
                     # Scale loss for gradient accumulation
                     if gradient_accumulation_steps > 1:
@@ -1219,7 +1275,7 @@ class LINet(BaseModel):
                             history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
             else:
                 # Standard precision training
-                outputs = self(stream_batches)
+                outputs = self(stream_batches, blanked_mask=blanked_mask)
                 loss = self.criterion(outputs, targets)
                 # Scale loss for gradient accumulation
                 if gradient_accumulation_steps > 1:
@@ -1262,8 +1318,12 @@ class LINet(BaseModel):
                 self.eval()  # Prevent BN stats updates during monitoring
 
                 # Forward through stream pathways and compute auxiliary losses
+                # Note: When modality dropout is active, we skip blanked samples for each stream
                 aux_losses = []
                 for i in range(self.num_streams):
+                    # Get mask for this stream (if dropout active)
+                    stream_blanked = blanked_mask.get(i) if blanked_mask else None
+
                     # Forward through this stream's pathway (no BN stats updates in eval mode)
                     stream_features = self._forward_stream_pathway(i, stream_batches[i])
 
@@ -1273,9 +1333,18 @@ class LINet(BaseModel):
                     # Classify with auxiliary classifier (only it gets gradients)
                     stream_outputs = self.fc_streams[i](stream_features_detached)
 
-                    # Compute auxiliary loss (full gradient, no scaling)
-                    aux_loss = self.criterion(stream_outputs, targets)
-                    aux_losses.append(aux_loss)
+                    # Compute auxiliary loss ONLY for non-blanked samples
+                    if stream_blanked is not None and stream_blanked.any():
+                        # Get indices of active (non-blanked) samples
+                        active_idx = (~stream_blanked).nonzero(as_tuple=True)[0]
+                        if len(active_idx) > 0:
+                            aux_loss = self.criterion(stream_outputs[active_idx], targets[active_idx])
+                            aux_losses.append(aux_loss)
+                        # If all samples blanked for this stream, skip this stream's aux loss
+                    else:
+                        # No blanking - use all samples
+                        aux_loss = self.criterion(stream_outputs, targets)
+                        aux_losses.append(aux_loss)
 
                 # Restore training mode for auxiliary classifier backward pass
                 # (fc_streams don't have BN, so this is safe)
@@ -1284,22 +1353,24 @@ class LINet(BaseModel):
                 # Backward pass for auxiliary classifiers only (detached features ensure no gradient to streams)
                 # Each stream's classifier learns independently with full gradients
                 # CRITICAL: Use separate aux_optimizer to avoid affecting main optimizer's internal state
-                if self.use_amp:
-                    for aux_loss in aux_losses:
-                        self.scaler.scale(aux_loss).backward()
-                    # Update auxiliary classifiers using separate optimizer
-                    self.scaler.step(aux_optimizer)
-                    self.scaler.update()
-                else:
-                    for aux_loss in aux_losses:
-                        aux_loss.backward()
-                    # Update auxiliary classifiers using separate optimizer
-                    aux_optimizer.step()
+                if aux_losses:  # Only if we have any losses to backprop
+                    if self.use_amp:
+                        for aux_loss in aux_losses:
+                            self.scaler.scale(aux_loss).backward()
+                        # Update auxiliary classifiers using separate optimizer
+                        self.scaler.step(aux_optimizer)
+                        self.scaler.update()
+                    else:
+                        for aux_loss in aux_losses:
+                            aux_loss.backward()
+                        # Update auxiliary classifiers using separate optimizer
+                        aux_optimizer.step()
 
-                # Zero gradients for auxiliary optimizer
-                aux_optimizer.zero_grad()
+                    # Zero gradients for auxiliary optimizer
+                    aux_optimizer.zero_grad()
 
                 # === ACCURACY MEASUREMENT PHASE: Calculate stream accuracies ===
+                # Only count non-blanked samples for each stream's accuracy
                 with torch.no_grad():
                     self.eval()  # Disable dropout, use BN running stats
 
@@ -1307,9 +1378,18 @@ class LINet(BaseModel):
                         stream_features = self._forward_stream_pathway(i, stream_batches[i])
                         stream_outputs = self.fc_streams[i](stream_features)
                         stream_pred = stream_outputs.argmax(1)
-                        stream_train_correct[i] += (stream_pred == targets).sum().item()
 
-                    stream_train_total += targets.size(0)
+                        # Only count non-blanked samples for accuracy
+                        stream_blanked = blanked_mask.get(i) if blanked_mask else None
+                        if stream_blanked is not None and stream_blanked.any():
+                            active_idx = (~stream_blanked).nonzero(as_tuple=True)[0]
+                            if len(active_idx) > 0:
+                                stream_train_correct[i] += (stream_pred[active_idx] == targets[active_idx]).sum().item()
+                                stream_train_active[i] += len(active_idx)
+                        else:
+                            stream_train_correct[i] += (stream_pred == targets).sum().item()
+                            stream_train_active[i] += targets.size(0)
+
                     self.train(was_training)  # Restore training mode
 
             # Calculate training accuracy
@@ -1352,8 +1432,9 @@ class LINet(BaseModel):
         train_accuracy = train_correct / train_total
 
         # Calculate stream-specific accuracies (N streams)
+        # Use per-stream active sample counts (accounts for modality dropout)
         stream_accs = [
-            stream_train_correct[i] / max(stream_train_total, 1) if stream_monitoring else 0.0
+            stream_train_correct[i] / max(stream_train_active[i], 1) if stream_monitoring else 0.0
             for i in range(self.num_streams)
         ]
 
@@ -1364,7 +1445,8 @@ class LINet(BaseModel):
         return avg_train_loss, train_accuracy, stream_accs
     
     def _validate(self, data_loader: DataLoader,
-                  pbar: Optional['TqdmType'] = None, stream_monitoring: bool = True) -> tuple:
+                  pbar: Optional['TqdmType'] = None, stream_monitoring: bool = True,
+                  blanked_streams: Optional[set[int]] = None) -> tuple:
         """
         Validate the model on the given data with GPU optimizations and reduced progress updates.
 
@@ -1372,6 +1454,8 @@ class LINet(BaseModel):
             data_loader: DataLoader containing N-stream input data and targets
             pbar: Optional progress bar to update during validation
             stream_monitoring: Whether to track stream-specific metrics during validation
+            blanked_streams: Optional set of stream indices to blank for ALL samples.
+                           Used for single-stream robustness evaluation.
 
         Returns:
             Tuple of (loss, accuracy, stream_val_accs: list[float], stream_val_losses: list[float])
@@ -1387,10 +1471,10 @@ class LINet(BaseModel):
         stream_val_correct = [0] * self.num_streams
         stream_val_loss = [0.0] * self.num_streams
         stream_val_total = 0
-        
+
         # OPTIMIZATION 1: Progress bar update frequency for validation - major performance improvement
         update_frequency = max(1, len(data_loader) // 25)  # Update only 25 times during validation
-        
+
         with torch.no_grad():
             for batch_idx, batch_data in enumerate(data_loader):
                 # Unpack N streams + targets from tuple format
@@ -1401,13 +1485,24 @@ class LINet(BaseModel):
                 stream_batches = [batch.to(self.device, non_blocking=True) for batch in stream_batches]
                 targets = targets.to(self.device, non_blocking=True)
 
+                # Convert blanked_streams set to blanked_mask for entire batch
+                blanked_mask = None
+                if blanked_streams:
+                    batch_size = stream_batches[0].shape[0]
+                    blanked_mask = {
+                        i: torch.ones(batch_size, dtype=torch.bool, device=self.device)
+                        if i in blanked_streams else
+                        torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+                        for i in range(self.num_streams)
+                    }
+
                 # Use AMP for validation if enabled
                 if self.use_amp:
                     with autocast(device_type=self.device.type):
-                        outputs = self(stream_batches)
+                        outputs = self(stream_batches, blanked_mask=blanked_mask)
                         loss = self.criterion(outputs, targets)
                 else:
-                    outputs = self(stream_batches)
+                    outputs = self(stream_batches, blanked_mask=blanked_mask)
                     loss = self.criterion(outputs, targets)
                 
                 total_loss += loss.item()
