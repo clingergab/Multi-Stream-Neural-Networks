@@ -61,3 +61,5 @@ htmlcov/
 coverage_reports/
 .coverage
 .coverage.*
+
+CLAUDE.md

@@ -6,10 +6,12 @@ Loads preprocessed SUN RGB-D dataset with RGB and depth images.
 
 import os
 import random
+from collections import Counter
+
 import numpy as np
 from PIL import Image
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, WeightedRandomSampler
 from torchvision import transforms
 
 
@@ -247,7 +249,6 @@ class SUNRGBDDataset(Dataset):
         Returns:
             Tensor of shape [num_classes] with weights
         """
-        from collections import Counter
         label_counts = Counter(self.labels)
 
         weights = torch.zeros(len(self.CLASS_NAMES))
@@ -269,7 +270,6 @@ class SUNRGBDDataset(Dataset):
         Returns:
             Dictionary with class counts and percentages
         """
-        from collections import Counter
         label_counts = Counter(self.labels)
 
         distribution = {}
@@ -306,6 +306,7 @@ def get_sunrgbd_dataloaders(
     num_workers=4,
     target_size=(416, 544),
     use_class_weights=False,
+    stratified=False,
     seed=None,
 ):
     """
@@ -317,6 +318,9 @@ def get_sunrgbd_dataloaders(
         num_workers: Number of dataloader workers
         target_size: Target image size (H, W)
         use_class_weights: If True, return class weights for loss
+        stratified: If True, use stratified sampling for training to ensure
+                   balanced class representation in each batch. Recommended for
+                   imbalanced datasets. Note: this oversamples minority classes.
         seed: Random seed for reproducible data loading. If None, non-reproducible.
               When set, ensures reproducible shuffle order and worker initialization.
 
@@ -324,10 +328,10 @@ def get_sunrgbd_dataloaders(
         train_loader, val_loader, (optional) class_weights
 
     Example:
-        >>> # Reproducible dataloaders
+        >>> # Reproducible dataloaders with stratified sampling
         >>> from src.utils.seed import set_seed
         >>> set_seed(42)
-        >>> train_loader, val_loader = get_sunrgbd_dataloaders(seed=42)
+        >>> train_loader, val_loader = get_sunrgbd_dataloaders(seed=42, stratified=True)
     """
     # Create datasets
     train_dataset = SUNRGBDDataset(
@@ -350,16 +354,45 @@ def get_sunrgbd_dataloaders(
         worker_init_fn = _WorkerInitFn(seed)
         generator = torch.Generator().manual_seed(seed)
 
+    # Setup stratified sampling if requested
+    train_sampler = None
+    train_shuffle = True
+
+    if stratified:
+        # Compute sample weights (inverse class frequency)
+        label_counts = Counter(train_dataset.labels)
+        num_samples = len(train_dataset.labels)
+
+        # Weight for each sample = 1 / (number of samples in that class)
+        # This makes each class equally likely to be sampled
+        sample_weights = [1.0 / label_counts[label] for label in train_dataset.labels]
+        sample_weights = torch.tensor(sample_weights, dtype=torch.float64)
+
+        # Create sampler - replacement=True allows oversampling minority classes
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=num_samples,  # Same epoch size as original
+            replacement=True,
+            generator=generator
+        )
+        train_shuffle = False  # Sampler handles randomization
+
+        # Print stratification info
+        print(f"\nStratified sampling enabled (training only):")
+        print(f"  Train class imbalance: {max(label_counts.values())/min(label_counts.values()):.1f}x")
+        print(f"  Each training batch will have balanced class representation")
+
     # Create dataloaders
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True if num_workers > 0 else False,
         worker_init_fn=worker_init_fn,
-        generator=generator
+        generator=generator if train_sampler is None else None  # Generator used by sampler
     )
 
     val_loader = torch.utils.data.DataLoader(
@@ -370,13 +403,13 @@ def get_sunrgbd_dataloaders(
         pin_memory=True,
         persistent_workers=True if num_workers > 0 else False,
         worker_init_fn=worker_init_fn,
-        generator=generator
     )
 
     print(f"\nDataLoader Info:")
     print(f"  Train batches: {len(train_loader)}")
     print(f"  Val batches: {len(val_loader)}")
     print(f"  Batch size: {batch_size}")
+    print(f"  Stratified: {stratified}")
 
     if use_class_weights:
         class_weights = train_dataset.get_class_weights()
