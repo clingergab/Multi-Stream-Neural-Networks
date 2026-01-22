@@ -815,6 +815,9 @@ class LINet(BaseModel):
         if modality_dropout:
             history['modality_dropout_prob'] = []
 
+        # Track when modality dropout first becomes active (for logging)
+        modality_dropout_started = False
+
         # Scheduler is already set by compile(), no need to create it here
 
         for epoch in range(epochs):
@@ -828,6 +831,21 @@ class LINet(BaseModel):
                     final_rate=modality_dropout_rate
                 )
                 history['modality_dropout_prob'].append(modality_dropout_prob)
+
+                # Log when modality dropout first becomes active
+                if modality_dropout_prob > 0 and not modality_dropout_started:
+                    modality_dropout_started = True
+                    if verbose:
+                        print(f"\n🎲 Modality dropout activated at epoch {epoch} (prob={modality_dropout_prob:.1%})")
+                        print(f"   Schedule: ramp over {modality_dropout_ramp} epochs to {modality_dropout_rate:.0%}")
+
+                # Log dropout probability periodically (every 10 epochs during ramp)
+                elif modality_dropout_prob > 0 and epoch % 10 == 0 and verbose:
+                    ramp_end_epoch = modality_dropout_start + modality_dropout_ramp
+                    if epoch < ramp_end_epoch:
+                        print(f"🎲 Modality dropout: {modality_dropout_prob:.1%} (ramping)")
+                    elif epoch == ramp_end_epoch:
+                        print(f"🎲 Modality dropout: {modality_dropout_prob:.1%} (reached final rate)")
 
             # Calculate total steps for this epoch (training + validation)
             total_steps = len(train_loader)
@@ -1212,10 +1230,17 @@ class LINet(BaseModel):
         # Per-stream active sample counters (accounts for modality dropout)
         stream_train_correct = [0] * self.num_streams
         stream_train_active = [0] * self.num_streams
-        
+
+        # Modality dropout statistics tracking (epoch-level accumulators)
+        dropout_stats = {
+            'total_samples': 0,
+            'total_blanked': 0,
+            'blanked_per_stream': [0] * self.num_streams
+        } if modality_dropout_prob > 0 else None
+
         # Ensure gradient_accumulation_steps is at least 1 to avoid division by zero
         gradient_accumulation_steps = max(1, gradient_accumulation_steps)
-        
+
         # OPTIMIZATION 1: Progress bar update frequency - major performance improvement
         update_frequency = max(1, len(train_loader) // 50)  # Update only 50 times per epoch
 
@@ -1237,6 +1262,24 @@ class LINet(BaseModel):
                     dropout_prob=modality_dropout_prob,
                     device=self.device
                 )
+
+                # Accumulate mask statistics for this batch
+                batch_size = targets.shape[0]
+                dropout_stats['total_samples'] += batch_size
+                if blanked_mask is not None:
+                    for i in range(self.num_streams):
+                        blanked_count = blanked_mask[i].sum().item()
+                        dropout_stats['blanked_per_stream'][i] += blanked_count
+                        dropout_stats['total_blanked'] += blanked_count
+
+                # Periodic logging (same frequency as progress bar updates)
+                if pbar is not None and batch_idx % update_frequency == 0 and batch_idx > 0:
+                    pct_blanked = 100 * dropout_stats['total_blanked'] / max(dropout_stats['total_samples'], 1)
+                    stream_pcts = [100 * dropout_stats['blanked_per_stream'][i] / max(dropout_stats['total_samples'], 1)
+                                   for i in range(self.num_streams)]
+                    stream_str = ", ".join([f"s{i}:{p:.1f}%" for i, p in enumerate(stream_pcts)])
+                    # Use carriage return to update in place (like tqdm)
+                    print(f"\r  🎲 Dropout: {pct_blanked:.1f}% blanked ({stream_str})", end="", flush=True)
 
             # OPTIMIZATION 5: Gradient accumulation - zero gradients only when starting accumulation
             if batch_idx % gradient_accumulation_steps == 0:
@@ -1418,8 +1461,8 @@ class LINet(BaseModel):
                         if key in current_postfix:
                             postfix[key] = current_postfix[key]
                 
-                # Add lr at the end
-                postfix['lr'] = f'{current_lr:.6f}'
+                # Add lr at the end (scientific notation for small LRs)
+                postfix['lr'] = f'{current_lr:.2e}'
 
                 pbar.set_postfix(postfix)
 
@@ -1437,6 +1480,30 @@ class LINet(BaseModel):
             stream_train_correct[i] / max(stream_train_active[i], 1) if stream_monitoring else 0.0
             for i in range(self.num_streams)
         ]
+
+        # End-of-epoch modality dropout summary
+        if dropout_stats is not None and dropout_stats['total_samples'] > 0:
+            total_samples = dropout_stats['total_samples']
+            total_blanked = dropout_stats['total_blanked']
+            pct_blanked = 100 * total_blanked / total_samples
+            stream_pcts = [100 * dropout_stats['blanked_per_stream'][i] / total_samples
+                          for i in range(self.num_streams)]
+            stream_str = ", ".join([f"stream{i}: {p:.1f}%" for i, p in enumerate(stream_pcts)])
+
+            # Clear the periodic update line and print summary
+            print(f"\r  🎲 Epoch dropout summary: {total_blanked}/{total_samples} samples blanked ({pct_blanked:.1f}%)")
+            print(f"     Per-stream: {stream_str}")
+
+            # Store in history for analysis
+            if '_dropout_epoch_stats' not in history:
+                history['_dropout_epoch_stats'] = []
+            history['_dropout_epoch_stats'].append({
+                'total_samples': total_samples,
+                'total_blanked': total_blanked,
+                'pct_blanked': pct_blanked,
+                'blanked_per_stream': dropout_stats['blanked_per_stream'].copy(),
+                'pct_per_stream': stream_pcts
+            })
 
         # Optional: Clear CUDA cache at end of epoch (only if experiencing OOM issues)
         # if clear_cache_per_epoch and self.device.type == 'cuda':
