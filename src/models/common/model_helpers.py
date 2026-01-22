@@ -584,10 +584,18 @@ def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
         else:
             final_postfix['best'] = f"{early_stopping_state['best_metric']:.4f}"
     
-    # Add lr at the end
-    final_postfix['lr'] = f'{current_lr:.6f}'
-    
+    # Add lr at the end (scientific notation for small LRs)
+    final_postfix['lr'] = f'{current_lr:.2e}'
+
     pbar.set_postfix(final_postfix)
+
+    # Safety net: ensure progress bar reaches 100% before closing
+    # The main progress tracking in _train_epoch/_validate should already handle this,
+    # but this catches any edge cases (e.g., early loop exit)
+    remaining = pbar.total - pbar.n
+    if remaining > 0:
+        pbar.update(remaining)
+
     pbar.refresh()
     pbar.close()
 

@@ -1466,10 +1466,11 @@ class LINet(BaseModel):
 
                 pbar.set_postfix(postfix)
 
-                # Simplified progress bar update - tqdm handles remaining steps automatically
-                updates_needed = min(update_frequency, len(train_loader) - pbar.n)
-                if updates_needed > 0:
-                    pbar.update(updates_needed)
+                # Update progress bar to reflect actual batch progress
+                # batch_idx is 0-indexed, so batch_idx + 1 is the number of batches completed
+                actual_progress = batch_idx + 1
+                if actual_progress > pbar.n:
+                    pbar.update(actual_progress - pbar.n)
         
         avg_train_loss = train_loss / train_batches
         train_accuracy = train_correct / train_total
@@ -1617,15 +1618,16 @@ class LINet(BaseModel):
                         'val_acc': f'{current_val_acc:.4f}'
                     })
                     
-                    # Add lr at the end
-                    postfix['lr'] = f'{current_lr:.6f}'
+                    # Add lr at the end (scientific notation for small LRs)
+                    postfix['lr'] = f'{current_lr:.2e}'
 
                     pbar.set_postfix(postfix)
 
-                    # Simplified progress bar update - tqdm handles remaining steps automatically
-                    updates_needed = min(update_frequency, len(data_loader) - pbar.n)
-                    if updates_needed > 0:
-                        pbar.update(updates_needed)
+                    # Update progress bar to reflect actual batch progress
+                    # batch_idx is 0-indexed, so batch_idx + 1 is the number of batches completed
+                    actual_progress = batch_idx + 1
+                    if actual_progress > pbar.n:
+                        pbar.update(actual_progress - pbar.n)
         
         avg_loss = total_loss / len(data_loader)
         accuracy = correct / total
