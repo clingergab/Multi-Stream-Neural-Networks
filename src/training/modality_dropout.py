@@ -19,13 +19,17 @@ def get_modality_dropout_prob(
 
     Schedule:
     - Before start_epoch: 0% dropout
-    - During ramp (start_epoch to start_epoch + ramp_epochs): Linear ramp 0% → final_rate
-    - After ramp: final_rate
+    - During ramp (start_epoch to start_epoch + ramp_epochs - 1): Linear ramp
+      from (final_rate / ramp_epochs) to final_rate
+    - At and after (start_epoch + ramp_epochs - 1): final_rate
+
+    Example with start_epoch=0, ramp_epochs=10, final_rate=0.2:
+      epoch 0: 2%, epoch 1: 4%, ... epoch 9: 20%, epoch 10+: 20%
 
     Args:
         epoch: Current training epoch (0-indexed)
         start_epoch: Epoch to start dropout (default: 0)
-        ramp_epochs: Number of epochs to ramp from 0 to final_rate (default: 20)
+        ramp_epochs: Number of epochs to ramp to final_rate (default: 20)
         final_rate: Final dropout probability (default: 0.2 = 20%)
 
     Returns:
@@ -36,7 +40,8 @@ def get_modality_dropout_prob(
     epochs_since_start = epoch - start_epoch
     ramp_epochs = max(1, ramp_epochs)  # Prevent division by zero
     if epochs_since_start < ramp_epochs:
-        return final_rate * (epochs_since_start / ramp_epochs)
+        # Linear ramp: epoch 0 gets 1/ramp_epochs, epoch ramp_epochs-1 gets full rate
+        return final_rate * ((epochs_since_start + 1) / ramp_epochs)
     return final_rate
 
 

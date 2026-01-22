@@ -82,7 +82,18 @@ def test_mask_generation():
 
 
 def test_dropout_prob_schedule():
-    """Test get_modality_dropout_prob schedule."""
+    """Test get_modality_dropout_prob schedule.
+
+    New schedule (fixed): epoch at start_epoch gets (1/ramp_epochs * final_rate),
+    ramping linearly to final_rate over ramp_epochs epochs.
+
+    Example with start=10, ramp=20, final=0.2:
+      - Epoch 10: 1/20 * 0.2 = 0.01 (1%)
+      - Epoch 11: 2/20 * 0.2 = 0.02 (2%)
+      - ...
+      - Epoch 29: 20/20 * 0.2 = 0.2 (20%)
+      - Epoch 30+: 0.2 (20%)
+    """
     print("\n" + "=" * 60)
     print("TEST 1b: Dropout Probability Schedule")
     print("=" * 60)
@@ -90,29 +101,35 @@ def test_dropout_prob_schedule():
     # Test with start_epoch=10, ramp_epochs=20, final_rate=0.2
     start, ramp, final = 10, 20, 0.2
 
-    # Before start
+    # Before start - should be 0
     prob = get_modality_dropout_prob(5, start, ramp, final)
     assert prob == 0.0, f"Expected 0.0 before start, got {prob}"
     print(f"  Epoch 5 (before start): {prob:.4f} ✓")
 
-    # At start
+    # At start - should be 1/ramp_epochs * final = 0.01
     prob = get_modality_dropout_prob(10, start, ramp, final)
-    assert prob == 0.0, f"Expected 0.0 at start, got {prob}"
+    expected = final / ramp  # 0.2 / 20 = 0.01
+    assert abs(prob - expected) < 1e-6, f"Expected {expected}, got {prob}"
     print(f"  Epoch 10 (at start): {prob:.4f} ✓")
 
-    # Midway through ramp
-    prob = get_modality_dropout_prob(20, start, ramp, final)
-    expected = 0.1  # 10/20 * 0.2
+    # Midway through ramp - epoch 19 is 10 epochs in, so 10/20 * 0.2 = 0.1
+    # Wait, with new formula: epochs_since_start=9, (9+1)/20 * 0.2 = 0.1
+    prob = get_modality_dropout_prob(19, start, ramp, final)
+    expected = 0.1  # (19-10+1)/20 * 0.2 = 10/20 * 0.2 = 0.1
     assert abs(prob - expected) < 1e-6, f"Expected {expected}, got {prob}"
-    print(f"  Epoch 20 (mid-ramp): {prob:.4f} ✓")
+    print(f"  Epoch 19 (mid-ramp): {prob:.4f} ✓")
 
-    # After ramp
+    # End of ramp - epoch 29 is last ramp epoch: (29-10+1)/20 * 0.2 = 20/20 * 0.2 = 0.2
+    prob = get_modality_dropout_prob(29, start, ramp, final)
+    assert abs(prob - final) < 1e-6, f"Expected {final}, got {prob}"
+    print(f"  Epoch 29 (end of ramp): {prob:.4f} ✓")
+
+    # After ramp - should be final
     prob = get_modality_dropout_prob(50, start, ramp, final)
     assert prob == final, f"Expected {final}, got {prob}"
     print(f"  Epoch 50 (after ramp): {prob:.4f} ✓")
 
     print("  ✅ PASSED: Dropout probability schedule works correctly")
-    return True
 
 
 def test_conv_masking():

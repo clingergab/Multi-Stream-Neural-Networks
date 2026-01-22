@@ -832,20 +832,20 @@ class LINet(BaseModel):
                 )
                 history['modality_dropout_prob'].append(modality_dropout_prob)
 
-                # Log when modality dropout first becomes active
+                # Log when modality dropout first becomes active (use 1-indexed epoch for display)
                 if modality_dropout_prob > 0 and not modality_dropout_started:
                     modality_dropout_started = True
                     if verbose:
-                        print(f"\n🎲 Modality dropout activated at epoch {epoch} (prob={modality_dropout_prob:.1%})")
+                        print(f"\n🎲 Modality dropout activated at epoch {epoch + 1} (prob={modality_dropout_prob:.1%})")
                         print(f"   Schedule: ramp over {modality_dropout_ramp} epochs to {modality_dropout_rate:.0%}")
 
                 # Log dropout probability periodically (every 10 epochs during ramp)
                 elif modality_dropout_prob > 0 and epoch % 10 == 0 and verbose:
                     ramp_end_epoch = modality_dropout_start + modality_dropout_ramp
                     if epoch < ramp_end_epoch:
-                        print(f"🎲 Modality dropout: {modality_dropout_prob:.1%} (ramping)")
+                        print(f"🎲 Modality dropout: {modality_dropout_prob:.1%} (ramping, epoch {epoch + 1})")
                     elif epoch == ramp_end_epoch:
-                        print(f"🎲 Modality dropout: {modality_dropout_prob:.1%} (reached final rate)")
+                        print(f"🎲 Modality dropout: {modality_dropout_prob:.1%} (reached final rate at epoch {epoch + 1})")
 
             # Calculate total steps for this epoch (training + validation)
             total_steps = len(train_loader)
@@ -981,6 +981,13 @@ class LINet(BaseModel):
                         stream_stats[f'stream_{i}_train_acc'] = stream_train_accs[i]
                         stream_stats[f'stream_{i}_val_acc'] = stream_val_accs[i]
                         stream_stats[f'stream_{i}_val_loss'] = stream_val_losses[i]
+
+            # Print modality dropout epoch summary (after stream monitoring, before early stopping)
+            if modality_dropout and '_dropout_epoch_stats' in history and history['_dropout_epoch_stats']:
+                stats = history['_dropout_epoch_stats'][-1]  # Get this epoch's stats
+                stream_str = ", ".join([f"s{i}:{p:.1f}%" for i, p in enumerate(stats['pct_per_stream'])])
+                print(f"  🎲 Dropout: {stats['total_blanked']}/{stats['total_samples']} blanked "
+                      f"({stats['pct_blanked']:.1f}%) | {stream_str}")
 
             # Stream-specific early stopping (freeze streams when they plateau)
             if stream_early_stopping_state['enabled'] and stream_stats:
@@ -1272,14 +1279,7 @@ class LINet(BaseModel):
                         dropout_stats['blanked_per_stream'][i] += blanked_count
                         dropout_stats['total_blanked'] += blanked_count
 
-                # Periodic logging (same frequency as progress bar updates)
-                if pbar is not None and batch_idx % update_frequency == 0 and batch_idx > 0:
-                    pct_blanked = 100 * dropout_stats['total_blanked'] / max(dropout_stats['total_samples'], 1)
-                    stream_pcts = [100 * dropout_stats['blanked_per_stream'][i] / max(dropout_stats['total_samples'], 1)
-                                   for i in range(self.num_streams)]
-                    stream_str = ", ".join([f"s{i}:{p:.1f}%" for i, p in enumerate(stream_pcts)])
-                    # Use carriage return to update in place (like tqdm)
-                    print(f"\r  🎲 Dropout: {pct_blanked:.1f}% blanked ({stream_str})", end="", flush=True)
+                # Per-batch dropout stats are added to pbar postfix below
 
             # OPTIMIZATION 5: Gradient accumulation - zero gradients only when starting accumulation
             if batch_idx % gradient_accumulation_steps == 0:
@@ -1461,8 +1461,16 @@ class LINet(BaseModel):
                         if key in current_postfix:
                             postfix[key] = current_postfix[key]
                 
-                # Add lr at the end (scientific notation for small LRs)
+                # Add lr (scientific notation for small LRs)
                 postfix['lr'] = f'{current_lr:.2e}'
+
+                # Add dropout stats if active (after lr so lr appears first)
+                if dropout_stats is not None and dropout_stats['total_samples'] > 0:
+                    pct_blanked = 100 * dropout_stats['total_blanked'] / dropout_stats['total_samples']
+                    stream_pcts = [100 * dropout_stats['blanked_per_stream'][i] / dropout_stats['total_samples']
+                                   for i in range(self.num_streams)]
+                    stream_str = "/".join([f"{p:.1f}" for p in stream_pcts])
+                    postfix['drop'] = f'{pct_blanked:.1f}%({stream_str})'
 
                 pbar.set_postfix(postfix)
 
@@ -1482,20 +1490,16 @@ class LINet(BaseModel):
             for i in range(self.num_streams)
         ]
 
-        # End-of-epoch modality dropout summary
+        # End-of-epoch modality dropout summary - store in history for analysis
+        # Note: Printing is done by fit() after the progress bar closes to avoid output interference
         if dropout_stats is not None and dropout_stats['total_samples'] > 0:
             total_samples = dropout_stats['total_samples']
             total_blanked = dropout_stats['total_blanked']
             pct_blanked = 100 * total_blanked / total_samples
             stream_pcts = [100 * dropout_stats['blanked_per_stream'][i] / total_samples
                           for i in range(self.num_streams)]
-            stream_str = ", ".join([f"stream{i}: {p:.1f}%" for i, p in enumerate(stream_pcts)])
 
-            # Clear the periodic update line and print summary
-            print(f"\r  🎲 Epoch dropout summary: {total_blanked}/{total_samples} samples blanked ({pct_blanked:.1f}%)")
-            print(f"     Per-stream: {stream_str}")
-
-            # Store in history for analysis
+            # Store in history for analysis (fit() will print the summary)
             if '_dropout_epoch_stats' not in history:
                 history['_dropout_epoch_stats'] = []
             history['_dropout_epoch_stats'].append({
