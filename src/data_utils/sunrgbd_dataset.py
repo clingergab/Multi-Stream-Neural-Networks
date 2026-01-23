@@ -45,12 +45,16 @@ class SUNRGBDDataset(Dataset):
         data_root='data/sunrgbd_15',
         train=True,
         target_size=(416, 544),
+        normalize: bool = True,
     ):
         """
         Args:
             data_root: Root directory of preprocessed dataset
             train: If True, load training set; else load validation set
             target_size: Target image size (H, W)
+            normalize: If True, apply normalization in __getitem__().
+                      Set to False when using GPU augmentation (which handles
+                      normalization on GPU after augmentation).
 
         Note: All augmentation is performed in __getitem__() to enable synchronized
         transforms between RGB and depth modalities.
@@ -58,6 +62,7 @@ class SUNRGBDDataset(Dataset):
         self.data_root = data_root
         self.train = train
         self.target_size = target_size
+        self.normalize = normalize
 
         # Set split directory
         split = 'train' if train else 'val'
@@ -136,33 +141,37 @@ class SUNRGBDDataset(Dataset):
                 rgb = transforms.functional.resize(rgb, self.target_size)
                 depth = transforms.functional.resize(depth, self.target_size)
 
-            # 3. RGB-Only: Color Jitter (43% probability - BALANCED for 1.5x ratio)
-            # Applies brightness, contrast, saturation, hue adjustments
-            # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 75%)
-            if np.random.random() < 0.43:
-                color_jitter = transforms.ColorJitter(
-                    brightness=0.37,  # ±37% (balanced for 1.5x ratio)
-                    contrast=0.37,    # ±37% (balanced for 1.5x ratio)
-                    saturation=0.37,  # ±37% (balanced for 1.5x ratio)
-                    hue=0.11          # ±11% (balanced for 1.5x ratio)
-                )
-                rgb = color_jitter(rgb)
+            # 3-5. RGB-Only Appearance Augmentation (ColorJitter, Blur, Grayscale)
+            # Skip these when normalize=False (GPU augmentation mode) because
+            # GPUAugmentation will apply them on GPU after transfer.
+            if self.normalize:
+                # 3. RGB-Only: Color Jitter (43% probability - BALANCED for 1.5x ratio)
+                # Applies brightness, contrast, saturation, hue adjustments
+                # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 75%)
+                if np.random.random() < 0.43:
+                    color_jitter = transforms.ColorJitter(
+                        brightness=0.37,  # ±37% (balanced for 1.5x ratio)
+                        contrast=0.37,    # ±37% (balanced for 1.5x ratio)
+                        saturation=0.37,  # ±37% (balanced for 1.5x ratio)
+                        hue=0.11          # ±11% (balanced for 1.5x ratio)
+                    )
+                    rgb = color_jitter(rgb)
 
-            # 4. RGB-Only: Gaussian Blur (25% probability - BALANCED for 1.5x ratio)
-            # Reduces reliance on fine textures/edges, forces focus on spatial structure
-            # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 50%)
-            if np.random.random() < 0.25:
-                # Kernel size: random odd number between 3, 5, and 7
-                # Sigma: random between 0.1 and 1.7 (balanced for 1.5x ratio)
-                kernel_size = int(np.random.choice([3, 5, 7]))
-                sigma = float(np.random.uniform(0.1, 1.7))
-                rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
+                # 4. RGB-Only: Gaussian Blur (25% probability - BALANCED for 1.5x ratio)
+                # Reduces reliance on fine textures/edges, forces focus on spatial structure
+                # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 50%)
+                if np.random.random() < 0.25:
+                    # Kernel size: random odd number between 3, 5, and 7
+                    # Sigma: random between 0.1 and 1.7 (balanced for 1.5x ratio)
+                    kernel_size = int(np.random.choice([3, 5, 7]))
+                    sigma = float(np.random.uniform(0.1, 1.7))
+                    rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
 
-            # 5. RGB-Only: Occasional Grayscale (17% - BALANCED for 1.5x ratio)
-            # Forces RGB stream to learn from structure, not just color
-            # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 35%)
-            if np.random.random() < 0.17:
-                rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
+                # 5. RGB-Only: Occasional Grayscale (17% - BALANCED for 1.5x ratio)
+                # Forces RGB stream to learn from structure, not just color
+                # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 35%)
+                if np.random.random() < 0.17:
+                    rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
             # 6. Depth-Only: Combined Appearance Augmentation (50% probability)
             # IMPORTANT: Matches RGB's color jitter - single augmentation block
@@ -196,46 +205,50 @@ class SUNRGBDDataset(Dataset):
             rgb = transforms.functional.resize(rgb, self.target_size)
             depth = transforms.functional.resize(depth, self.target_size)
 
+        # ==================== TO TENSOR ====================
+        # Convert to tensor (always needed)
+        rgb = transforms.functional.to_tensor(rgb)
+        depth = transforms.functional.to_tensor(depth)
+
         # ==================== NORMALIZATION ====================
-        # Convert to tensor and normalize
         # Statistics computed from 8041 training samples at (416, 544) resolution
         # after scaling to [0, 1] range
+        #
+        # When normalize=False (GPU augmentation mode), skip normalization here.
+        # GPU augmentation will handle normalization after applying augmentations.
+        if self.normalize:
+            # RGB: Use exact computed training statistics
+            rgb = transforms.functional.normalize(
+                rgb,
+                mean=[0.4905626144214781, 0.4564359471868703, 0.43112756716677114],
+                std=[0.27944652961530003, 0.2868739703756949, 0.29222326115669395]
+            )
 
-        # RGB: Use exact computed training statistics
-        rgb = transforms.functional.to_tensor(rgb)
-        rgb = transforms.functional.normalize(
-            rgb,
-            mean=[0.4905626144214781, 0.4564359471868703, 0.43112756716677114],
-            std=[0.27944652961530003, 0.2868739703756949, 0.29222326115669395]
-        )
+            # Depth: Use exact computed training statistics
+            depth = transforms.functional.normalize(
+                depth, mean=[0.2912], std=[0.1472]
+            )
 
-        # Depth: Use exact computed training statistics
-        depth = transforms.functional.to_tensor(depth)
-        depth = transforms.functional.normalize(
-            depth, mean=[0.2912], std=[0.1472]
-        )
+            # 7. Post-normalization Random Erasing (CPU mode only)
+            # When using GPU augmentation, erasing is done on GPU after normalization
+            if self.train:
+                # RGB random erasing (17% - BALANCED for 1.5x ratio)
+                if np.random.random() < 0.17:
+                    erasing = transforms.RandomErasing(
+                        p=1.0,
+                        scale=(0.02, 0.10),    # Small patches (2-10% of image)
+                        ratio=(0.5, 2.0)       # Reasonable aspect ratios
+                    )
+                    rgb = erasing(rgb)
 
-
-        # 7. Post-normalization Random Erasing
-        # Applied after normalization for both modalities
-        if self.train:
-            # RGB random erasing (17% - BALANCED for 1.5x ratio)
-            if np.random.random() < 0.17:
-                erasing = transforms.RandomErasing(
-                    p=1.0,
-                    scale=(0.02, 0.10),    # Small patches (2-10% of image, balanced for 1.5x ratio)
-                    ratio=(0.5, 2.0)       # Reasonable aspect ratios
-                )
-                rgb = erasing(rgb)
-
-            # Depth random erasing (10% - separate and equal)
-            if np.random.random() < 0.1:
-                erasing = transforms.RandomErasing(
-                    p=1.0,
-                    scale=(0.02, 0.1),
-                    ratio=(0.5, 2.0)
-                )
-                depth = erasing(depth)
+                # Depth random erasing (10% - separate and equal)
+                if np.random.random() < 0.1:
+                    erasing = transforms.RandomErasing(
+                        p=1.0,
+                        scale=(0.02, 0.1),
+                        ratio=(0.5, 2.0)
+                    )
+                    depth = erasing(depth)
 
         # Get label
         label = self.labels[idx]
@@ -308,6 +321,7 @@ def get_sunrgbd_dataloaders(
     use_class_weights=False,
     stratified=False,
     seed=None,
+    normalize: bool = True,
 ):
     """
     Create train and validation dataloaders for SUN RGB-D.
@@ -323,6 +337,9 @@ def get_sunrgbd_dataloaders(
                    imbalanced datasets. Note: this oversamples minority classes.
         seed: Random seed for reproducible data loading. If None, non-reproducible.
               When set, ensures reproducible shuffle order and worker initialization.
+        normalize: If True, apply normalization in dataset __getitem__().
+                  Set to False when using GPU augmentation (which handles
+                  normalization on GPU after augmentation).
 
     Returns:
         train_loader, val_loader, (optional) class_weights
@@ -332,18 +349,23 @@ def get_sunrgbd_dataloaders(
         >>> from src.utils.seed import set_seed
         >>> set_seed(42)
         >>> train_loader, val_loader = get_sunrgbd_dataloaders(seed=42, stratified=True)
+        >>>
+        >>> # For GPU augmentation mode
+        >>> train_loader, val_loader = get_sunrgbd_dataloaders(normalize=False)
     """
     # Create datasets
     train_dataset = SUNRGBDDataset(
         data_root=data_root,
         train=True,
         target_size=target_size,
+        normalize=normalize,
     )
 
     val_dataset = SUNRGBDDataset(
         data_root=data_root,
         train=False,
         target_size=target_size,
+        normalize=normalize,
     )
 
     # Setup reproducibility if seed is provided

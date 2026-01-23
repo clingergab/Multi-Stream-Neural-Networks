@@ -125,6 +125,8 @@ class BaseModel(nn.Module, ABC):
         self.optimizer = None
         self.criterion = None
         self.scheduler = None
+        self.gpu_augmentation = False
+        self.gpu_aug = None
 
     def get_stream_parameter_groups(self,
                                      stream_lrs: Union[float, list[float]],
@@ -299,6 +301,7 @@ class BaseModel(nn.Module, ABC):
                 loss: str = 'cross_entropy',
                 scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
                 metrics: Optional[list[str]] = None,
+                gpu_augmentation: bool = False,
                 **kwargs):
         """
         Compile the model with optimizer, loss, and scheduler (Keras-style API).
@@ -314,6 +317,9 @@ class BaseModel(nn.Module, ABC):
             scheduler: Optional PyTorch LR scheduler instance (e.g., from setup_scheduler())
                       If None, no learning rate scheduling is applied
             metrics: List of metrics to track during training (default: ['accuracy'])
+            gpu_augmentation: Whether to use GPU-based augmentation. When True, expects
+                             input data in [0, 1] range (not normalized). GPU will apply
+                             augmentation and normalization. Requires dataset with normalize=False.
             **kwargs: Additional arguments for loss functions (e.g., label_smoothing, alpha, gamma)
 
         Example:
@@ -387,6 +393,14 @@ class BaseModel(nn.Module, ABC):
         base_lr = optimizer.param_groups[0]['lr'] if optimizer.param_groups else 'N/A'
         scheduler_name = scheduler.__class__.__name__ if scheduler else 'None'
 
+        # Setup GPU augmentation if enabled
+        self.gpu_augmentation = gpu_augmentation
+        self.gpu_aug = None
+        if gpu_augmentation:
+            from src.training.gpu_augmentation import GPUAugmentation
+            self.gpu_aug = GPUAugmentation().to(self.device)
+            print(f"  GPU augmentation: Enabled (using Kornia)")
+
         # Store configuration
         self.training_config = {
             'optimizer': optimizer_name,
@@ -396,7 +410,8 @@ class BaseModel(nn.Module, ABC):
             'scheduler': scheduler_name,
             'device': str(self.device),
             'use_amp': self.use_amp,
-            'num_param_groups': len(optimizer.param_groups)
+            'num_param_groups': len(optimizer.param_groups),
+            'gpu_augmentation': gpu_augmentation
         }
 
         # Set compilation flag

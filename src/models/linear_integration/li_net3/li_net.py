@@ -316,6 +316,45 @@ class LINet(BaseModel):
         logits = self.fc(integrated_features)
         return logits
 
+    # ==================== Configuration Validation ====================
+
+    def _validate_augmentation_config(self, train_loader: DataLoader, verbose: bool) -> None:
+        """
+        Validate that GPU augmentation setting matches dataset normalize setting.
+
+        Warns if there's a mismatch that could cause:
+        - Double normalization (normalize=True + gpu_augmentation=True)
+        - Missing normalization (normalize=False + gpu_augmentation=False)
+        """
+        # Try to get normalize attribute from dataset
+        dataset = train_loader.dataset
+
+        # Handle wrapped datasets (e.g., Subset, ConcatDataset)
+        while hasattr(dataset, 'dataset'):
+            dataset = dataset.dataset
+
+        # Check if dataset has normalize attribute
+        if not hasattr(dataset, 'normalize'):
+            return  # Can't validate, skip silently
+
+        dataset_normalize = dataset.normalize
+
+        # Check for mismatched configurations
+        if self.gpu_augmentation and dataset_normalize:
+            if verbose:
+                print(
+                    "⚠️  Warning: GPU augmentation is enabled but dataset has normalize=True.\n"
+                    "   This will cause DOUBLE NORMALIZATION (CPU + GPU).\n"
+                    "   Fix: Use normalize=False when creating dataset for GPU augmentation."
+                )
+        elif not self.gpu_augmentation and not dataset_normalize:
+            if verbose:
+                print(
+                    "⚠️  Warning: GPU augmentation is disabled but dataset has normalize=False.\n"
+                    "   Data will NOT be normalized, which may cause poor training.\n"
+                    "   Fix: Either enable gpu_augmentation=True in compile(), or use normalize=True in dataset."
+                )
+
     # ==================== Early Stopping Helper Methods ====================
 
     def _setup_early_stopping(self, enabled: bool, val_loader, monitor: str,
@@ -710,6 +749,9 @@ class LINet(BaseModel):
         """
         if self.optimizer is None or self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before fit().")
+
+        # Validate GPU augmentation configuration matches dataset
+        self._validate_augmentation_config(train_loader, verbose)
 
         callbacks = callbacks or []
 
@@ -1160,6 +1202,12 @@ class LINet(BaseModel):
                 # GPU optimization: non-blocking transfer for N-stream data
                 stream_batches = [stream.to(self.device, non_blocking=True) for stream in stream_batches]
 
+                # GPU normalization (if gpu_augmentation enabled)
+                if self.gpu_augmentation and self.gpu_aug is not None:
+                    stream_batches[0], stream_batches[1] = self.gpu_aug(
+                        stream_batches[0], stream_batches[1]
+                    )
+
                 outputs = self(stream_batches)
                 _, predictions = torch.max(outputs, 1)
                 all_predictions.append(predictions.cpu().numpy())
@@ -1194,6 +1242,12 @@ class LINet(BaseModel):
 
                 # GPU optimization: non-blocking transfer for N-stream data
                 stream_batches = [stream.to(self.device, non_blocking=True) for stream in stream_batches]
+
+                # GPU normalization (if gpu_augmentation enabled)
+                if self.gpu_augmentation and self.gpu_aug is not None:
+                    stream_batches[0], stream_batches[1] = self.gpu_aug(
+                        stream_batches[0], stream_batches[1]
+                    )
 
                 outputs = self(stream_batches)
                 # Apply softmax to get probabilities
@@ -1259,6 +1313,14 @@ class LINet(BaseModel):
             # GPU optimization: non-blocking transfer for all streams
             stream_batches = [batch.to(self.device, non_blocking=True) for batch in stream_batches]
             targets = targets.to(self.device, non_blocking=True)
+
+            # GPU augmentation (if enabled)
+            # Note: self.gpu_aug.training is True because self.train() was called at start of epoch
+            # Input expected in [0, 1] range when gpu_augmentation=True
+            if self.gpu_augmentation and self.gpu_aug is not None:
+                stream_batches[0], stream_batches[1] = self.gpu_aug(
+                    stream_batches[0], stream_batches[1]
+                )
 
             # Generate per-sample blanked mask for modality dropout
             blanked_mask = None
@@ -1556,6 +1618,14 @@ class LINet(BaseModel):
                 # GPU optimization: non-blocking transfer for all streams
                 stream_batches = [batch.to(self.device, non_blocking=True) for batch in stream_batches]
                 targets = targets.to(self.device, non_blocking=True)
+
+                # GPU normalization (if gpu_augmentation enabled)
+                # Note: self.gpu_aug.training is False because self.eval() was called
+                # This applies normalization only (no augmentation in eval mode)
+                if self.gpu_augmentation and self.gpu_aug is not None:
+                    stream_batches[0], stream_batches[1] = self.gpu_aug(
+                        stream_batches[0], stream_batches[1]
+                    )
 
                 # Convert blanked_streams set to blanked_mask for entire batch
                 blanked_mask = None
