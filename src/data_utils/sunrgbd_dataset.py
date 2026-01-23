@@ -389,6 +389,7 @@ def get_sunrgbd_dataloaders(
         shuffle=train_shuffle,
         sampler=train_sampler,
         num_workers=num_workers,
+        prefetch_factor=4,
         pin_memory=True,
         persistent_workers=True if num_workers > 0 else False,
         worker_init_fn=worker_init_fn,
@@ -400,8 +401,8 @@ def get_sunrgbd_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
+        prefetch_factor=2,
         pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False,
         worker_init_fn=worker_init_fn,
     )
 
