@@ -157,21 +157,31 @@ class PerGroupSchedulerWrapper:
             for scheduler in self.schedulers:
                 scheduler.last_epoch = 0
                 # Reset LR to base_lr (epoch 0 of cosine = base_lr)
-                for param_group, base_lr in zip(scheduler.optimizer.param_groups, scheduler.base_lrs):
-                    param_group['lr'] = base_lr
+                base_lr = scheduler.base_lrs[0]
+                scheduler.optimizer.param_groups[0]['lr'] = base_lr
+                # Also update the scheduler's internal _last_lr cache
+                scheduler._last_lr = [base_lr]
+
+            # Update main optimizer LRs directly from base_lrs
+            for param_group, scheduler in zip(self.optimizer.param_groups, self.schedulers):
+                param_group['lr'] = scheduler.base_lrs[0]
+
+            # Update tracking
+            self.last_epoch = 0
+            self._last_lr = [scheduler.base_lrs[0] for scheduler in self.schedulers]
         else:
             # Normal step - no epoch argument to avoid deprecation issues
             for scheduler in self.schedulers:
                 scheduler.step()
 
-        # Update main optimizer LRs (technically redundant due to shared references,
-        # but kept for explicitness and future-proofing)
-        for param_group, scheduler in zip(self.optimizer.param_groups, self.schedulers):
-            param_group['lr'] = scheduler.get_last_lr()[0]
+            # Update main optimizer LRs (technically redundant due to shared references,
+            # but kept for explicitness and future-proofing)
+            for param_group, scheduler in zip(self.optimizer.param_groups, self.schedulers):
+                param_group['lr'] = scheduler.get_last_lr()[0]
 
-        # Update tracking
-        self.last_epoch = self.schedulers[0].last_epoch
-        self._last_lr = [scheduler.get_last_lr()[0] for scheduler in self.schedulers]
+            # Update tracking
+            self.last_epoch = self.schedulers[0].last_epoch
+            self._last_lr = [scheduler.get_last_lr()[0] for scheduler in self.schedulers]
 
     def get_last_lr(self):
         """Get last learning rates from all schedulers."""
