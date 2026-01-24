@@ -145,42 +145,103 @@ class PerGroupSchedulerWrapper:
             epoch: Optional epoch number. When epoch=0 is passed (by SequentialLR during
                    transition), we reset all sub-schedulers to their base LRs.
 
-        Note: Because param_groups are shared by reference between the single-group
-        optimizers and the main optimizer, when each scheduler updates its optimizer's
-        param_group['lr'], it automatically updates the main optimizer's param_group['lr'].
-        The explicit update loop below is kept for clarity and to ensure _last_lr tracking.
+        Note: In PyTorch 2.9+, scheduler.step(epoch) behavior changed and may skip updates.
+        We handle epoch=0 (SequentialLR transition) by manually resetting to base_lrs.
         """
         # Handle epoch=0 specially (SequentialLR transition reset)
         # In PyTorch 2.9+, step(epoch) is deprecated and may skip updates,
         # so we manually reset to base_lrs when epoch=0
         if epoch == 0:
-            for scheduler in self.schedulers:
-                scheduler.last_epoch = 0
-                # Reset LR to base_lr (epoch 0 of cosine = base_lr)
-                base_lr = scheduler.base_lrs[0]
-                scheduler.optimizer.param_groups[0]['lr'] = base_lr
-                # Also update the scheduler's internal _last_lr cache
-                scheduler._last_lr = [base_lr]
+            # Collect all base_lrs first, before any modifications
+            base_lrs = [scheduler.base_lrs[0] for scheduler in self.schedulers]
 
-            # Update main optimizer LRs directly from base_lrs
-            for param_group, scheduler in zip(self.optimizer.param_groups, self.schedulers):
-                param_group['lr'] = scheduler.base_lrs[0]
+            # Reset each sub-scheduler and its optimizer's param_group
+            for i, scheduler in enumerate(self.schedulers):
+                base_lr = base_lrs[i]
+                # Reset scheduler state
+                scheduler.last_epoch = 0
+                # Reset LR in sub-scheduler's optimizer
+                scheduler.optimizer.param_groups[0]['lr'] = base_lr
+                # Update the scheduler's internal _last_lr cache
+                if hasattr(scheduler, '_last_lr'):
+                    scheduler._last_lr = [base_lr]
+
+            # CRITICAL: Also update main optimizer LRs directly
+            # This ensures the LRs are correct even if param_groups aren't shared properly
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                param_group['lr'] = base_lrs[i]
 
             # Update tracking
             self.last_epoch = 0
-            self._last_lr = [scheduler.base_lrs[0] for scheduler in self.schedulers]
+            self._last_lr = base_lrs
         else:
             # Normal step - no epoch argument to avoid deprecation issues
             for scheduler in self.schedulers:
                 scheduler.step()
 
-            # Update main optimizer LRs (technically redundant due to shared references,
-            # but kept for explicitness and future-proofing)
+            # Update main optimizer LRs explicitly
+            # This ensures correctness regardless of whether param_groups are truly shared
             for param_group, scheduler in zip(self.optimizer.param_groups, self.schedulers):
                 param_group['lr'] = scheduler.get_last_lr()[0]
 
             # Update tracking
             self.last_epoch = self.schedulers[0].last_epoch
+            self._last_lr = [scheduler.get_last_lr()[0] for scheduler in self.schedulers]
+
+    def _update_lr(self, epoch=None):
+        """
+        Update learning rates for all parameter groups.
+
+        This method is called by SequentialLR in PyTorch 2.9+ during scheduler transitions.
+        In PyTorch 2.9, SequentialLR calls scheduler._update_lr(0) instead of scheduler.step(0)
+        when transitioning between schedulers.
+
+        Args:
+            epoch: When epoch=0 is passed (during SequentialLR transition), reset all
+                   sub-schedulers to their base_lrs. Otherwise, step all schedulers.
+        """
+        if epoch == 0:
+            # Transition from warmup to main scheduler - reset to base_lrs
+            base_lrs = [scheduler.base_lrs[0] for scheduler in self.schedulers]
+
+            # Reset each sub-scheduler
+            for i, scheduler in enumerate(self.schedulers):
+                base_lr = base_lrs[i]
+                scheduler.last_epoch = 0
+                scheduler.optimizer.param_groups[0]['lr'] = base_lr
+                if hasattr(scheduler, '_last_lr'):
+                    scheduler._last_lr = [base_lr]
+
+            # Update main optimizer LRs
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                param_group['lr'] = base_lrs[i]
+
+            # Update tracking
+            self.last_epoch = 0
+            self._last_lr = base_lrs
+        elif epoch is None:
+            # Normal step (increment last_epoch)
+            for scheduler in self.schedulers:
+                scheduler.step()
+
+            # Update main optimizer LRs
+            for param_group, scheduler in zip(self.optimizer.param_groups, self.schedulers):
+                param_group['lr'] = scheduler.get_last_lr()[0]
+
+            # Update tracking
+            self.last_epoch = self.schedulers[0].last_epoch
+            self._last_lr = [scheduler.get_last_lr()[0] for scheduler in self.schedulers]
+        else:
+            # Explicit epoch setting
+            for scheduler in self.schedulers:
+                scheduler._update_lr(epoch)
+
+            # Update main optimizer LRs
+            for param_group, scheduler in zip(self.optimizer.param_groups, self.schedulers):
+                param_group['lr'] = scheduler.get_last_lr()[0]
+
+            # Update tracking
+            self.last_epoch = epoch
             self._last_lr = [scheduler.get_last_lr()[0] for scheduler in self.schedulers]
 
     def get_last_lr(self):
@@ -219,7 +280,7 @@ class PerGroupSchedulerWrapper:
         that expects a single scheduler.
         """
         if name in ['optimizer', 'scheduler_class', 'scheduler_kwargs_list',
-                    'schedulers', 'last_epoch', '_last_lr']:
+                    'schedulers', 'last_epoch', '_last_lr', '_update_lr']:
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
         return getattr(self.schedulers[0], name)
