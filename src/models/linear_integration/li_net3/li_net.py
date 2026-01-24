@@ -969,6 +969,10 @@ class LINet(BaseModel):
                                                         stream_early_stopping_state)
                             break
             
+            # Capture LRs that were used during this epoch BEFORE stepping the scheduler
+            current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
+            epoch_stream_lrs = [pg['lr'] for pg in self.optimizer.param_groups[:self.num_streams]]
+
             # Step epoch-based schedulers at epoch end
             # Skip OneCycleLR (steps per batch) and schedulers with _step_per_batch=True
             if self.scheduler is not None:
@@ -988,7 +992,6 @@ class LINet(BaseModel):
                         # All other epoch-based schedulers (CosineAnnealingLR, CosineAnnealingWarmRestarts, StepLR, etc.)
                         # step per epoch without arguments
                         self.scheduler.step()
-            current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
             
             # Update history and finalize progress bar
             update_history(history, avg_train_loss, train_accuracy, val_loss, val_acc, current_lr, bool(val_loader))
@@ -1010,7 +1013,8 @@ class LINet(BaseModel):
                     stream_stats = self._print_stream_monitoring(
                         stream_train_accs=stream_train_accs,
                         stream_val_accs=stream_val_accs,
-                        stream_val_losses=stream_val_losses
+                        stream_val_losses=stream_val_losses,
+                        stream_lrs=epoch_stream_lrs
                     )
                     # Save learning rates (only available with stream-specific param groups)
                     if stream_stats:
@@ -1719,7 +1723,7 @@ class LINet(BaseModel):
         return avg_loss, accuracy, stream_val_accs, avg_stream_val_losses
 
     def _print_stream_monitoring(self, stream_train_accs: list[float], stream_val_accs: list[float],
-                                 stream_val_losses: list[float]) -> dict:
+                                 stream_val_losses: list[float], stream_lrs: list[float] = None) -> dict:
         """
         Print stream-specific monitoring metrics (computed during main training loop).
 
@@ -1727,6 +1731,7 @@ class LINet(BaseModel):
             stream_train_accs: List of training accuracies for each stream
             stream_val_accs: List of validation accuracies for each stream
             stream_val_losses: List of validation losses for each stream
+            stream_lrs: Optional list of LRs used during this epoch (if None, reads from optimizer)
 
         Returns:
             Dictionary containing stream-specific metrics for history tracking
@@ -1742,7 +1747,8 @@ class LINet(BaseModel):
             stream_stats = {}
 
             for i in range(self.num_streams):
-                stream_lr = param_groups[i]['lr']
+                # Use pre-captured LRs if provided, otherwise read from optimizer
+                stream_lr = stream_lrs[i] if stream_lrs is not None else param_groups[i]['lr']
                 stream_wd = param_groups[i]['weight_decay']
 
                 stream_str = (f"Stream_{i}: "
