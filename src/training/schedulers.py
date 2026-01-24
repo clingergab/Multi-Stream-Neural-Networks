@@ -137,18 +137,32 @@ class PerGroupSchedulerWrapper:
         self.last_epoch = -1
         self._last_lr = None
 
-    def step(self, *args, **kwargs):
+    def step(self, epoch=None):
         """
         Step all per-group schedulers and update optimizer LRs.
+
+        Args:
+            epoch: Optional epoch number. When epoch=0 is passed (by SequentialLR during
+                   transition), we reset all sub-schedulers to their base LRs.
 
         Note: Because param_groups are shared by reference between the single-group
         optimizers and the main optimizer, when each scheduler updates its optimizer's
         param_group['lr'], it automatically updates the main optimizer's param_group['lr'].
         The explicit update loop below is kept for clarity and to ensure _last_lr tracking.
         """
-        # Step each scheduler (this updates LRs in shared param_groups)
-        for scheduler in self.schedulers:
-            scheduler.step(*args, **kwargs)
+        # Handle epoch=0 specially (SequentialLR transition reset)
+        # In PyTorch 2.9+, step(epoch) is deprecated and may skip updates,
+        # so we manually reset to base_lrs when epoch=0
+        if epoch == 0:
+            for scheduler in self.schedulers:
+                scheduler.last_epoch = 0
+                # Reset LR to base_lr (epoch 0 of cosine = base_lr)
+                for param_group, base_lr in zip(scheduler.optimizer.param_groups, scheduler.base_lrs):
+                    param_group['lr'] = base_lr
+        else:
+            # Normal step - no epoch argument to avoid deprecation issues
+            for scheduler in self.schedulers:
+                scheduler.step()
 
         # Update main optimizer LRs (technically redundant due to shared references,
         # but kept for explicitness and future-proofing)
