@@ -18,6 +18,34 @@ Validation mode: Normalize only (no augmentation)
 import torch
 import torch.nn as nn
 
+from src.training.augmentation_config import (
+    # Probability baselines
+    BASE_COLOR_JITTER_P,
+    BASE_BLUR_P,
+    BASE_GRAYSCALE_P,
+    BASE_RGB_ERASING_P,
+    BASE_DEPTH_ERASING_P,
+    # Magnitude baselines
+    BASE_BRIGHTNESS,
+    BASE_CONTRAST,
+    BASE_SATURATION,
+    BASE_HUE,
+    BASE_BLUR_SIGMA_MIN,
+    BASE_BLUR_SIGMA_MAX,
+    BASE_ERASING_SCALE_MIN,
+    BASE_ERASING_SCALE_MAX,
+    BASE_ERASING_RATIO_MIN,
+    BASE_ERASING_RATIO_MAX,
+    # Caps
+    MAX_PROBABILITY,
+    MAX_BRIGHTNESS,
+    MAX_CONTRAST,
+    MAX_SATURATION,
+    MAX_HUE,
+    MAX_BLUR_SIGMA,
+    MAX_ERASING_SCALE,
+)
+
 try:
     import kornia.augmentation as K
     KORNIA_AVAILABLE = True
@@ -33,20 +61,19 @@ class GPUAugmentation(nn.Module):
     whether to apply augmentations. This follows PyTorch conventions and
     automatically syncs with parent model's train/eval state.
 
+    Note: Flip and crop augmentations are handled by the dataset (CPU-side) because
+    they need to be synchronized between RGB and Depth. GPU augmentation only handles
+    color transforms and erasing.
+
     Args:
         rgb_mean: RGB normalization mean (3 values). Defaults to SUN RGB-D stats.
         rgb_std: RGB normalization std (3 values). Defaults to SUN RGB-D stats.
         depth_mean: Depth normalization mean (1 value). Defaults to SUN RGB-D stats.
         depth_std: Depth normalization std (1 value). Defaults to SUN RGB-D stats.
-        color_jitter_p: Probability of applying ColorJitter (default: 0.43)
-        blur_p: Probability of applying Gaussian blur (default: 0.25)
-        grayscale_p: Probability of converting to grayscale (default: 0.17)
-        rgb_erasing_p: Probability of random erasing on RGB (default: 0.17)
-        depth_erasing_p: Probability of random erasing on depth (default: 0.10)
-        brightness: ColorJitter brightness range (default: 0.37)
-        contrast: ColorJitter contrast range (default: 0.37)
-        saturation: ColorJitter saturation range (default: 0.37)
-        hue: ColorJitter hue range (default: 0.11)
+        rgb_aug_prob: Scales probability of RGB augmentations (default: 1.0 = baseline)
+        rgb_aug_mag: Scales magnitude of RGB augmentations (default: 1.0 = baseline)
+        depth_aug_prob: Scales probability of Depth augmentations (default: 1.0 = baseline)
+        depth_aug_mag: Scales magnitude of Depth augmentations (default: 1.0 = baseline)
 
     Example:
         >>> gpu_aug = GPUAugmentation().to('cuda')
@@ -57,6 +84,9 @@ class GPUAugmentation(nn.Module):
         >>>
         >>> # In validation (model.eval() sets gpu_aug.training = False)
         >>> rgb_norm, depth_norm = gpu_aug(rgb_batch, depth_batch)
+        >>>
+        >>> # With custom augmentation scaling
+        >>> gpu_aug = GPUAugmentation(rgb_aug_prob=1.5, rgb_aug_mag=1.2).to('cuda')
     """
 
     # SUN RGB-D training set statistics (computed from 8041 samples)
@@ -71,15 +101,10 @@ class GPUAugmentation(nn.Module):
         rgb_std: list[float] = None,
         depth_mean: list[float] = None,
         depth_std: list[float] = None,
-        color_jitter_p: float = 0.43,
-        blur_p: float = 0.25,
-        grayscale_p: float = 0.17,
-        rgb_erasing_p: float = 0.17,
-        depth_erasing_p: float = 0.10,
-        brightness: float = 0.37,
-        contrast: float = 0.37,
-        saturation: float = 0.37,
-        hue: float = 0.11,
+        rgb_aug_prob: float = 1.0,
+        rgb_aug_mag: float = 1.0,
+        depth_aug_prob: float = 1.0,
+        depth_aug_mag: float = 1.0,
     ):
         super().__init__()
 
@@ -88,6 +113,12 @@ class GPUAugmentation(nn.Module):
                 "Kornia is required for GPU augmentation. "
                 "Install with: pip install kornia"
             )
+
+        # Store augmentation scaling parameters for logging
+        self.rgb_aug_prob = rgb_aug_prob
+        self.rgb_aug_mag = rgb_aug_mag
+        self.depth_aug_prob = depth_aug_prob
+        self.depth_aug_mag = depth_aug_mag
 
         # Use defaults if not specified
         rgb_mean = rgb_mean or self.DEFAULT_RGB_MEAN
@@ -100,6 +131,31 @@ class GPUAugmentation(nn.Module):
         self.register_buffer('rgb_std', torch.tensor(rgb_std, dtype=torch.float32))
         self.register_buffer('depth_mean', torch.tensor(depth_mean, dtype=torch.float32))
         self.register_buffer('depth_std', torch.tensor(depth_std, dtype=torch.float32))
+
+        # === Compute scaled RGB augmentation values ===
+        color_jitter_p = min(BASE_COLOR_JITTER_P * rgb_aug_prob, MAX_PROBABILITY)
+        blur_p = min(BASE_BLUR_P * rgb_aug_prob, MAX_PROBABILITY)
+        grayscale_p = min(BASE_GRAYSCALE_P * rgb_aug_prob, MAX_PROBABILITY)
+        rgb_erasing_p = min(BASE_RGB_ERASING_P * rgb_aug_prob, MAX_PROBABILITY)
+
+        brightness = min(BASE_BRIGHTNESS * rgb_aug_mag, MAX_BRIGHTNESS)
+        contrast = min(BASE_CONTRAST * rgb_aug_mag, MAX_CONTRAST)
+        saturation = min(BASE_SATURATION * rgb_aug_mag, MAX_SATURATION)
+        hue = min(BASE_HUE * rgb_aug_mag, MAX_HUE)
+        blur_sigma_max = min(BASE_BLUR_SIGMA_MAX * rgb_aug_mag, MAX_BLUR_SIGMA)
+        rgb_erasing_scale_max = min(BASE_ERASING_SCALE_MAX * rgb_aug_mag, MAX_ERASING_SCALE)
+
+        # === Compute scaled Depth augmentation values ===
+        depth_erasing_p = min(BASE_DEPTH_ERASING_P * depth_aug_prob, MAX_PROBABILITY)
+        depth_erasing_scale_max = min(BASE_ERASING_SCALE_MAX * depth_aug_mag, MAX_ERASING_SCALE)
+
+        # Store computed values for logging
+        self._color_jitter_p = color_jitter_p
+        self._blur_p = blur_p
+        self._grayscale_p = grayscale_p
+        self._rgb_erasing_p = rgb_erasing_p
+        self._brightness = brightness
+        self._depth_erasing_p = depth_erasing_p
 
         # RGB augmentation pipeline (applied before normalization)
         # Note: Kornia's RandomGaussianBlur with kernel_size=(3, 7) samples
@@ -114,7 +170,7 @@ class GPUAugmentation(nn.Module):
             ),
             K.RandomGaussianBlur(
                 kernel_size=(3, 7),
-                sigma=(0.1, 1.7),
+                sigma=(BASE_BLUR_SIGMA_MIN, blur_sigma_max),
                 p=blur_p,
             ),
             K.RandomGrayscale(p=grayscale_p),
@@ -124,15 +180,32 @@ class GPUAugmentation(nn.Module):
 
         # Random erasing (applied after normalization)
         self.rgb_erasing = K.RandomErasing(
-            scale=(0.02, 0.10),
-            ratio=(0.5, 2.0),
+            scale=(BASE_ERASING_SCALE_MIN, rgb_erasing_scale_max),
+            ratio=(BASE_ERASING_RATIO_MIN, BASE_ERASING_RATIO_MAX),
             p=rgb_erasing_p,
         )
         self.depth_erasing = K.RandomErasing(
-            scale=(0.02, 0.10),
-            ratio=(0.5, 2.0),
+            scale=(BASE_ERASING_SCALE_MIN, depth_erasing_scale_max),
+            ratio=(BASE_ERASING_RATIO_MIN, BASE_ERASING_RATIO_MAX),
             p=depth_erasing_p,
         )
+
+        # Log augmentation config if scaling is applied
+        if any(p != 1.0 for p in [rgb_aug_prob, rgb_aug_mag, depth_aug_prob, depth_aug_mag]):
+            self._log_augmentation_config()
+
+    def _log_augmentation_config(self):
+        """Log computed augmentation values when scaling is applied."""
+        print(f"\nGPU Augmentation scaling applied:")
+        print(f"  RGB:   prob={self.rgb_aug_prob:.2f}, mag={self.rgb_aug_mag:.2f}")
+        print(f"  Depth: prob={self.depth_aug_prob:.2f}, mag={self.depth_aug_mag:.2f}")
+        print(f"  Computed values:")
+        print(f"    [RGB]   ColorJitter prob: {BASE_COLOR_JITTER_P:.2f} -> {self._color_jitter_p:.3f}")
+        print(f"    [RGB]   Brightness: ±{BASE_BRIGHTNESS:.2f} -> ±{self._brightness:.3f}")
+        print(f"    [RGB]   Blur prob: {BASE_BLUR_P:.2f} -> {self._blur_p:.3f}")
+        print(f"    [RGB]   Grayscale prob: {BASE_GRAYSCALE_P:.2f} -> {self._grayscale_p:.3f}")
+        print(f"    [RGB]   Erasing prob: {BASE_RGB_ERASING_P:.2f} -> {self._rgb_erasing_p:.3f}")
+        print(f"    [Depth] Erasing prob: {BASE_DEPTH_ERASING_P:.2f} -> {self._depth_erasing_p:.3f}")
 
     def forward(
         self,

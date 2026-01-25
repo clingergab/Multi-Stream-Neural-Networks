@@ -302,6 +302,10 @@ class BaseModel(nn.Module, ABC):
                 scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
                 metrics: Optional[list[str]] = None,
                 gpu_augmentation: bool = False,
+                rgb_aug_prob: float = 1.0,
+                rgb_aug_mag: float = 1.0,
+                depth_aug_prob: float = 1.0,
+                depth_aug_mag: float = 1.0,
                 **kwargs):
         """
         Compile the model with optimizer, loss, and scheduler (Keras-style API).
@@ -320,6 +324,10 @@ class BaseModel(nn.Module, ABC):
             gpu_augmentation: Whether to use GPU-based augmentation. When True, expects
                              input data in [0, 1] range (not normalized). GPU will apply
                              augmentation and normalization. Requires dataset with normalize=False.
+            rgb_aug_prob: Scales probability of RGB augmentations (default: 1.0 = baseline)
+            rgb_aug_mag: Scales magnitude of RGB augmentations (default: 1.0 = baseline)
+            depth_aug_prob: Scales probability of Depth augmentations (default: 1.0 = baseline)
+            depth_aug_mag: Scales magnitude of Depth augmentations (default: 1.0 = baseline)
             **kwargs: Additional arguments for loss functions (e.g., label_smoothing, alpha, gamma)
 
         Example:
@@ -343,6 +351,14 @@ class BaseModel(nn.Module, ABC):
             >>>
             >>> # Compile model with optimizer and scheduler objects
             >>> model.compile(optimizer=optimizer, scheduler=scheduler, loss='cross_entropy')
+            >>>
+            >>> # With custom augmentation scaling
+            >>> from src.training.augmentation_config import AugmentationConfig
+            >>> aug_config = AugmentationConfig(rgb_aug_prob=1.5, rgb_aug_mag=1.2)
+            >>> model.compile(
+            ...     optimizer=optimizer, scheduler=scheduler, gpu_augmentation=True,
+            ...     **aug_config.to_dict()
+            ... )
             >>>
             >>> # Train model
             >>> model.fit(train_loader, val_loader, epochs=80)
@@ -398,7 +414,12 @@ class BaseModel(nn.Module, ABC):
         self.gpu_aug = None
         if gpu_augmentation:
             from src.training.gpu_augmentation import GPUAugmentation
-            self.gpu_aug = GPUAugmentation().to(self.device)
+            self.gpu_aug = GPUAugmentation(
+                rgb_aug_prob=rgb_aug_prob,
+                rgb_aug_mag=rgb_aug_mag,
+                depth_aug_prob=depth_aug_prob,
+                depth_aug_mag=depth_aug_mag,
+            ).to(self.device)
             print(f"  GPU augmentation: Enabled (using Kornia)")
 
         # Store configuration
@@ -411,7 +432,11 @@ class BaseModel(nn.Module, ABC):
             'device': str(self.device),
             'use_amp': self.use_amp,
             'num_param_groups': len(optimizer.param_groups),
-            'gpu_augmentation': gpu_augmentation
+            'gpu_augmentation': gpu_augmentation,
+            'rgb_aug_prob': rgb_aug_prob,
+            'rgb_aug_mag': rgb_aug_mag,
+            'depth_aug_prob': depth_aug_prob,
+            'depth_aug_mag': depth_aug_mag,
         }
 
         # Set compilation flag

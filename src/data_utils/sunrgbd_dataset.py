@@ -14,6 +14,48 @@ import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 from torchvision import transforms
 
+from src.training.augmentation_config import (
+    # Probability baselines
+    BASE_FLIP_P,
+    BASE_CROP_P,
+    BASE_COLOR_JITTER_P,
+    BASE_BLUR_P,
+    BASE_GRAYSCALE_P,
+    BASE_RGB_ERASING_P,
+    BASE_DEPTH_AUG_P,
+    BASE_DEPTH_ERASING_P,
+    # Magnitude baselines
+    BASE_CROP_SCALE_MIN,
+    BASE_CROP_SCALE_MAX,
+    BASE_CROP_RATIO_MIN,
+    BASE_CROP_RATIO_MAX,
+    BASE_BRIGHTNESS,
+    BASE_CONTRAST,
+    BASE_SATURATION,
+    BASE_HUE,
+    BASE_BLUR_SIGMA_MIN,
+    BASE_BLUR_SIGMA_MAX,
+    BASE_ERASING_SCALE_MIN,
+    BASE_ERASING_SCALE_MAX,
+    BASE_ERASING_RATIO_MIN,
+    BASE_ERASING_RATIO_MAX,
+    BASE_DEPTH_BRIGHTNESS,
+    BASE_DEPTH_CONTRAST,
+    BASE_DEPTH_NOISE_STD,
+    # Caps
+    MAX_PROBABILITY,
+    MAX_BRIGHTNESS,
+    MAX_CONTRAST,
+    MAX_SATURATION,
+    MAX_HUE,
+    MAX_BLUR_SIGMA,
+    MAX_DEPTH_BRIGHTNESS,
+    MAX_DEPTH_CONTRAST,
+    MAX_DEPTH_NOISE_STD,
+    MIN_CROP_SCALE,
+    MAX_ERASING_SCALE,
+)
+
 
 class SUNRGBDDataset(Dataset):
     """
@@ -46,6 +88,10 @@ class SUNRGBDDataset(Dataset):
         train=True,
         target_size=(416, 544),
         normalize: bool = True,
+        rgb_aug_prob: float = 1.0,
+        rgb_aug_mag: float = 1.0,
+        depth_aug_prob: float = 1.0,
+        depth_aug_mag: float = 1.0,
     ):
         """
         Args:
@@ -55,6 +101,10 @@ class SUNRGBDDataset(Dataset):
             normalize: If True, apply normalization in __getitem__().
                       Set to False when using GPU augmentation (which handles
                       normalization on GPU after augmentation).
+            rgb_aug_prob: Scales probability of RGB augmentations (default: 1.0 = baseline)
+            rgb_aug_mag: Scales magnitude of RGB augmentations (default: 1.0 = baseline)
+            depth_aug_prob: Scales probability of Depth augmentations (default: 1.0 = baseline)
+            depth_aug_mag: Scales magnitude of Depth augmentations (default: 1.0 = baseline)
 
         Note: All augmentation is performed in __getitem__() to enable synchronized
         transforms between RGB and depth modalities.
@@ -63,6 +113,15 @@ class SUNRGBDDataset(Dataset):
         self.train = train
         self.target_size = target_size
         self.normalize = normalize
+
+        # Store augmentation scaling parameters
+        self.rgb_aug_prob = rgb_aug_prob
+        self.rgb_aug_mag = rgb_aug_mag
+        self.depth_aug_prob = depth_aug_prob
+        self.depth_aug_mag = depth_aug_mag
+
+        # Pre-compute scaled augmentation values (avoids repeated computation in __getitem__)
+        self._compute_scaled_aug_values()
 
         # Set split directory
         split = 'train' if train else 'val'
@@ -85,8 +144,76 @@ class SUNRGBDDataset(Dataset):
 
         print(f"Loaded SUN RGB-D {split} set: {self.num_samples} samples, 15 classes")
 
+        # Log augmentation config if scaling is applied
+        if train and any(p != 1.0 for p in [rgb_aug_prob, rgb_aug_mag, depth_aug_prob, depth_aug_mag]):
+            self._log_augmentation_config()
+
     def __len__(self):
         return self.num_samples
+
+    def _compute_scaled_aug_values(self):
+        """Pre-compute scaled augmentation values based on aug_prob and aug_mag parameters."""
+        # Synchronized augmentations use average of RGB and Depth params
+        sync_prob = (self.rgb_aug_prob + self.depth_aug_prob) / 2
+        sync_mag = (self.rgb_aug_mag + self.depth_aug_mag) / 2
+
+        # === SYNCHRONIZED (flip, crop) ===
+        self._flip_p = min(BASE_FLIP_P * sync_prob, MAX_PROBABILITY)
+        self._crop_p = min(BASE_CROP_P * sync_prob, MAX_PROBABILITY)
+        # Crop scale: higher mag = more aggressive crop (lower min scale)
+        self._crop_scale_min = max(
+            MIN_CROP_SCALE,
+            1.0 - (1.0 - BASE_CROP_SCALE_MIN) * sync_mag
+        )
+        self._crop_scale_max = BASE_CROP_SCALE_MAX
+        self._crop_ratio_min = BASE_CROP_RATIO_MIN
+        self._crop_ratio_max = BASE_CROP_RATIO_MAX
+
+        # === RGB-ONLY ===
+        self._color_jitter_p = min(BASE_COLOR_JITTER_P * self.rgb_aug_prob, MAX_PROBABILITY)
+        self._brightness = min(BASE_BRIGHTNESS * self.rgb_aug_mag, MAX_BRIGHTNESS)
+        self._contrast = min(BASE_CONTRAST * self.rgb_aug_mag, MAX_CONTRAST)
+        self._saturation = min(BASE_SATURATION * self.rgb_aug_mag, MAX_SATURATION)
+        self._hue = min(BASE_HUE * self.rgb_aug_mag, MAX_HUE)
+
+        self._blur_p = min(BASE_BLUR_P * self.rgb_aug_prob, MAX_PROBABILITY)
+        self._blur_sigma_min = BASE_BLUR_SIGMA_MIN
+        self._blur_sigma_max = min(BASE_BLUR_SIGMA_MAX * self.rgb_aug_mag, MAX_BLUR_SIGMA)
+
+        self._grayscale_p = min(BASE_GRAYSCALE_P * self.rgb_aug_prob, MAX_PROBABILITY)
+
+        self._rgb_erasing_p = min(BASE_RGB_ERASING_P * self.rgb_aug_prob, MAX_PROBABILITY)
+        self._rgb_erasing_scale_min = BASE_ERASING_SCALE_MIN
+        self._rgb_erasing_scale_max = min(BASE_ERASING_SCALE_MAX * self.rgb_aug_mag, MAX_ERASING_SCALE)
+
+        # === DEPTH-ONLY ===
+        self._depth_aug_p = min(BASE_DEPTH_AUG_P * self.depth_aug_prob, MAX_PROBABILITY)
+        self._depth_brightness = min(BASE_DEPTH_BRIGHTNESS * self.depth_aug_mag, MAX_DEPTH_BRIGHTNESS)
+        self._depth_contrast = min(BASE_DEPTH_CONTRAST * self.depth_aug_mag, MAX_DEPTH_CONTRAST)
+        self._depth_noise_std = min(BASE_DEPTH_NOISE_STD * self.depth_aug_mag, MAX_DEPTH_NOISE_STD)
+
+        self._depth_erasing_p = min(BASE_DEPTH_ERASING_P * self.depth_aug_prob, MAX_PROBABILITY)
+        self._depth_erasing_scale_min = BASE_ERASING_SCALE_MIN
+        self._depth_erasing_scale_max = min(BASE_ERASING_SCALE_MAX * self.depth_aug_mag, MAX_ERASING_SCALE)
+
+    def _log_augmentation_config(self):
+        """Log computed augmentation values when scaling is applied."""
+        print(f"\nAugmentation scaling applied:")
+        print(f"  RGB:   prob={self.rgb_aug_prob:.2f}, mag={self.rgb_aug_mag:.2f}")
+        print(f"  Depth: prob={self.depth_aug_prob:.2f}, mag={self.depth_aug_mag:.2f}")
+        print(f"  Computed values:")
+        print(f"    [Sync]  Flip prob: {BASE_FLIP_P:.2f} -> {self._flip_p:.3f}")
+        print(f"    [Sync]  Crop prob: {BASE_CROP_P:.2f} -> {self._crop_p:.3f}")
+        print(f"    [Sync]  Crop scale min: {BASE_CROP_SCALE_MIN:.2f} -> {self._crop_scale_min:.3f}")
+        print(f"    [RGB]   ColorJitter prob: {BASE_COLOR_JITTER_P:.2f} -> {self._color_jitter_p:.3f}")
+        print(f"    [RGB]   Brightness: ±{BASE_BRIGHTNESS:.2f} -> ±{self._brightness:.3f}")
+        print(f"    [RGB]   Blur prob: {BASE_BLUR_P:.2f} -> {self._blur_p:.3f}")
+        print(f"    [RGB]   Grayscale prob: {BASE_GRAYSCALE_P:.2f} -> {self._grayscale_p:.3f}")
+        print(f"    [RGB]   Erasing prob: {BASE_RGB_ERASING_P:.2f} -> {self._rgb_erasing_p:.3f}")
+        print(f"    [Depth] Aug prob: {BASE_DEPTH_AUG_P:.2f} -> {self._depth_aug_p:.3f}")
+        print(f"    [Depth] Brightness: ±{BASE_DEPTH_BRIGHTNESS:.2f} -> ±{self._depth_brightness:.3f}")
+        print(f"    [Depth] Noise std: {BASE_DEPTH_NOISE_STD:.3f} -> {self._depth_noise_std:.3f}")
+        print(f"    [Depth] Erasing prob: {BASE_DEPTH_ERASING_P:.2f} -> {self._depth_erasing_p:.3f}")
 
     def __getitem__(self, idx):
         """
@@ -122,17 +249,20 @@ class SUNRGBDDataset(Dataset):
 
         # ==================== TRAINING AUGMENTATION ====================
         if self.train:
-            # 1. Synchronized Random Horizontal Flip (50%)
-            if np.random.random() < 0.5:
+            # 1. Synchronized Random Horizontal Flip
+            # Uses pre-computed _flip_p (scaled by sync_prob)
+            if np.random.random() < self._flip_p:
                 rgb = rgb.transpose(Image.FLIP_LEFT_RIGHT)
                 depth = depth.transpose(Image.FLIP_LEFT_RIGHT)
 
-            # 2. Synchronized Random Resized Crop (50% probability)
-            # IMPORTANT: Scene classification needs context, so crop is probabilistic
-            # 50% get crop (scale variance), 50% get full scene (context preserved)
-            if np.random.random() < 0.5:
+            # 2. Synchronized Random Resized Crop
+            # Uses pre-computed _crop_p and _crop_scale_min (scaled by sync_prob/sync_mag)
+            # Scene classification needs context, so crop is probabilistic
+            if np.random.random() < self._crop_p:
                 i, j, h, w = transforms.RandomResizedCrop.get_params(
-                    rgb, scale=(0.9, 1.0), ratio=(0.95, 1.05)  # Gentle crop 90-100%
+                    rgb,
+                    scale=(self._crop_scale_min, self._crop_scale_max),
+                    ratio=(self._crop_ratio_min, self._crop_ratio_max)
                 )
                 rgb = transforms.functional.resized_crop(rgb, i, j, h, w, self.target_size)
                 depth = transforms.functional.resized_crop(depth, i, j, h, w, self.target_size)
@@ -145,56 +275,51 @@ class SUNRGBDDataset(Dataset):
             # Skip these when normalize=False (GPU augmentation mode) because
             # GPUAugmentation will apply them on GPU after transfer.
             if self.normalize:
-                # 3. RGB-Only: Color Jitter (43% probability - BALANCED for 1.5x ratio)
-                # Applies brightness, contrast, saturation, hue adjustments
-                # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 75%)
-                if np.random.random() < 0.43:
+                # 3. RGB-Only: Color Jitter
+                # Uses pre-computed _color_jitter_p and magnitude values (scaled by rgb_aug_prob/mag)
+                if np.random.random() < self._color_jitter_p:
                     color_jitter = transforms.ColorJitter(
-                        brightness=0.37,  # ±37% (balanced for 1.5x ratio)
-                        contrast=0.37,    # ±37% (balanced for 1.5x ratio)
-                        saturation=0.37,  # ±37% (balanced for 1.5x ratio)
-                        hue=0.11          # ±11% (balanced for 1.5x ratio)
+                        brightness=self._brightness,
+                        contrast=self._contrast,
+                        saturation=self._saturation,
+                        hue=self._hue
                     )
                     rgb = color_jitter(rgb)
 
-                # 4. RGB-Only: Gaussian Blur (25% probability - BALANCED for 1.5x ratio)
-                # Reduces reliance on fine textures/edges, forces focus on spatial structure
-                # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 50%)
-                if np.random.random() < 0.25:
-                    # Kernel size: random odd number between 3, 5, and 7
-                    # Sigma: random between 0.1 and 1.7 (balanced for 1.5x ratio)
+                # 4. RGB-Only: Gaussian Blur
+                # Uses pre-computed _blur_p and _blur_sigma_max (scaled by rgb_aug_prob/mag)
+                if np.random.random() < self._blur_p:
                     kernel_size = int(np.random.choice([3, 5, 7]))
-                    sigma = float(np.random.uniform(0.1, 1.7))
+                    sigma = float(np.random.uniform(self._blur_sigma_min, self._blur_sigma_max))
                     rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
 
-                # 5. RGB-Only: Occasional Grayscale (17% - BALANCED for 1.5x ratio)
-                # Forces RGB stream to learn from structure, not just color
-                # Balanced augmentation to achieve ~1.5x RGB/Depth ratio (was 35%)
-                if np.random.random() < 0.17:
+                # 5. RGB-Only: Occasional Grayscale
+                # Uses pre-computed _grayscale_p (scaled by rgb_aug_prob)
+                if np.random.random() < self._grayscale_p:
                     rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
 
-            # 6. Depth-Only: Combined Appearance Augmentation (50% probability)
-            # IMPORTANT: Matches RGB's color jitter - single augmentation block
-            # Applies brightness + contrast + noise together (like RGB does color jitter)
-            if np.random.random() < 0.5:
+            # 6. Depth-Only: Combined Appearance Augmentation
+            # Uses pre-computed _depth_aug_p and magnitude values (scaled by depth_aug_prob/mag)
+            if np.random.random() < self._depth_aug_p:
                 depth_array = np.array(depth, dtype=np.float32)
 
-                # Apply brightness and contrast
-                # Slightly higher than RGB (±25% vs ±20%) to compensate for:
-                #   1. Depth having 1 channel vs RGB's 3 channels
-                #   2. Reduced crop probability (50% vs previous 100%)
-                brightness_factor = np.random.uniform(0.75, 1.25)  # ±25%
-                contrast_factor = np.random.uniform(0.75, 1.25)    # ±25%
+                # Apply brightness and contrast using pre-computed scaled magnitudes
+                brightness_factor = np.random.uniform(
+                    1.0 - self._depth_brightness,
+                    1.0 + self._depth_brightness
+                )
+                contrast_factor = np.random.uniform(
+                    1.0 - self._depth_contrast,
+                    1.0 + self._depth_contrast
+                )
 
                 # Apply contrast then brightness (same order as ColorJitter)
                 # Note: depth_array is in [0, 1] range, so use 0.5 as midpoint
                 depth_array = (depth_array - 0.5) * contrast_factor + 0.5
                 depth_array = depth_array * brightness_factor
 
-                # Add Gaussian noise (simulates sensor noise)
-                # Moderate std to avoid excessive noise while providing robustness
-                # Scale noise to [0, 1] range (15/255 ≈ 0.059)
-                noise = np.random.normal(0, 0.059, depth_array.shape).astype(np.float32)
+                # Add Gaussian noise using pre-computed scaled std
+                noise = np.random.normal(0, self._depth_noise_std, depth_array.shape).astype(np.float32)
                 depth_array = depth_array + noise
 
                 depth_array = np.clip(depth_array, 0.0, 1.0).astype(np.float32)
@@ -231,22 +356,23 @@ class SUNRGBDDataset(Dataset):
 
             # 7. Post-normalization Random Erasing (CPU mode only)
             # When using GPU augmentation, erasing is done on GPU after normalization
+            # Uses pre-computed _rgb_erasing_p and _depth_erasing_p (scaled by aug_prob/mag)
             if self.train:
-                # RGB random erasing (17% - BALANCED for 1.5x ratio)
-                if np.random.random() < 0.17:
+                # RGB random erasing
+                if np.random.random() < self._rgb_erasing_p:
                     erasing = transforms.RandomErasing(
                         p=1.0,
-                        scale=(0.02, 0.10),    # Small patches (2-10% of image)
-                        ratio=(0.5, 2.0)       # Reasonable aspect ratios
+                        scale=(self._rgb_erasing_scale_min, self._rgb_erasing_scale_max),
+                        ratio=(BASE_ERASING_RATIO_MIN, BASE_ERASING_RATIO_MAX)
                     )
                     rgb = erasing(rgb)
 
-                # Depth random erasing (10% - separate and equal)
-                if np.random.random() < 0.1:
+                # Depth random erasing
+                if np.random.random() < self._depth_erasing_p:
                     erasing = transforms.RandomErasing(
                         p=1.0,
-                        scale=(0.02, 0.1),
-                        ratio=(0.5, 2.0)
+                        scale=(self._depth_erasing_scale_min, self._depth_erasing_scale_max),
+                        ratio=(BASE_ERASING_RATIO_MIN, BASE_ERASING_RATIO_MAX)
                     )
                     depth = erasing(depth)
 
@@ -322,6 +448,10 @@ def get_sunrgbd_dataloaders(
     stratified=False,
     seed=None,
     normalize: bool = True,
+    rgb_aug_prob: float = 1.0,
+    rgb_aug_mag: float = 1.0,
+    depth_aug_prob: float = 1.0,
+    depth_aug_mag: float = 1.0,
 ):
     """
     Create train and validation dataloaders for SUN RGB-D.
@@ -340,6 +470,10 @@ def get_sunrgbd_dataloaders(
         normalize: If True, apply normalization in dataset __getitem__().
                   Set to False when using GPU augmentation (which handles
                   normalization on GPU after augmentation).
+        rgb_aug_prob: Scales probability of RGB augmentations (default: 1.0 = baseline)
+        rgb_aug_mag: Scales magnitude of RGB augmentations (default: 1.0 = baseline)
+        depth_aug_prob: Scales probability of Depth augmentations (default: 1.0 = baseline)
+        depth_aug_mag: Scales magnitude of Depth augmentations (default: 1.0 = baseline)
 
     Returns:
         train_loader, val_loader, (optional) class_weights
@@ -350,15 +484,26 @@ def get_sunrgbd_dataloaders(
         >>> set_seed(42)
         >>> train_loader, val_loader = get_sunrgbd_dataloaders(seed=42, stratified=True)
         >>>
-        >>> # For GPU augmentation mode
-        >>> train_loader, val_loader = get_sunrgbd_dataloaders(normalize=False)
+        >>> # For GPU augmentation mode with custom augmentation scaling
+        >>> from src.training.augmentation_config import AugmentationConfig
+        >>> aug_config = AugmentationConfig(rgb_aug_prob=1.5, rgb_aug_mag=1.2)
+        >>> train_loader, val_loader = get_sunrgbd_dataloaders(
+        ...     normalize=False,
+        ...     **aug_config.to_dict()
+        ... )
     """
     # Create datasets
+    # Note: Augmentation params only affect training set (train=True)
+    # Validation set ignores these params (no augmentation applied)
     train_dataset = SUNRGBDDataset(
         data_root=data_root,
         train=True,
         target_size=target_size,
         normalize=normalize,
+        rgb_aug_prob=rgb_aug_prob,
+        rgb_aug_mag=rgb_aug_mag,
+        depth_aug_prob=depth_aug_prob,
+        depth_aug_mag=depth_aug_mag,
     )
 
     val_dataset = SUNRGBDDataset(
@@ -366,6 +511,7 @@ def get_sunrgbd_dataloaders(
         train=False,
         target_size=target_size,
         normalize=normalize,
+        # Validation: aug params don't matter (train=False means no augmentation)
     )
 
     # Setup reproducibility if seed is provided
