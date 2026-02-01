@@ -151,6 +151,10 @@ class HistoricalMedianStoppingRule(MedianStoppingRule):
         logger.info(
             "Loaded %d historical trials from %s", self._num_historical, csv_path
         )
+        print(
+            f"✅ HistoricalMedianStoppingRule: loaded {self._num_historical} "
+            f"historical trials from {csv_path}"
+        )
 
     def debug_string(self):
         base = super().debug_string()
