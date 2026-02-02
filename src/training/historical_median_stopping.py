@@ -104,9 +104,18 @@ class HistoricalMedianStoppingRule(MedianStoppingRule):
             )
             return
 
-        # Filter by search space hash if provided
+        # Filter by search space hash if provided.
+        # Pandas may read all-digit hashes as int64 or float64 (e.g., 12055273.0
+        # instead of "12055273"), so we normalize the column: convert to str, then
+        # strip any trailing ".0" that float→str conversion produces.
         if search_space_hash is not None and "search_space_hash" in df.columns:
-            df = df[df["search_space_hash"] == search_space_hash]
+            hash_col = (
+                df["search_space_hash"]
+                .astype(str)
+                .str.replace(r"\.0$", "", regex=True)
+            )
+            target = str(search_space_hash).strip()
+            df = df[hash_col == target]
             if df.empty:
                 logger.warning(
                     "No historical data matches search_space_hash=%s — running without historical data.",
