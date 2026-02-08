@@ -377,7 +377,8 @@ def run_benchmark_suite(
     stream_channels: List[int],
     batch_size: int = 16,
     num_iters: int = 100,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    use_torch_compile: bool = False
 ):
     """Run complete benchmark suite for a given configuration.
 
@@ -386,6 +387,7 @@ def run_benchmark_suite(
         batch_size: Batch size (default: 16, typical for SUN RGB-D training)
         num_iters: Number of iterations for timing (default: 100)
         device: Device to run on (must be 'cuda')
+        use_torch_compile: Whether to apply torch.compile to functions (default: False)
 
     Raises:
         RuntimeError: If CUDA is not available
@@ -412,24 +414,78 @@ def run_benchmark_suite(
     print(f"  Device: {device} ({torch.cuda.get_device_name(0)})")
     print(f"  GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     print(f"  Iterations: {num_iters}")
+    print(f"  torch.compile: {'ENABLED (max-autotune)' if use_torch_compile else 'DISABLED'}")
     print(f"{'='*80}\n")
+
+    # Apply torch.compile if requested
+    seq_forward_fn = sequential_forward
+    batched_forward_fn = batched_forward_with_padding
+
+    if use_torch_compile:
+        print("⚙️  Compiling functions with torch.compile (this may take 10-30s on first run)...")
+        seq_forward_fn = torch.compile(sequential_forward, mode='max-autotune')
+        batched_forward_fn = torch.compile(batched_forward_with_padding, mode='max-autotune')
+        print("✅ Compilation complete\n")
 
     # Create test data (uses SUN RGB-D defaults: 416x544)
     stream_inputs, stream_weights = create_test_data(batch_size, stream_channels, device=device)
 
-    # 1. Verify numerical equivalence
+    # 1. Verify numerical equivalence (using compiled functions if enabled)
     print("1. Numerical Equivalence Check")
     print("-" * 40)
-    is_equivalent = verify_numerical_equivalence(stream_inputs, stream_weights)
+    with torch.no_grad():
+        seq_outputs = seq_forward_fn(stream_inputs, stream_weights)
+        batched_outputs = batched_forward_fn(stream_inputs, stream_weights)
+
+    is_equivalent = True
+    for i, (seq_out, batched_out) in enumerate(zip(seq_outputs, batched_outputs)):
+        if not torch.allclose(seq_out, batched_out, atol=1e-6, rtol=1e-5):
+            print(f"❌ Stream {i} outputs differ!")
+            max_diff = (seq_out - batched_out).abs().max().item()
+            print(f"   Max difference: {max_diff:.2e}")
+            is_equivalent = False
+
     if not is_equivalent:
         print("⚠️  Warning: Numerical equivalence failed! Results may not be valid.\n")
         return
+    print("✅ Numerical equivalence verified (all streams match within tolerance)")
     print()
 
     # 2. Forward pass benchmark
     print("2. Forward Pass Benchmark")
     print("-" * 40)
-    seq_fwd, batched_fwd = benchmark_forward_pass(stream_inputs, stream_weights, num_iters)
+
+    # Benchmark using compiled functions
+    device_obj = stream_inputs[0].device
+
+    # Warmup
+    for _ in range(10):
+        _ = seq_forward_fn(stream_inputs, stream_weights)
+        _ = batched_forward_fn(stream_inputs, stream_weights)
+
+    if device_obj.type == 'cuda':
+        torch.cuda.synchronize()
+
+    # Measure sequential
+    seq_times = []
+    for _ in range(num_iters):
+        start = time.perf_counter()
+        _ = seq_forward_fn(stream_inputs, stream_weights)
+        if device_obj.type == 'cuda':
+            torch.cuda.synchronize()
+        seq_times.append(time.perf_counter() - start)
+
+    # Measure batched
+    batched_times = []
+    for _ in range(num_iters):
+        start = time.perf_counter()
+        _ = batched_forward_fn(stream_inputs, stream_weights)
+        if device_obj.type == 'cuda':
+            torch.cuda.synchronize()
+        batched_times.append(time.perf_counter() - start)
+
+    seq_fwd = np.mean(seq_times) * 1000
+    batched_fwd = np.mean(batched_times) * 1000
     speedup_fwd = seq_fwd / batched_fwd
 
     print(f"Sequential:    {seq_fwd:7.3f} ms")
@@ -440,7 +496,56 @@ def run_benchmark_suite(
     # 3. Backward pass benchmark
     print("3. Backward Pass Benchmark")
     print("-" * 40)
-    seq_bwd, batched_bwd = benchmark_backward_pass(stream_inputs, stream_weights, num_iters)
+
+    # Warmup
+    for _ in range(10):
+        outputs = seq_forward_fn(stream_inputs, stream_weights)
+        loss = sum(out.sum() for out in outputs)
+        loss.backward()
+        for inp in stream_inputs:
+            inp.grad = None
+        for w in stream_weights:
+            w.grad = None
+
+    if device_obj.type == 'cuda':
+        torch.cuda.synchronize()
+
+    # Measure sequential backward
+    seq_times = []
+    for _ in range(num_iters):
+        outputs = seq_forward_fn(stream_inputs, stream_weights)
+        loss = sum(out.sum() for out in outputs)
+
+        start = time.perf_counter()
+        loss.backward()
+        if device_obj.type == 'cuda':
+            torch.cuda.synchronize()
+        seq_times.append(time.perf_counter() - start)
+
+        for inp in stream_inputs:
+            inp.grad = None
+        for w in stream_weights:
+            w.grad = None
+
+    # Measure batched backward
+    batched_times = []
+    for _ in range(num_iters):
+        outputs = batched_forward_fn(stream_inputs, stream_weights)
+        loss = sum(out.sum() for out in outputs)
+
+        start = time.perf_counter()
+        loss.backward()
+        if device_obj.type == 'cuda':
+            torch.cuda.synchronize()
+        batched_times.append(time.perf_counter() - start)
+
+        for inp in stream_inputs:
+            inp.grad = None
+        for w in stream_weights:
+            w.grad = None
+
+    seq_bwd = np.mean(seq_times) * 1000
+    batched_bwd = np.mean(batched_times) * 1000
     speedup_bwd = seq_bwd / batched_bwd
 
     print(f"Sequential:    {seq_bwd:7.3f} ms")
@@ -464,7 +569,19 @@ def run_benchmark_suite(
     if device == 'cuda':
         print("5. Memory Usage")
         print("-" * 40)
-        seq_mem, batched_mem = measure_memory_usage(stream_inputs, stream_weights)
+
+        # Sequential memory
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+        _ = seq_forward_fn(stream_inputs, stream_weights)
+        seq_mem = torch.cuda.max_memory_allocated() / 1024**2
+
+        # Batched memory
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+        _ = batched_forward_fn(stream_inputs, stream_weights)
+        batched_mem = torch.cuda.max_memory_allocated() / 1024**2
+
         mem_overhead = ((batched_mem - seq_mem) / seq_mem) * 100 if seq_mem > 0 else 0
 
         print(f"Sequential:    {seq_mem:7.1f} MB")
@@ -505,7 +622,7 @@ def run_benchmark_suite(
     print("=" * 80)
 
 
-def run_all_benchmarks(batch_size: int = 16, num_iters: int = 100, device: str = 'cuda'):
+def run_all_benchmarks(batch_size: int = 16, num_iters: int = 100, device: str = 'cuda', use_torch_compile: bool = False):
     """Run benchmarks for all common stream configurations.
 
     This is a convenience function for notebook environments.
@@ -514,6 +631,7 @@ def run_all_benchmarks(batch_size: int = 16, num_iters: int = 100, device: str =
         batch_size: Batch size for benchmarking (default: 16)
         num_iters: Number of iterations per benchmark (default: 100)
         device: Device to run on (must be 'cuda')
+        use_torch_compile: Whether to apply torch.compile to functions (default: False)
 
     Raises:
         RuntimeError: If CUDA is not available
@@ -542,7 +660,7 @@ def run_all_benchmarks(batch_size: int = 16, num_iters: int = 100, device: str =
         print(f"\n\n{'#'*80}")
         print(f"# {description}")
         print(f"{'#'*80}")
-        run_benchmark_suite(stream_channels, batch_size, num_iters, device)
+        run_benchmark_suite(stream_channels, batch_size, num_iters, device, use_torch_compile)
 
 
 def main():
@@ -556,6 +674,8 @@ def main():
                        help='Number of iterations (default: 100)')
     parser.add_argument('--all', action='store_true',
                        help='Run all stream configurations')
+    parser.add_argument('--torch-compile', action='store_true',
+                       help='Apply torch.compile(mode="max-autotune") to functions')
 
     args = parser.parse_args()
 
@@ -584,13 +704,15 @@ def main():
     print("="*80)
 
     if args.all:
-        run_all_benchmarks(args.batch_size, args.num_iters, device)
+        run_all_benchmarks(args.batch_size, args.num_iters, device, args.torch_compile)
     else:
         # Default: 2-stream RGB + Depth (SUN RGB-D configuration)
         stream_channels = [3, 1]
-        run_benchmark_suite(stream_channels, args.batch_size, args.num_iters, device)
+        run_benchmark_suite(stream_channels, args.batch_size, args.num_iters, device, args.torch_compile)
 
-        print("\n💡 Tip: Run with --all to test multiple stream configurations")
+        print("\n💡 Tips:")
+        print("  - Run with --all to test multiple stream configurations")
+        print("  - Run with --torch-compile to test torch.compile speedup")
 
 
 if __name__ == '__main__':

@@ -51,8 +51,20 @@ run_benchmark_suite(
     device='cuda'
 )
 
+# With torch.compile optimization
+run_benchmark_suite(
+    stream_channels=[3, 1],
+    batch_size=16,
+    num_iters=100,
+    device='cuda',
+    use_torch_compile=True
+)
+
 # Or run all configurations
 run_all_benchmarks(batch_size=16, num_iters=100, device='cuda')
+
+# All configurations with torch.compile
+run_all_benchmarks(batch_size=16, num_iters=100, device='cuda', use_torch_compile=True)
 ```
 
 ## Option 2: Inline Code (No Repo Needed)
@@ -381,3 +393,32 @@ run_benchmark_suite([3, 1], batch_size=4, num_iters=20, device='cpu')
 
 **Import errors**
 - Use Option 2 (inline code) or Option 3 (minimal code) instead
+
+## Testing torch.compile Optimization
+
+To test if `torch.compile` provides speedup, use the `use_torch_compile=True` flag:
+
+```python
+# Compare WITHOUT torch.compile (baseline)
+run_benchmark_suite([3, 1], batch_size=16, use_torch_compile=False)
+
+# Compare WITH torch.compile (optimized)
+run_benchmark_suite([3, 1], batch_size=16, use_torch_compile=True)
+```
+
+**Expected behavior:**
+- First run with `use_torch_compile=True` takes 10-30s extra (compilation time)
+- Subsequent iterations should be faster (1.5-2x speedup expected)
+- Speedup is most visible with larger batch sizes (32+)
+
+**Command-line usage:**
+```bash
+# Baseline
+python benchmark_padding_vs_sequential.py
+
+# With torch.compile
+python benchmark_padding_vs_sequential.py --torch-compile
+
+# All configs with torch.compile
+python benchmark_padding_vs_sequential.py --all --torch-compile
+```
