@@ -395,8 +395,9 @@ class LIConv2d(_LIConvNd):
             if stream_blanked is not None and stream_blanked.any():
                 # mask: [batch_size, 1, 1, 1] for broadcasting, 1.0 for active, 0.0 for blanked
                 mask = (~stream_blanked).float().view(-1, 1, 1, 1)
-                stream_out = stream_out * mask
-                stream_out_raw = stream_out_raw * mask  # Critical: zeros for integration
+                # OPTIMIZATION: Use in-place operations to avoid creating temporary tensors
+                stream_out.mul_(mask)
+                stream_out_raw.mul_(mask)  # Critical: zeros for integration
 
             stream_outputs.append(stream_out)  # Biased output for stream pathway
             stream_outputs_raw.append(stream_out_raw)  # Raw output for integration
@@ -755,12 +756,12 @@ class _LIBatchNorm(_LINormBase):
                 stream_out = stream_input
             else:
                 # Partial blanking - subset BN on active samples only
-                active_idx = (~stream_blanked).nonzero(as_tuple=True)[0]
-                active_input = stream_input[active_idx]  # [num_active, C, H, W]
+                # OPTIMIZATION: More efficient indexing and scatter operations
+                active_idx = torch.where(~stream_blanked)[0]
 
-                # Standard BN on active samples - this updates running stats correctly
+                # Process only active samples to maintain correct BN statistics
                 active_output = self._forward_single_pathway(
-                    active_input,
+                    stream_input[active_idx],
                     getattr(self, f"stream{i}_running_mean"),
                     getattr(self, f"stream{i}_running_var"),
                     self.stream_weights[i] if self.affine else None,
@@ -768,9 +769,10 @@ class _LIBatchNorm(_LINormBase):
                     exponential_average_factor,
                 )
 
-                # Scatter back - blanked samples stay as zeros
-                stream_out = torch.zeros_like(stream_input)
-                stream_out[active_idx] = active_output
+                # OPTIMIZATION: Use scatter operation with new_zeros for efficiency
+                # new_zeros is slightly faster than zeros_like for large tensors
+                stream_out = stream_input.new_zeros(stream_input.shape)
+                stream_out.index_copy_(0, active_idx, active_output)
 
             stream_outputs.append(stream_out)
 
