@@ -25,13 +25,31 @@ Usage:
     run_benchmark_suite([3, 1], batch_size=16)
 """
 
+import os
+import sys
 import time
+import contextlib
+
 import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import List, Tuple
 import argparse
-import sys
+
+
+@contextlib.contextmanager
+def suppress_output():
+    """Suppress stdout and stderr output."""
+    with open(os.devnull, 'w') as devnull:
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = devnull
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
 
 
 def create_test_data(
@@ -422,20 +440,37 @@ def run_benchmark_suite(
     batched_forward_fn = batched_forward_with_padding
 
     if use_torch_compile:
-        print("⚙️  Compiling functions with torch.compile (this may take 10-30s on first run)...")
+        print("⚙️  Applying torch.compile (compilation will happen on first forward pass)...")
         seq_forward_fn = torch.compile(sequential_forward, mode='max-autotune')
         batched_forward_fn = torch.compile(batched_forward_with_padding, mode='max-autotune')
-        print("✅ Compilation complete\n")
 
     # Create test data (uses SUN RGB-D defaults: 416x544)
     stream_inputs, stream_weights = create_test_data(batch_size, stream_channels, device=device)
 
     # 1. Verify numerical equivalence (using compiled functions if enabled)
-    print("1. Numerical Equivalence Check")
+    print("\n1. Numerical Equivalence Check")
     print("-" * 40)
+
+    if use_torch_compile:
+        print("⏳ Compiling functions (first run, ~10-30s with autotuning)...")
+        print("   Suppressing verbose autotune output...\n")
+
     with torch.no_grad():
-        seq_outputs = seq_forward_fn(stream_inputs, stream_weights)
-        batched_outputs = batched_forward_fn(stream_inputs, stream_weights)
+        # Suppress verbose autotuning output during compilation
+        if use_torch_compile:
+            with suppress_output():
+                seq_outputs = seq_forward_fn(stream_inputs, stream_weights)
+                batched_outputs = batched_forward_fn(stream_inputs, stream_weights)
+        else:
+            seq_outputs = seq_forward_fn(stream_inputs, stream_weights)
+            batched_outputs = batched_forward_fn(stream_inputs, stream_weights)
+
+        # Clone outputs to prevent CUDA Graphs memory overwrite issues
+        seq_outputs = [out.clone() for out in seq_outputs]
+        batched_outputs = [out.clone() for out in batched_outputs]
+
+    if use_torch_compile:
+        print("✅ Compilation complete")
 
     is_equivalent = True
     for i, (seq_out, batched_out) in enumerate(zip(seq_outputs, batched_outputs)):
