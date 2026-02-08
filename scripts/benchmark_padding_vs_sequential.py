@@ -432,7 +432,7 @@ def run_benchmark_suite(
     print(f"  Device: {device} ({torch.cuda.get_device_name(0)})")
     print(f"  GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     print(f"  Iterations: {num_iters}")
-    print(f"  torch.compile: {'ENABLED (max-autotune)' if use_torch_compile else 'DISABLED'}")
+    print(f"  torch.compile: {'ENABLED (default mode)' if use_torch_compile else 'DISABLED'}")
     print(f"{'='*80}\n")
 
     # Apply torch.compile if requested
@@ -441,8 +441,9 @@ def run_benchmark_suite(
 
     if use_torch_compile:
         print("⚙️  Applying torch.compile (compilation will happen on first forward pass)...")
-        seq_forward_fn = torch.compile(sequential_forward, mode='max-autotune')
-        batched_forward_fn = torch.compile(batched_forward_with_padding, mode='max-autotune')
+        # Use 'default' mode for realistic training performance (maintains FP32 precision)
+        seq_forward_fn = torch.compile(sequential_forward, mode='default')
+        batched_forward_fn = torch.compile(batched_forward_with_padding, mode='default')
 
     # Create test data (uses SUN RGB-D defaults: 416x544)
     stream_inputs, stream_weights = create_test_data(batch_size, stream_channels, device=device)
@@ -472,18 +473,29 @@ def run_benchmark_suite(
     if use_torch_compile:
         print("✅ Compilation complete")
 
+    # torch.compile with 'default' mode maintains FP32 precision
+    # Same tolerance for both compiled and non-compiled
+    atol, rtol = 1e-6, 1e-5  # FP32 precision
+    tolerance_msg = "(FP32 precision)" if not use_torch_compile else "(FP32 precision, compiled)"
+
     is_equivalent = True
+    max_diff_overall = 0.0
     for i, (seq_out, batched_out) in enumerate(zip(seq_outputs, batched_outputs)):
-        if not torch.allclose(seq_out, batched_out, atol=1e-6, rtol=1e-5):
-            print(f"❌ Stream {i} outputs differ!")
-            max_diff = (seq_out - batched_out).abs().max().item()
-            print(f"   Max difference: {max_diff:.2e}")
+        max_diff = (seq_out - batched_out).abs().max().item()
+        max_diff_overall = max(max_diff_overall, max_diff)
+
+        if not torch.allclose(seq_out, batched_out, atol=atol, rtol=rtol):
+            print(f"❌ Stream {i} outputs differ beyond tolerance!")
+            print(f"   Max difference: {max_diff:.2e} (tolerance: atol={atol}, rtol={rtol})")
             is_equivalent = False
 
     if not is_equivalent:
         print("⚠️  Warning: Numerical equivalence failed! Results may not be valid.\n")
         return
-    print("✅ Numerical equivalence verified (all streams match within tolerance)")
+
+    print(f"✅ Numerical equivalence verified {tolerance_msg}")
+    if max_diff_overall > 0:
+        print(f"   Max difference: {max_diff_overall:.2e}")
     print()
 
     # 2. Forward pass benchmark

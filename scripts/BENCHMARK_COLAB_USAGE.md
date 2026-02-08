@@ -408,8 +408,14 @@ run_benchmark_suite([3, 1], batch_size=16, use_torch_compile=True)
 
 **Expected behavior:**
 - First run with `use_torch_compile=True` takes 10-30s extra (compilation time)
-- Subsequent iterations should be faster (1.5-2x speedup expected)
+- Uses `mode='default'` which maintains FP32 precision (safe for training)
+- Subsequent iterations should be faster (1.3-1.8x speedup expected)
 - Speedup is most visible with larger batch sizes (32+)
+
+**Note on compile modes:**
+- Benchmark uses `mode='default'` (same as training)
+- This maintains FP32 precision for numerical stability
+- `mode='max-autotune'` is faster but uses TF32 (lower precision, not suitable for training)
 
 **Command-line usage:**
 ```bash

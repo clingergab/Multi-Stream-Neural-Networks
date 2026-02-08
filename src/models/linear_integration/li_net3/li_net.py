@@ -115,7 +115,8 @@ class LINet(BaseModel):
         )
 
         # Apply torch.compile for speedup (PyTorch 2.0+)
-        torch.compile(self, mode='max-autotune')
+        # Use 'default' mode for training (maintains FP32 precision)
+        torch.compile(self, mode='default')
     
     def _build_network(
         self,
