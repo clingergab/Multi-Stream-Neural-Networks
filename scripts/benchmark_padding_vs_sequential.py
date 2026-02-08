@@ -461,13 +461,13 @@ def run_benchmark_suite(
             with suppress_output():
                 seq_outputs = seq_forward_fn(stream_inputs, stream_weights)
                 batched_outputs = batched_forward_fn(stream_inputs, stream_weights)
+
+                # Clone outputs INSIDE the context to prevent CUDA Graphs memory overwrite
+                seq_outputs = [out.clone() for out in seq_outputs]
+                batched_outputs = [out.clone() for out in batched_outputs]
         else:
             seq_outputs = seq_forward_fn(stream_inputs, stream_weights)
             batched_outputs = batched_forward_fn(stream_inputs, stream_weights)
-
-        # Clone outputs to prevent CUDA Graphs memory overwrite issues
-        seq_outputs = [out.clone() for out in seq_outputs]
-        batched_outputs = [out.clone() for out in batched_outputs]
 
     if use_torch_compile:
         print("✅ Compilation complete")
