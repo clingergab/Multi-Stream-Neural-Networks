@@ -378,7 +378,7 @@ def run_benchmark_suite(
     batch_size: int = 16,
     num_iters: int = 100,
     device: str = 'cuda',
-    use_torch_compile: bool = False
+    use_torch_compile: bool = True
 ):
     """Run complete benchmark suite for a given configuration.
 
