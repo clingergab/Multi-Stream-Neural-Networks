@@ -113,6 +113,9 @@ class LINet(BaseModel):
             device=device,
             use_amp=use_amp
         )
+
+        # Apply torch.compile for speedup (PyTorch 2.0+)
+        torch.compile(self, mode='max-autotune')
     
     def _build_network(
         self,
