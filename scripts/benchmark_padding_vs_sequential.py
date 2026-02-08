@@ -459,12 +459,12 @@ def run_benchmark_suite(
         # Suppress verbose autotuning output during compilation
         if use_torch_compile:
             with suppress_output():
-                seq_outputs = seq_forward_fn(stream_inputs, stream_weights)
-                batched_outputs = batched_forward_fn(stream_inputs, stream_weights)
+                # Clone IMMEDIATELY after each forward to prevent CUDA Graphs overwrite
+                seq_outputs_raw = seq_forward_fn(stream_inputs, stream_weights)
+                seq_outputs = [out.clone() for out in seq_outputs_raw]
 
-                # Clone outputs INSIDE the context to prevent CUDA Graphs memory overwrite
-                seq_outputs = [out.clone() for out in seq_outputs]
-                batched_outputs = [out.clone() for out in batched_outputs]
+                batched_outputs_raw = batched_forward_fn(stream_inputs, stream_weights)
+                batched_outputs = [out.clone() for out in batched_outputs_raw]
         else:
             seq_outputs = seq_forward_fn(stream_inputs, stream_weights)
             batched_outputs = batched_forward_fn(stream_inputs, stream_weights)
