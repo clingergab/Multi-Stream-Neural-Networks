@@ -121,6 +121,10 @@ def batched_forward_with_padding(
 ) -> List[torch.Tensor]:
     """Batched stream processing with channel padding (Tier 2).
 
+    Uses grouped convolutions to process all streams in a single kernel call.
+    Each stream is padded to the max channel count, then all streams are
+    processed using groups=num_streams.
+
     Args:
         stream_inputs: List of input tensors
         stream_weights: List of weight tensors
@@ -130,9 +134,12 @@ def batched_forward_with_padding(
     Returns:
         List of output tensors (same as sequential)
     """
+    num_streams = len(stream_inputs)
+
     # Step 1: Compute padding configuration
     stream_in_channels = [inp.shape[1] for inp in stream_inputs]
     max_in_channels = max(stream_in_channels)
+    out_channels = stream_weights[0].shape[0]  # All streams have same output channels
 
     # Step 2: Pad inputs to max channels
     padded_inputs = []
@@ -145,15 +152,13 @@ def batched_forward_with_padding(
             padded = inp
         padded_inputs.append(padded)
 
-    # Step 3: Concatenate inputs along channel dimension
+    # Step 3: Stack inputs along channel dimension
     batched_input = torch.cat(padded_inputs, dim=1)
-    # Shape: [batch, total_channels, height, width]
-    # e.g., for [3, 1]: [B, 6, H, W] (3+3 channels after padding)
+    # Shape: [batch, num_streams * max_in_channels, height, width]
+    # e.g., for [3, 1]: [B, 2*3=6, H, W]
 
     # Step 4: Pad weights to max channels
     padded_weights = []
-    out_channels = stream_weights[0].shape[0]  # All streams have same output channels
-
     for weight, in_ch in zip(stream_weights, stream_in_channels):
         if in_ch < max_in_channels:
             pad_size = max_in_channels - in_ch
@@ -163,21 +168,27 @@ def batched_forward_with_padding(
             padded = weight
         padded_weights.append(padded)
 
-    # Step 5: Concatenate weights along output channel dimension
+    # Step 5: Stack weights for grouped convolution
     batched_weight = torch.cat(padded_weights, dim=0)
-    # Shape: [total_out_channels, max_in_channels, kernel_h, kernel_w]
+    # Shape: [num_streams * out_channels, max_in_channels, kernel_h, kernel_w]
     # e.g., for 2 streams with 64 out each: [128, 3, 7, 7]
 
-    # Step 6: Single batched convolution
-    batched_output = F.conv2d(batched_input, batched_weight, bias=None, stride=stride, padding=padding)
-    # Shape: [batch, total_out_channels, height', width']
+    # Step 6: Single batched convolution with groups=num_streams
+    # This processes each stream independently in parallel
+    batched_output = F.conv2d(
+        batched_input,
+        batched_weight,
+        bias=None,
+        stride=stride,
+        padding=padding,
+        groups=num_streams  # KEY: Each group processes one stream
+    )
+    # Shape: [batch, num_streams * out_channels, height', width']
 
     # Step 7: Split outputs back into separate streams
     outputs = []
-    offset = 0
-    for _ in stream_inputs:
-        outputs.append(batched_output[:, offset:offset+out_channels])
-        offset += out_channels
+    for i in range(num_streams):
+        outputs.append(batched_output[:, i*out_channels:(i+1)*out_channels])
 
     return outputs
 
