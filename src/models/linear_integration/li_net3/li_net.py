@@ -1036,8 +1036,9 @@ class LINet(BaseModel):
             if modality_dropout and '_dropout_epoch_stats' in history and history['_dropout_epoch_stats']:
                 stats = history['_dropout_epoch_stats'][-1]  # Get this epoch's stats
                 stream_str = ", ".join([f"s{i}:{p:.1f}%" for i, p in enumerate(stats['pct_per_stream'])])
-                print(f"  🎲 Dropout: {stats['total_blanked']}/{stats['total_samples']} blanked "
-                      f"({stats['pct_blanked']:.1f}%) | {stream_str}")
+                if verbose:
+                    print(f"  🎲 Dropout: {stats['total_blanked']}/{stats['total_samples']} blanked "
+                        f"({stats['pct_blanked']:.1f}%) | {stream_str}")
 
             # Stream-specific early stopping (freeze streams when they plateau)
             if stream_early_stopping_state['enabled'] and stream_stats:
