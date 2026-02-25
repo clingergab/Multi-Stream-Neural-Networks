@@ -1,7 +1,8 @@
 """
 SUN RGB-D 15 Scene Category Mapping
 
-Based on the paper "SUN RGB-D: A RGB-D Scene Understanding Benchmark Suite"
+Based on the paper "Centroid Based Concept Learning for RGB-D
+Indoor Scene Classification"
 (arxiv.org/pdf/1911.00155)
 
 Merges the 19 standard categories down to 15 by combining semantically similar
