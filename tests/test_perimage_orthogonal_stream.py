@@ -28,7 +28,7 @@ print("\nGoal: Create a 3rd stream by projecting each image's pixels onto")
 print("      the orthogonal vector of that image's RGB-D hyperplane\n")
 
 # Load dataset
-train_dataset = SUNRGBDDataset(train=True)
+train_dataset = SUNRGBDDataset(split='train')
 print(f"Loaded SUN RGB-D train set: {len(train_dataset)} samples\n")
 
 def extract_orthogonal_stream(rgb, depth):

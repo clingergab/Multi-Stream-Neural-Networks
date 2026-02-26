@@ -1,5 +1,9 @@
 """
-Preprocess SUN RGB-D dataset into 15 categories.
+Preprocess SUN RGB-D dataset into 15 categories with official train/test split.
+
+Uses the official SUN RGB-D train/test split from SUNRGBDtoolbox/allsplit.mat,
+then sub-splits the official training set into train (90%) and val (10%) for
+model selection / early stopping. The official test set is preserved as-is.
 
 Creates a new directory structure:
 data/sunrgbd_15/
@@ -17,17 +21,24 @@ data/sunrgbd_15/
     rgb/
     depth/
     labels.txt
+  test/
+    rgb/
+    depth/
+    labels.txt
 
 Also creates metadata files with class names and statistics.
 """
 
 import os
 import shutil
+from collections import Counter, defaultdict
 from pathlib import Path
-from PIL import Image
+
 import numpy as np
-from collections import Counter
+import scipy.io as sio
+from PIL import Image
 from tqdm import tqdm
+
 from scripts.sunrgbd_15_category_mapping import map_raw_scene_to_15, SUNRGBD_15_CATEGORIES, get_class_idx
 
 # Paths
@@ -38,22 +49,49 @@ TOOLBOX_PATH = "data/sunrgbd/SUNRGBDtoolbox"
 # Use official train/test split from toolbox
 TRAIN_SPLIT_FILE = os.path.join(TOOLBOX_PATH, "traintestSUNRGBD/allsplit.mat")
 
+# Prefix used in allsplit.mat paths (maps to local SUNRGBD_BASE)
+MAT_PATH_PREFIX = "/n/fs/sun3d/data/SUNRGBD/"
+
+
 def load_official_split():
-    """Load official train/test split from SUNRGBDtoolbox."""
-    try:
-        import scipy.io as sio
-        split_data = sio.loadmat(TRAIN_SPLIT_FILE)
+    """
+    Load official train/test split from SUNRGBDtoolbox.
 
-        # Extract train and test indices
-        # Note: MATLAB indices are 1-based, need to convert to 0-based
-        train_indices = split_data['alltrain'].flatten() - 1
-        test_indices = split_data['alltest'].flatten() - 1
+    The allsplit.mat file contains string file paths (not numeric indices).
+    Each entry is a path like '/n/fs/sun3d/data/SUNRGBD/kv2/kinect2data/000065_...-resize'.
+    We strip the prefix and trailing slashes to get relative paths that can be
+    matched against local sample directories.
 
-        return set(train_indices.tolist()), set(test_indices.tolist())
-    except Exception as e:
-        print(f"Warning: Could not load official split: {e}")
-        print("Will use random 80/20 split instead")
-        return None, None
+    Returns:
+        Tuple of (train_paths, test_paths) where each is a set of relative paths.
+        Raises FileNotFoundError if the split file doesn't exist.
+    """
+    if not os.path.exists(TRAIN_SPLIT_FILE):
+        raise FileNotFoundError(
+            f"Official split file not found: {TRAIN_SPLIT_FILE}\n"
+            f"Please ensure the SUNRGBDtoolbox is extracted at {TOOLBOX_PATH}"
+        )
+
+    split_data = sio.loadmat(TRAIN_SPLIT_FILE)
+
+    def extract_paths(mat_array):
+        """Extract relative paths from nested numpy string arrays."""
+        paths = set()
+        for entry in mat_array.flatten():
+            # Each entry is a numpy array containing a string
+            path_str = str(entry.flatten()[0])
+            # Strip the server prefix and trailing slashes
+            relative = path_str.replace(MAT_PATH_PREFIX, '').rstrip('/')
+            paths.add(relative)
+        return paths
+
+    train_paths = extract_paths(split_data['alltrain'])
+    test_paths = extract_paths(split_data['alltest'])
+
+    print(f"Official split loaded: {len(train_paths)} train, {len(test_paths)} test")
+
+    return train_paths, test_paths
+
 
 def find_rgb_depth_files(sample_dir):
     """
@@ -86,12 +124,13 @@ def find_rgb_depth_files(sample_dir):
 
     return rgb_path, depth_path
 
+
 def collect_all_samples():
     """
     Collect all valid samples from SUN RGB-D dataset.
 
     Returns:
-        List of tuples: (sample_dir, raw_scene, mapped_scene, class_idx)
+        List of tuples: (sample_dir, raw_scene, mapped_scene, class_idx, rgb_path, depth_path)
     """
     samples = []
 
@@ -127,105 +166,120 @@ def collect_all_samples():
 
     return samples
 
-def create_preprocessed_dataset(samples, train_indices=None, test_indices=None):
+
+def _process_split(split_name, split_samples):
     """
-    Create preprocessed dataset with proper train/val split.
+    Process a single split: copy images and write labels.
 
     Args:
-        samples: List of sample tuples
-        train_indices: Set of training indices (if using official split)
-        test_indices: Set of test indices (if using official split)
+        split_name: One of 'train', 'val', 'test'
+        split_samples: List of sample tuples for this split
+
+    Returns:
+        List of class labels for this split
     """
     # Create output directories
-    for split in ['train', 'val']:
-        for subdir in ['rgb', 'depth']:
-            os.makedirs(os.path.join(OUTPUT_BASE, split, subdir), exist_ok=True)
+    for subdir in ['rgb', 'depth']:
+        os.makedirs(os.path.join(OUTPUT_BASE, split_name, subdir), exist_ok=True)
 
-    # Split samples
-    if train_indices is not None and test_indices is not None:
-        print("Using official train/test split from SUNRGBDtoolbox")
-        train_samples = [samples[i] for i in train_indices if i < len(samples)]
-        val_samples = [samples[i] for i in test_indices if i < len(samples)]
-    else:
-        print("Using random 80/20 split with stratification")
-        # Group by class for stratified split
-        from collections import defaultdict
-        class_samples = defaultdict(list)
-        for idx, sample in enumerate(samples):
-            class_idx = sample[3]
-            class_samples[class_idx].append(idx)
-
-        train_indices_list = []
-        val_indices_list = []
-
-        # Shuffle and split each class
-        np.random.seed(42)
-        for class_idx, indices in class_samples.items():
-            indices = np.array(indices)
-            np.random.shuffle(indices)
-            split_point = int(len(indices) * 0.8)
-            train_indices_list.extend(indices[:split_point])
-            val_indices_list.extend(indices[split_point:])
-
-        train_samples = [samples[i] for i in train_indices_list]
-        val_samples = [samples[i] for i in val_indices_list]
-
-    print(f"\nTrain samples: {len(train_samples)}")
-    print(f"Val samples: {len(val_samples)}")
-
-    # Process train split
-    print("\nProcessing training set...")
-    train_labels = []
-    for idx, (sample_dir, raw_scene, mapped_scene, class_idx, rgb_path, depth_path) in enumerate(tqdm(train_samples)):
+    print(f"\nProcessing {split_name} set ({len(split_samples)} samples)...")
+    labels = []
+    for idx, (sample_dir, raw_scene, mapped_scene, class_idx, rgb_path, depth_path) in enumerate(tqdm(split_samples)):
         # Copy RGB image
-        rgb_out = os.path.join(OUTPUT_BASE, 'train', 'rgb', f'{idx:05d}.png')
+        rgb_out = os.path.join(OUTPUT_BASE, split_name, 'rgb', f'{idx:05d}.png')
         img = Image.open(rgb_path).convert('RGB')
         img.save(rgb_out)
 
         # Copy depth image
-        depth_out = os.path.join(OUTPUT_BASE, 'train', 'depth', f'{idx:05d}.png')
+        depth_out = os.path.join(OUTPUT_BASE, split_name, 'depth', f'{idx:05d}.png')
         depth = Image.open(depth_path)
         depth.save(depth_out)
 
         # Record label
-        train_labels.append(class_idx)
+        labels.append(class_idx)
 
-    # Save train labels
-    with open(os.path.join(OUTPUT_BASE, 'train', 'labels.txt'), 'w') as f:
-        for label in train_labels:
+    # Save labels
+    with open(os.path.join(OUTPUT_BASE, split_name, 'labels.txt'), 'w') as f:
+        for label in labels:
             f.write(f"{label}\n")
 
-    # Process val split
-    print("\nProcessing validation set...")
-    val_labels = []
-    for idx, (sample_dir, raw_scene, mapped_scene, class_idx, rgb_path, depth_path) in enumerate(tqdm(val_samples)):
-        # Copy RGB image
-        rgb_out = os.path.join(OUTPUT_BASE, 'val', 'rgb', f'{idx:05d}.png')
-        img = Image.open(rgb_path).convert('RGB')
-        img.save(rgb_out)
+    return labels
 
-        # Copy depth image
-        depth_out = os.path.join(OUTPUT_BASE, 'val', 'depth', f'{idx:05d}.png')
-        depth = Image.open(depth_path)
-        depth.save(depth_out)
 
-        # Record label
-        val_labels.append(class_idx)
+def create_preprocessed_dataset(samples, train_paths, test_paths, val_ratio=0.1, seed=42):
+    """
+    Create preprocessed dataset with official 3-way split (train/val/test).
 
-    # Save val labels
-    with open(os.path.join(OUTPUT_BASE, 'val', 'labels.txt'), 'w') as f:
-        for label in val_labels:
-            f.write(f"{label}\n")
+    The official training set is sub-split into train and val using stratified
+    sampling. The official test set is preserved as-is.
 
-    # Save metadata
-    metadata = {
-        'num_classes': 15,
-        'class_names': SUNRGBD_15_CATEGORIES,
-        'train_samples': len(train_samples),
-        'val_samples': len(val_samples),
-        'train_distribution': dict(Counter(train_labels)),
-        'val_distribution': dict(Counter(val_labels)),
-    }
+    Args:
+        samples: List of sample tuples from collect_all_samples()
+        train_paths: Set of relative paths for official training samples
+        test_paths: Set of relative paths for official test samples
+        val_ratio: Fraction of official training set to use for validation
+        seed: Random seed for reproducible train/val sub-split
+    """
+    # Build lookup: relative path -> sample
+    path_to_sample = {}
+    for sample in samples:
+        sample_dir = sample[0]
+        rel_path = os.path.relpath(sample_dir, SUNRGBD_BASE)
+        path_to_sample[rel_path] = sample
+
+    # Match samples to official splits
+    official_train_samples = []
+    official_test_samples = []
+    unmatched_train = 0
+    unmatched_test = 0
+
+    for path in train_paths:
+        if path in path_to_sample:
+            official_train_samples.append(path_to_sample[path])
+        else:
+            unmatched_train += 1
+
+    for path in test_paths:
+        if path in path_to_sample:
+            official_test_samples.append(path_to_sample[path])
+        else:
+            unmatched_test += 1
+
+    print(f"\nOfficial split matching:")
+    print(f"  Train: {len(official_train_samples)} matched ({unmatched_train} filtered by 15-cat mapping)")
+    print(f"  Test:  {len(official_test_samples)} matched ({unmatched_test} filtered by 15-cat mapping)")
+
+    # Sub-split official train into train (90%) and val (10%) — stratified by class
+    class_groups = defaultdict(list)
+    for idx, sample in enumerate(official_train_samples):
+        class_idx = sample[3]
+        class_groups[class_idx].append(idx)
+
+    np.random.seed(seed)
+    train_sub_indices = []
+    val_sub_indices = []
+
+    for class_idx in sorted(class_groups.keys()):
+        indices = np.array(class_groups[class_idx])
+        np.random.shuffle(indices)
+        split_point = int(len(indices) * (1.0 - val_ratio))
+        train_sub_indices.extend(indices[:split_point])
+        val_sub_indices.extend(indices[split_point:])
+
+    train_samples = [official_train_samples[i] for i in train_sub_indices]
+    val_samples = [official_train_samples[i] for i in val_sub_indices]
+    test_samples = official_test_samples
+
+    print(f"\n3-way split:")
+    print(f"  Train: {len(train_samples)} (90% of official train)")
+    print(f"  Val:   {len(val_samples)} (10% of official train)")
+    print(f"  Test:  {len(test_samples)} (official test set)")
+    print(f"  Total: {len(train_samples) + len(val_samples) + len(test_samples)}")
+
+    # Process all three splits
+    train_labels = _process_split('train', train_samples)
+    val_labels = _process_split('val', val_samples)
+    test_labels = _process_split('test', test_samples)
 
     # Write class names
     with open(os.path.join(OUTPUT_BASE, 'class_names.txt'), 'w') as f:
@@ -234,34 +288,34 @@ def create_preprocessed_dataset(samples, train_indices=None, test_indices=None):
 
     # Write statistics
     with open(os.path.join(OUTPUT_BASE, 'dataset_info.txt'), 'w') as f:
-        f.write("SUN RGB-D 15-Category Dataset\n")
+        f.write("SUN RGB-D 15-Category Dataset (Official Split)\n")
         f.write("=" * 80 + "\n\n")
-        f.write(f"Number of classes: {metadata['num_classes']}\n")
-        f.write(f"Train samples: {metadata['train_samples']}\n")
-        f.write(f"Val samples: {metadata['val_samples']}\n\n")
+        f.write(f"Split: Official train/test from SUNRGBDtoolbox allsplit.mat\n")
+        f.write(f"Train/Val sub-split: {1.0 - val_ratio:.0%}/{val_ratio:.0%} stratified (seed={seed})\n\n")
+        f.write(f"Number of classes: 15\n")
+        f.write(f"Train samples: {len(train_samples)}\n")
+        f.write(f"Val samples: {len(val_samples)}\n")
+        f.write(f"Test samples: {len(test_samples)}\n")
+        f.write(f"Total: {len(train_samples) + len(val_samples) + len(test_samples)}\n\n")
 
         f.write("Class names:\n")
         for idx, name in enumerate(SUNRGBD_15_CATEGORIES):
             f.write(f"  {idx:2d}: {name}\n")
 
-        f.write("\nTrain distribution:\n")
-        train_counter = Counter(train_labels)
-        for class_idx in range(15):
-            class_name = SUNRGBD_15_CATEGORIES[class_idx]
-            count = train_counter.get(class_idx, 0)
-            f.write(f"  {class_idx:2d} {class_name:20s}: {count:5d}\n")
-
-        f.write("\nVal distribution:\n")
-        val_counter = Counter(val_labels)
-        for class_idx in range(15):
-            class_name = SUNRGBD_15_CATEGORIES[class_idx]
-            count = val_counter.get(class_idx, 0)
-            f.write(f"  {class_idx:2d} {class_name:20s}: {count:5d}\n")
+        for split_name, split_labels in [('Train', train_labels), ('Val', val_labels), ('Test', test_labels)]:
+            f.write(f"\n{split_name} distribution:\n")
+            counter = Counter(split_labels)
+            for class_idx in range(15):
+                class_name = SUNRGBD_15_CATEGORIES[class_idx]
+                count = counter.get(class_idx, 0)
+                f.write(f"  {class_idx:2d} {class_name:20s}: {count:5d}\n")
 
     print(f"\n✓ Dataset preprocessed successfully!")
     print(f"Output directory: {OUTPUT_BASE}")
     print(f"Train: {len(train_samples)} samples")
     print(f"Val: {len(val_samples)} samples")
+    print(f"Test: {len(test_samples)} samples")
+
 
 def main():
     # Collect all samples
@@ -276,11 +330,12 @@ def main():
         count = class_counter.get(class_idx, 0)
         print(f"  {class_idx:2d} {class_name:20s}: {count:5d}")
 
-    # Load official split (if available)
-    train_indices, test_indices = load_official_split()
+    # Load official split
+    train_paths, test_paths = load_official_split()
 
-    # Create preprocessed dataset
-    create_preprocessed_dataset(samples, train_indices, test_indices)
+    # Create preprocessed dataset with 3-way split
+    create_preprocessed_dataset(samples, train_paths, test_paths)
+
 
 if __name__ == "__main__":
     main()

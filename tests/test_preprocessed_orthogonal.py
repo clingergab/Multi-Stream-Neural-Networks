@@ -121,7 +121,7 @@ print("="*80)
 
 print("\nLoading 5 preprocessed orthogonal images...\n")
 
-train_dataset = SUNRGBDDataset(train=True)
+train_dataset = SUNRGBDDataset(split='train')
 
 for idx in range(5):
     # Load preprocessed orthogonal image
@@ -292,8 +292,9 @@ print("FINAL SUMMARY")
 print("="*80)
 
 print("\n✅ FILE STRUCTURE:")
-print("   - Train: 8041 files")
-print("   - Val:   2018 files")
+print("   - Train: 4613 files")
+print("   - Val:   520 files")
+print("   - Test:  4926 files")
 print("   - All match RGB/Depth counts")
 
 print("\n✅ VALUE CORRECTNESS:")

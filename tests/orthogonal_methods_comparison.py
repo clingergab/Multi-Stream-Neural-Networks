@@ -22,7 +22,7 @@ print("COMPARING ORTHOGONAL STREAM EXTRACTION METHODS")
 print("="*80)
 
 # Load dataset
-train_dataset = SUNRGBDDataset(train=True)
+train_dataset = SUNRGBDDataset(split='train')
 print(f"\nLoaded SUN RGB-D train set: {len(train_dataset)} samples\n")
 
 

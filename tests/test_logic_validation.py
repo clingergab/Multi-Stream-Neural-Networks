@@ -57,7 +57,7 @@ def test_random_erasing_impact():
 
     from src.data_utils.sunrgbd_dataset import SUNRGBDDataset
 
-    dataset = SUNRGBDDataset(train=False, target_size=(224, 224))
+    dataset = SUNRGBDDataset(split='val', target_size=(224, 224))
 
     num_samples = 50
 

@@ -96,11 +96,11 @@ def apply_full_augmentation(rgb, depth, target_size=(416, 544)):
     # 7. Normalization
     rgb = transforms.functional.normalize(
         rgb,
-        mean=[0.4905626144214781, 0.4564359471868703, 0.43112756716677114],
-        std=[0.27944652961530003, 0.2868739703756949, 0.29222326115669395]
+        mean=[0.4974685511366709, 0.4657685752251157, 0.4418713446646282],
+        std=[0.2772972605813588, 0.2859611184863525, 0.2896814863955933]
     )
     depth = transforms.functional.normalize(
-        depth, mean=[0.2912], std=[0.1472]
+        depth, mean=[0.2911], std=[0.1514]
     )
 
     # 8. Random Erasing RGB (17%)
@@ -267,8 +267,8 @@ def benchmark_transforms(num_iterations=500):
     print(f"    {time_saved_per_batch:.1f} ms/batch")
     print(f"    {time_saved_per_batch/1000:.3f} sec/batch")
 
-    # Per-epoch calculation (assuming ~250 batches for 8000 samples)
-    num_batches = 8041 // batch_size
+    # Per-epoch calculation (official split: 4613 training samples)
+    num_batches = 4613 // batch_size
     time_saved_per_epoch = time_saved_per_batch * num_batches / 1000
 
     print(f"\n  Time saved per epoch ({num_batches} batches):")

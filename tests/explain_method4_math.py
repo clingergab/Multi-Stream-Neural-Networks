@@ -150,7 +150,7 @@ print("\n" + "="*80)
 print("CONCRETE EXAMPLE: One pixel from real data")
 print("="*80)
 
-train_dataset = SUNRGBDDataset(train=True)
+train_dataset = SUNRGBDDataset(split='train')
 rgb, depth, label = train_dataset[0]
 
 # Denormalize

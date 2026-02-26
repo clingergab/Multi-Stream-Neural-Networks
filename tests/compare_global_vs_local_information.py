@@ -21,7 +21,7 @@ print("="*80)
 print("GLOBAL vs LOCAL: Information Content Comparison")
 print("="*80)
 
-train_dataset = SUNRGBDDataset(train=True)
+train_dataset = SUNRGBDDataset(split='train')
 print(f"\nLoaded {len(train_dataset)} samples\n")
 
 

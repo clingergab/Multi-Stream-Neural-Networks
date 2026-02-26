@@ -31,8 +31,8 @@ def test_train_vs_val_augmentation():
 
     # Create both datasets (using same data_root, just different splits)
     try:
-        train_dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
-        val_dataset = SUNRGBDDataset(train=False, target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
+        val_dataset = SUNRGBDDataset(split='val', target_size=(224, 224))
     except Exception as e:
         print(f"⚠️  Could not load datasets: {e}")
         print("   Skipping this test (dataset may not be available)")
@@ -49,7 +49,7 @@ def test_train_vs_val_augmentation():
     rgb_diff = torch.abs(val_rgb1 - val_rgb2).max().item()
     depth_diff = torch.abs(val_depth1 - val_depth2).max().item()
 
-    print(f"\nValidation set (train=False):")
+    print(f"\nValidation set (split='val'):")
     print(f"  Loading same image twice...")
     print(f"  RGB difference: {rgb_diff:.6f}")
     print(f"  Depth difference: {depth_diff:.6f}")
@@ -67,7 +67,7 @@ def test_train_vs_val_augmentation():
     rgb_diff = torch.abs(train_rgb1 - train_rgb2).max().item()
     depth_diff = torch.abs(train_depth1 - train_depth2).max().item()
 
-    print(f"\nTraining set (train=True):")
+    print(f"\nTraining set (split='train'):")
     print(f"  Loading same image twice...")
     print(f"  RGB difference: {rgb_diff:.6f}")
     print(f"  Depth difference: {depth_diff:.6f}")
@@ -89,7 +89,7 @@ def test_synchronized_cropping():
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
     except Exception as e:
         print(f"⚠️  Could not load dataset: {e}")
         return
@@ -124,7 +124,7 @@ def test_rgb_independent_augmentation():
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
     except Exception as e:
         print(f"⚠️  Could not load dataset: {e}")
         return
@@ -180,7 +180,7 @@ def test_depth_independent_augmentation():
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
     except Exception as e:
         print(f"⚠️  Could not load dataset: {e}")
         return
@@ -220,8 +220,8 @@ def visualize_augmentation():
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
-        val_dataset = SUNRGBDDataset(train=False, target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
+        val_dataset = SUNRGBDDataset(split='val', target_size=(224, 224))
     except Exception as e:
         print(f"⚠️  Could not load datasets: {e}")
         return
@@ -316,7 +316,7 @@ def test_augmentation_probabilities():
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
     except Exception as e:
         print(f"⚠️  Could not load dataset: {e}")
         return

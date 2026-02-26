@@ -29,7 +29,7 @@ def test_augmentation_frequencies():
     from src.data_utils.sunrgbd_dataset import SUNRGBDDataset
 
     # Create dataset
-    dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+    dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
 
     # Track augmentation application
     num_samples = 1000
@@ -97,7 +97,7 @@ def test_augmentation_sanity():
 
     from src.data_utils.sunrgbd_dataset import SUNRGBDDataset
 
-    dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+    dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
 
     print(f"\nTesting {len(dataset)} training samples...")
 
@@ -153,8 +153,8 @@ def visualize_augmentations():
     from src.data_utils.sunrgbd_dataset import SUNRGBDDataset
 
     # Create both train and val datasets
-    train_dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
-    val_dataset = SUNRGBDDataset(train=False, target_size=(224, 224))
+    train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
+    val_dataset = SUNRGBDDataset(split='val', target_size=(224, 224))
 
     print(f"\nGenerating visualizations...")
 
@@ -251,8 +251,8 @@ def analyze_augmentation_strength():
 
     from src.data_utils.sunrgbd_dataset import SUNRGBDDataset
 
-    train_dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
-    val_dataset = SUNRGBDDataset(train=False, target_size=(224, 224))
+    train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
+    val_dataset = SUNRGBDDataset(split='val', target_size=(224, 224))
 
     num_samples = 50
     rgb_diffs = []
@@ -303,7 +303,7 @@ def test_augmentation_diversity():
 
     from src.data_utils.sunrgbd_dataset import SUNRGBDDataset
 
-    dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+    dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
 
     # Get multiple augmentations of the same sample
     idx = 0

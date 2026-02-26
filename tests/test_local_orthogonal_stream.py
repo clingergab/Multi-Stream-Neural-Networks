@@ -27,7 +27,7 @@ print("\nGoal: Create [R, G, B, D, O] representation where O is computed")
 print("      from each pixel's local RGB-D neighborhood hyperplane\n")
 
 # Load dataset
-train_dataset = SUNRGBDDataset(train=True)
+train_dataset = SUNRGBDDataset(split='train')
 print(f"Loaded SUN RGB-D train set: {len(train_dataset)} samples\n")
 
 

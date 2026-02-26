@@ -603,7 +603,7 @@ class TestSUNRGBDDatasetAugParams:
         # Should not raise any errors
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=1.5,
             rgb_aug_mag=1.2,
             depth_aug_prob=0.8,
@@ -619,7 +619,7 @@ class TestSUNRGBDDatasetAugParams:
         """Test that default params are all 1.0."""
         from src.data_utils.sunrgbd_dataset import SUNRGBDDataset
 
-        dataset = SUNRGBDDataset(data_root=mock_dataset, train=True)
+        dataset = SUNRGBDDataset(data_root=mock_dataset, split='train')
 
         assert dataset.rgb_aug_prob == 1.0
         assert dataset.rgb_aug_mag == 1.0
@@ -632,7 +632,7 @@ class TestSUNRGBDDatasetAugParams:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=1.5,
             rgb_aug_mag=1.5,
             depth_aug_prob=1.0,
@@ -653,14 +653,14 @@ class TestSUNRGBDDatasetAugParams:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=False,  # Validation mode
+            split='val',  # Validation mode
             rgb_aug_prob=1.5,  # Should be ignored
             rgb_aug_mag=1.5,
         )
 
         # Validation doesn't apply augmentation, so these shouldn't matter
         # Just verify the dataset was created without errors
-        assert dataset.train is False
+        assert dataset.split == 'val'
 
     def test_dataset_zero_params_disable_aug(self, mock_dataset):
         """Test that zero params effectively disable augmentation."""
@@ -668,7 +668,7 @@ class TestSUNRGBDDatasetAugParams:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=0.0,
             rgb_aug_mag=0.0,
             depth_aug_prob=0.0,
@@ -872,7 +872,7 @@ class TestEndToEndIntegration:
         # Pass to dataset using to_dict()
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             **config.to_dict(),
         )
 
@@ -888,7 +888,7 @@ class TestEndToEndIntegration:
         from src.data_utils.sunrgbd_dataset import SUNRGBDDataset
 
         config = AugmentationConfig.uniform(aug_prob=1.5, aug_mag=1.2)
-        dataset = SUNRGBDDataset(data_root=mock_dataset, train=True, **config.to_dict())
+        dataset = SUNRGBDDataset(data_root=mock_dataset, split='train', **config.to_dict())
 
         # Both streams should have same values
         assert dataset.rgb_aug_prob == dataset.depth_aug_prob == 1.5
@@ -907,7 +907,7 @@ class TestEndToEndIntegration:
         config = AugmentationConfig()
 
         # Should produce baseline values
-        dataset = SUNRGBDDataset(data_root=mock_dataset, train=True, **config.to_dict())
+        dataset = SUNRGBDDataset(data_root=mock_dataset, split='train', **config.to_dict())
 
         # All values should be at baseline
         assert dataset._flip_p == BASE_FLIP_P
@@ -974,7 +974,7 @@ class TestBaselineRegression:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=1.0,
             rgb_aug_mag=1.0,
             depth_aug_prob=1.0,
@@ -1032,7 +1032,7 @@ class TestZeroAugmentation:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=0.0,
             rgb_aug_mag=1.0,  # mag doesn't matter when prob=0
             depth_aug_prob=0.0,
@@ -1055,7 +1055,7 @@ class TestZeroAugmentation:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=0.0,
             rgb_aug_mag=1.0,
             depth_aug_prob=1.0,  # Depth stays at baseline
@@ -1082,7 +1082,7 @@ class TestZeroAugmentation:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=1.0,  # RGB stays at baseline
             rgb_aug_mag=1.0,
             depth_aug_prob=0.0,
@@ -1131,7 +1131,7 @@ class TestPerStreamIndependence:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=2.0,
             rgb_aug_mag=2.0,
             depth_aug_prob=0.5,
@@ -1155,7 +1155,7 @@ class TestPerStreamIndependence:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=0.5,
             rgb_aug_mag=0.5,
             depth_aug_prob=2.0,
@@ -1177,7 +1177,7 @@ class TestPerStreamIndependence:
         # High prob, low mag
         dataset1 = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=2.0,
             rgb_aug_mag=0.5,
             depth_aug_prob=1.0,
@@ -1187,7 +1187,7 @@ class TestPerStreamIndependence:
         # Low prob, high mag
         dataset2 = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=0.5,
             rgb_aug_mag=2.0,
             depth_aug_prob=1.0,
@@ -1335,7 +1335,7 @@ class TestCapEnforcement:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=5.0,  # Very high
             rgb_aug_mag=1.0,
             depth_aug_prob=5.0,
@@ -1367,7 +1367,7 @@ class TestCapEnforcement:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             rgb_aug_prob=1.0,
             rgb_aug_mag=5.0,  # Very high
             depth_aug_prob=1.0,
@@ -1484,7 +1484,7 @@ class TestConfigConsistency:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             **config.to_dict(),
         )
 
@@ -1628,7 +1628,7 @@ class TestIntegration:
 
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             target_size=(64, 64),  # Small for speed
             **config.to_dict(),
         )
@@ -1648,7 +1648,7 @@ class TestIntegration:
         # Very high augmentation
         dataset_high = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             target_size=(64, 64),
             rgb_aug_prob=3.0,
             rgb_aug_mag=3.0,
@@ -1659,7 +1659,7 @@ class TestIntegration:
         # Very low augmentation
         dataset_low = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             target_size=(64, 64),
             rgb_aug_prob=0.1,
             rgb_aug_mag=0.1,
@@ -1690,7 +1690,7 @@ class TestIntegration:
         # Step 2: Create dataset with config
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
-            train=True,
+            split='train',
             target_size=(64, 64),
             normalize=True,  # CPU mode
             **config.to_dict(),

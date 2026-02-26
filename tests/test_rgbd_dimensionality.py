@@ -33,7 +33,7 @@ def test_dimensionality_basic():
     print("="*80)
 
     # Load dataset
-    dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+    dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
     print(f"\nLoaded SUN RGB-D train set: {len(dataset)} images")
 
     # Sample pixels from multiple images
@@ -361,7 +361,7 @@ def test_pca_comparison():
     print("="*80)
 
     # Load dataset
-    dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+    dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
 
     # Sample fewer pixels for PCA
     num_images = 100
@@ -454,7 +454,7 @@ def main():
 
     # Test 4: Visualize orthogonal stream
     if orthogonal_vector is not None:
-        dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+        dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
         test_visualize_orthogonal_stream(dataset, orthogonal_vector)
 
     # Test 5: PCA comparison

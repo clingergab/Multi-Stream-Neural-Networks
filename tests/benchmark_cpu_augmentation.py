@@ -189,14 +189,14 @@ def run_benchmarks():
     print("Creating datasets...")
     dataset_full = SUNRGBDDataset(
         data_root=data_root,
-        train=True,
+        split='train',
         target_size=(416, 544),
         normalize=True,  # Full CPU augmentation
     )
 
     dataset_partial = SUNRGBDDataset(
         data_root=data_root,
-        train=True,
+        split='train',
         target_size=(416, 544),
         normalize=False,  # Partial augmentation (for GPU mode)
     )

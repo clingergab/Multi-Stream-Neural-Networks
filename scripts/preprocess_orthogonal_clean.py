@@ -286,9 +286,10 @@ def main():
         f.write(f"{vmin}\n{vmax}\n")
     print(f"\n✓ Saved normalization params to {norm_params_file}")
 
-    # Step 2: Process both splits
+    # Step 2: Process all three splits
     train_stats = process_split(data_root, 'train', vmin, vmax)
     val_stats = process_split(data_root, 'val', vmin, vmax)
+    test_stats = process_split(data_root, 'test', vmin, vmax)
 
     # Final summary
     print(f"{'='*80}")
@@ -298,6 +299,7 @@ def main():
     print("Generated orthogonal stream images:")
     print(f"  {data_root}/train/orth/ (train split)")
     print(f"  {data_root}/val/orth/   (val split)")
+    print(f"  {data_root}/test/orth/  (test split)")
     print(f"\nFormat: 16-bit PNG")
     print(f"Normalization: [{vmin:.6f}, {vmax:.6f}]")
     print(f"Precision: 65536 levels\n")

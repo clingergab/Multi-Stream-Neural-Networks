@@ -24,7 +24,7 @@ def test_crop_probability():
     # Create dataset
     train_dataset = SUNRGBDDataset(
         data_root='data/sunrgbd_15',
-        train=True,
+        split='train',
         target_size=(224, 224)
     )
 
@@ -265,7 +265,7 @@ def test_validation_deterministic():
 
     val_dataset = SUNRGBDDataset(
         data_root='data/sunrgbd_15',
-        train=False,
+        split='val',
         target_size=(224, 224)
     )
 

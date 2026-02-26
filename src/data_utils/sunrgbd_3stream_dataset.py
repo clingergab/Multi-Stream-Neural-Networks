@@ -19,7 +19,7 @@ class SUNRGBD3StreamDataset(Dataset):
 
     Directory structure:
         data_root/
-            train/ or val/
+            train/ or val/ or test/
                 rgb/
                     00000.png
                     ...
@@ -32,6 +32,8 @@ class SUNRGBD3StreamDataset(Dataset):
                 labels.txt
     """
 
+    VALID_SPLITS = ('train', 'val', 'test')
+
     # 15 scene categories
     CLASS_NAMES = [
         'bathroom', 'bedroom', 'classroom', 'computer_room', 'corridor',
@@ -42,24 +44,26 @@ class SUNRGBD3StreamDataset(Dataset):
     def __init__(
         self,
         data_root='data/sunrgbd_15',
-        train=True,
+        split='train',
         target_size=(416, 544),
     ):
         """
         Args:
             data_root: Root directory of preprocessed dataset
-            train: If True, load training set; else load validation set
+            split: One of 'train', 'val', or 'test'
             target_size: Target image size (H, W)
 
         Note: All augmentation is performed in __getitem__() to enable synchronized
         transforms between RGB, Depth, and Orthogonal modalities.
         """
+        if split not in self.VALID_SPLITS:
+            raise ValueError(f"split must be one of {self.VALID_SPLITS}, got '{split}'")
+
         self.data_root = data_root
-        self.train = train
+        self.split = split
         self.target_size = target_size
 
         # Set split directory
-        split = 'train' if train else 'val'
         self.split_dir = os.path.join(data_root, split)
 
         # Load labels
@@ -79,7 +83,7 @@ class SUNRGBD3StreamDataset(Dataset):
         assert os.path.exists(self.depth_dir), f"Depth directory not found: {self.depth_dir}"
         assert os.path.exists(self.orth_dir), f"Orthogonal directory not found: {self.orth_dir}"
 
-        print(f"Loaded SUN RGB-D 3-Stream {split} set: {self.num_samples} samples, 15 classes")
+        print(f"Loaded SUN RGB-D 3-Stream {self.split} set: {self.num_samples} samples, 15 classes")
 
     def __len__(self):
         return self.num_samples
@@ -139,7 +143,7 @@ class SUNRGBD3StreamDataset(Dataset):
 
 
         # ==================== TRAINING AUGMENTATION ====================
-        if self.train:
+        if self.split == 'train':
             # 1. Synchronized Random Horizontal Flip (50%)
             # Applied to ALL streams to maintain geometric consistency
             if np.random.random() < 0.5:
@@ -240,34 +244,33 @@ class SUNRGBD3StreamDataset(Dataset):
 
         # ==================== NORMALIZATION ====================
         # Convert to tensor and normalize
-        # Statistics computed from 8041 training samples at (416, 544) resolution
+        # Statistics computed from training samples at (416, 544) resolution
         # after scaling to [0, 1] range
 
-        # RGB: Use exact computed training statistics
+        # RGB: Use exact computed training statistics (official split)
         rgb = transforms.functional.to_tensor(rgb)
         rgb = transforms.functional.normalize(
             rgb,
-            mean=[0.4905626144214781, 0.4564359471868703, 0.43112756716677114],
-            std=[0.27944652961530003, 0.2868739703756949, 0.29222326115669395]
+            mean=[0.4974685511366709, 0.4657685752251157, 0.4418713446646282],
+            std=[0.2772972605813588, 0.2859611184863525, 0.2896814863955933]
         )
 
-        # Depth: Use exact computed training statistics
+        # Depth: Use exact computed training statistics (official split)
         depth = transforms.functional.to_tensor(depth)
         depth = transforms.functional.normalize(
-            depth, mean=[0.2912], std=[0.1472]
+            depth, mean=[0.2911], std=[0.1514]
         )
 
-        # Orth: Use exact computed statistics from P1-P99 clipped data
-        # After P1-P99 outlier clipping, the data has mean=0.4736, std=0.1490
-        # This gives a normalized range of [-3.18, 3.53] which is stable for training
-        # Data generated with P1-P99 percentile clipping to remove extreme outliers
+        # Orth: Use exact computed statistics from official split training set
+        # After P1-P99 outlier clipping and normalization to uint16, the data has
+        # mean=0.4944, std=0.2065 (computed from 4613 training samples)
         orth = transforms.functional.to_tensor(orth)
         orth = transforms.functional.normalize(
-            orth, mean=[0.4736], std=[0.1490]
+            orth, mean=[0.4944], std=[0.2065]
         )
 
         # 7. Post-normalization Random Erasing
-        if self.train:
+        if self.split == 'train':
             # RGB random erasing (17%)
             if np.random.random() < 0.17:
                 erasing = transforms.RandomErasing(
@@ -350,7 +353,7 @@ def get_sunrgbd_3stream_dataloaders(
     use_class_weights=False,
 ):
     """
-    Create train and validation dataloaders for SUN RGB-D 3-Stream.
+    Create train, validation, and test dataloaders for SUN RGB-D 3-Stream.
 
     Args:
         data_root: Root directory of preprocessed dataset
@@ -360,18 +363,24 @@ def get_sunrgbd_3stream_dataloaders(
         use_class_weights: If True, return class weights for loss
 
     Returns:
-        train_loader, val_loader, (optional) class_weights
+        train_loader, val_loader, test_loader, (optional) class_weights
     """
     # Create datasets
     train_dataset = SUNRGBD3StreamDataset(
         data_root=data_root,
-        train=True,
+        split='train',
         target_size=target_size,
     )
 
     val_dataset = SUNRGBD3StreamDataset(
         data_root=data_root,
-        train=False,
+        split='val',
+        target_size=target_size,
+    )
+
+    test_dataset = SUNRGBD3StreamDataset(
+        data_root=data_root,
+        split='test',
         target_size=target_size,
     )
 
@@ -394,17 +403,27 @@ def get_sunrgbd_3stream_dataloaders(
         persistent_workers=(num_workers > 0)
     )
 
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0)
+    )
+
     print(f"\nDataLoader Info:")
     print(f"  Train batches: {len(train_loader)}")
     print(f"  Val batches: {len(val_loader)}")
+    print(f"  Test batches: {len(test_loader)}")
     print(f"  Batch size: {batch_size}")
 
     if use_class_weights:
         class_weights = train_dataset.get_class_weights()
         print(f"\nClass weights computed (inverse frequency)")
-        return train_loader, val_loader, class_weights
+        return train_loader, val_loader, test_loader, class_weights
 
-    return train_loader, val_loader
+    return train_loader, val_loader, test_loader
 
 
 if __name__ == "__main__":
@@ -415,11 +434,13 @@ if __name__ == "__main__":
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBD3StreamDataset(train=True)
-        val_dataset = SUNRGBD3StreamDataset(train=False)
+        train_dataset = SUNRGBD3StreamDataset(split='train')
+        val_dataset = SUNRGBD3StreamDataset(split='val')
+        test_dataset = SUNRGBD3StreamDataset(split='test')
 
         print(f"\nTrain set: {len(train_dataset)} samples")
         print(f"Val set: {len(val_dataset)} samples")
+        print(f"Test set: {len(test_dataset)} samples")
 
         # Test getting a sample
         rgb, depth, orth, label = train_dataset[0]
@@ -438,7 +459,7 @@ if __name__ == "__main__":
 
         # Test dataloader
         print("\nTesting dataloaders...")
-        train_loader, val_loader = get_sunrgbd_3stream_dataloaders(batch_size=16, num_workers=0)
+        train_loader, val_loader, test_loader = get_sunrgbd_3stream_dataloaders(batch_size=16, num_workers=0)
 
         # Get one batch
         rgb_batch, depth_batch, orth_batch, labels_batch = next(iter(train_loader))
@@ -449,7 +470,7 @@ if __name__ == "__main__":
         print(f"  Labels: {labels_batch.shape}")
 
         print("\n✓ Dataset loader working correctly!")
-    
+
     except Exception as e:
         print(f"\nError testing dataset: {e}")
-        print("Make sure the 'orth' directory exists in data/sunrgbd_15/train/ and data/sunrgbd_15/val/")
+        print("Make sure the 'orth' directory exists in data/sunrgbd_15/train/, val/, and test/")

@@ -25,7 +25,7 @@ print("="*80)
 print("WINDOW SIZE COMPARISON FOR LOCAL ORTHOGONAL STREAM")
 print("="*80)
 
-train_dataset = SUNRGBDDataset(train=True)
+train_dataset = SUNRGBDDataset(split='train')
 print(f"\nLoaded SUN RGB-D train set: {len(train_dataset)} samples\n")
 
 

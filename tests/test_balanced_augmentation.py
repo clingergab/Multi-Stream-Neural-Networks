@@ -23,7 +23,7 @@ def test_augmentation_balance():
     # Create dataset
     train_dataset = SUNRGBDDataset(
         data_root='data/sunrgbd_15',
-        train=True,
+        split='train',
         target_size=(224, 224)
     )
 
@@ -153,7 +153,7 @@ def visualize_sample_augmentations():
 
     train_dataset = SUNRGBDDataset(
         data_root='data/sunrgbd_15',
-        train=True,
+        split='train',
         target_size=(224, 224)
     )
 

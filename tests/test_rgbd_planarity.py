@@ -58,7 +58,7 @@ def test_global_planarity():
     print("TEST 1: Global Hyperplane Fit")
     print("="*80)
 
-    dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+    dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
 
     # Sample pixels from multiple images
     num_images = 100
@@ -319,7 +319,7 @@ def test_scene_type_planarity():
     print("TEST 4: Planarity by Scene Type")
     print("="*80)
 
-    dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+    dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
 
     # Group images by scene type
     scene_data = {}  # scene_label -> list of fit_qualities
@@ -397,7 +397,7 @@ def main():
     print("This validates that orthogonal vectors are well-defined and consistent.")
 
     # Load dataset
-    dataset = SUNRGBDDataset(train=True, target_size=(224, 224))
+    dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
 
     # Test 1: Global planarity
     X, basis, normal, global_fit_quality = test_global_planarity()

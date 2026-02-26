@@ -30,8 +30,8 @@ print("TEST 1: Validation Set - Preprocessed vs Online")
 print("="*80)
 
 print("\nLoading datasets...")
-dataset_val_preprocessed = SUNRGBDDataset(train=False, load_orth=True)
-dataset_val_online = SUNRGBDDataset(train=False, compute_orth_online=True)
+dataset_val_preprocessed = SUNRGBDDataset(split='val', load_orth=True)
+dataset_val_online = SUNRGBDDataset(split='val', compute_orth_online=True)
 
 print("\nComparing preprocessed vs online for 10 validation samples...")
 print("(Should be very similar since no augmentation)")
@@ -73,8 +73,8 @@ print("TEST 2: Training Set - Preprocessed vs Online")
 print("="*80)
 
 print("\nLoading datasets...")
-dataset_train_preprocessed = SUNRGBDDataset(train=True, load_orth=True)
-dataset_train_online = SUNRGBDDataset(train=True, compute_orth_online=True)
+dataset_train_preprocessed = SUNRGBDDataset(split='train', load_orth=True)
+dataset_train_online = SUNRGBDDataset(split='train', compute_orth_online=True)
 
 print("\nComparing preprocessed vs online for training samples...")
 print("(Expected to differ due to augmentation)")

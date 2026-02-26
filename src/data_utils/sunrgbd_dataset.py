@@ -63,7 +63,7 @@ class SUNRGBDDataset(Dataset):
 
     Directory structure:
         data_root/
-            train/ or val/
+            train/ or val/ or test/
                 rgb/
                     00000.png
                     00001.png
@@ -75,6 +75,8 @@ class SUNRGBDDataset(Dataset):
                 labels.txt
     """
 
+    VALID_SPLITS = ('train', 'val', 'test')
+
     # 15 scene categories
     CLASS_NAMES = [
         'bathroom', 'bedroom', 'classroom', 'computer_room', 'corridor',
@@ -85,7 +87,7 @@ class SUNRGBDDataset(Dataset):
     def __init__(
         self,
         data_root='data/sunrgbd_15',
-        train=True,
+        split='train',
         target_size=(416, 544),
         normalize: bool = True,
         rgb_aug_prob: float = 1.0,
@@ -96,7 +98,7 @@ class SUNRGBDDataset(Dataset):
         """
         Args:
             data_root: Root directory of preprocessed dataset
-            train: If True, load training set; else load validation set
+            split: One of 'train', 'val', or 'test'
             target_size: Target image size (H, W)
             normalize: If True, apply normalization in __getitem__().
                       Set to False when using GPU augmentation (which handles
@@ -109,8 +111,11 @@ class SUNRGBDDataset(Dataset):
         Note: All augmentation is performed in __getitem__() to enable synchronized
         transforms between RGB and depth modalities.
         """
+        if split not in self.VALID_SPLITS:
+            raise ValueError(f"split must be one of {self.VALID_SPLITS}, got '{split}'")
+
         self.data_root = data_root
-        self.train = train
+        self.split = split
         self.target_size = target_size
         self.normalize = normalize
 
@@ -124,7 +129,6 @@ class SUNRGBDDataset(Dataset):
         self._compute_scaled_aug_values()
 
         # Set split directory
-        split = 'train' if train else 'val'
         self.split_dir = os.path.join(data_root, split)
 
         # Load labels
@@ -145,7 +149,7 @@ class SUNRGBDDataset(Dataset):
         print(f"Loaded SUN RGB-D {split} set: {self.num_samples} samples, 15 classes")
 
         # Log augmentation config if scaling is applied
-        if train and any(p != 1.0 for p in [rgb_aug_prob, rgb_aug_mag, depth_aug_prob, depth_aug_mag]):
+        if split == 'train' and any(p != 1.0 for p in [rgb_aug_prob, rgb_aug_mag, depth_aug_prob, depth_aug_mag]):
             self._log_augmentation_config()
 
     def __len__(self):
@@ -248,7 +252,7 @@ class SUNRGBDDataset(Dataset):
                 depth = Image.fromarray(depth_arr / 255.0, mode='F')
 
         # ==================== TRAINING AUGMENTATION ====================
-        if self.train:
+        if self.split == 'train':
             # 1. Synchronized Random Horizontal Flip
             # Uses pre-computed _flip_p (scaled by sync_prob)
             if np.random.random() < self._flip_p:
@@ -336,28 +340,28 @@ class SUNRGBDDataset(Dataset):
         depth = transforms.functional.to_tensor(depth)
 
         # ==================== NORMALIZATION ====================
-        # Statistics computed from 8041 training samples at (416, 544) resolution
+        # Statistics computed from training samples at (416, 544) resolution
         # after scaling to [0, 1] range
         #
         # When normalize=False (GPU augmentation mode), skip normalization here.
         # GPU augmentation will handle normalization after applying augmentations.
         if self.normalize:
-            # RGB: Use exact computed training statistics
+            # RGB: Use exact computed training statistics (official split)
             rgb = transforms.functional.normalize(
                 rgb,
-                mean=[0.4905626144214781, 0.4564359471868703, 0.43112756716677114],
-                std=[0.27944652961530003, 0.2868739703756949, 0.29222326115669395]
+                mean=[0.4974685511366709, 0.4657685752251157, 0.4418713446646282],
+                std=[0.2772972605813588, 0.2859611184863525, 0.2896814863955933]
             )
 
-            # Depth: Use exact computed training statistics
+            # Depth: Use exact computed training statistics (official split)
             depth = transforms.functional.normalize(
-                depth, mean=[0.2912], std=[0.1472]
+                depth, mean=[0.2911], std=[0.1514]
             )
 
             # 7. Post-normalization Random Erasing (CPU mode only)
             # When using GPU augmentation, erasing is done on GPU after normalization
             # Uses pre-computed _rgb_erasing_p and _depth_erasing_p (scaled by aug_prob/mag)
-            if self.train:
+            if self.split == 'train':
                 # RGB random erasing
                 if np.random.random() < self._rgb_erasing_p:
                     erasing = transforms.RandomErasing(
@@ -454,7 +458,7 @@ def get_sunrgbd_dataloaders(
     depth_aug_mag: float = 1.0,
 ):
     """
-    Create train and validation dataloaders for SUN RGB-D.
+    Create train, validation, and test dataloaders for SUN RGB-D.
 
     Args:
         data_root: Root directory of preprocessed dataset
@@ -476,28 +480,28 @@ def get_sunrgbd_dataloaders(
         depth_aug_mag: Scales magnitude of Depth augmentations (default: 1.0 = baseline)
 
     Returns:
-        train_loader, val_loader, (optional) class_weights
+        train_loader, val_loader, test_loader, (optional) class_weights
 
     Example:
         >>> # Reproducible dataloaders with stratified sampling
         >>> from src.utils.seed import set_seed
         >>> set_seed(42)
-        >>> train_loader, val_loader = get_sunrgbd_dataloaders(seed=42, stratified=True)
+        >>> train_loader, val_loader, test_loader = get_sunrgbd_dataloaders(seed=42, stratified=True)
         >>>
         >>> # For GPU augmentation mode with custom augmentation scaling
         >>> from src.training.augmentation_config import AugmentationConfig
         >>> aug_config = AugmentationConfig(rgb_aug_prob=1.5, rgb_aug_mag=1.2)
-        >>> train_loader, val_loader = get_sunrgbd_dataloaders(
+        >>> train_loader, val_loader, test_loader = get_sunrgbd_dataloaders(
         ...     normalize=False,
         ...     **aug_config.to_dict()
         ... )
     """
     # Create datasets
-    # Note: Augmentation params only affect training set (train=True)
-    # Validation set ignores these params (no augmentation applied)
+    # Note: Augmentation params only affect training set (split='train')
+    # Val and test sets ignore these params (no augmentation applied)
     train_dataset = SUNRGBDDataset(
         data_root=data_root,
-        train=True,
+        split='train',
         target_size=target_size,
         normalize=normalize,
         rgb_aug_prob=rgb_aug_prob,
@@ -508,10 +512,16 @@ def get_sunrgbd_dataloaders(
 
     val_dataset = SUNRGBDDataset(
         data_root=data_root,
-        train=False,
+        split='val',
         target_size=target_size,
         normalize=normalize,
-        # Validation: aug params don't matter (train=False means no augmentation)
+    )
+
+    test_dataset = SUNRGBDDataset(
+        data_root=data_root,
+        split='test',
+        target_size=target_size,
+        normalize=normalize,
     )
 
     # Setup reproducibility if seed is provided
@@ -574,18 +584,29 @@ def get_sunrgbd_dataloaders(
         worker_init_fn=worker_init_fn,
     )
 
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        prefetch_factor=2,
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
+    )
+
     print(f"\nDataLoader Info:")
     print(f"  Train batches: {len(train_loader)}")
     print(f"  Val batches: {len(val_loader)}")
+    print(f"  Test batches: {len(test_loader)}")
     print(f"  Batch size: {batch_size}")
     print(f"  Stratified: {stratified}")
 
     if use_class_weights:
         class_weights = train_dataset.get_class_weights()
         print(f"\nClass weights computed (inverse frequency)")
-        return train_loader, val_loader, class_weights
+        return train_loader, val_loader, test_loader, class_weights
 
-    return train_loader, val_loader
+    return train_loader, val_loader, test_loader
 
 
 if __name__ == "__main__":
@@ -595,11 +616,13 @@ if __name__ == "__main__":
     print("Testing SUN RGB-D Dataset Loader")
     print("=" * 80)
 
-    train_dataset = SUNRGBDDataset(train=True)
-    val_dataset = SUNRGBDDataset(train=False)
+    train_dataset = SUNRGBDDataset(split='train')
+    val_dataset = SUNRGBDDataset(split='val')
+    test_dataset = SUNRGBDDataset(split='test')
 
     print(f"\nTrain set: {len(train_dataset)} samples")
     print(f"Val set: {len(val_dataset)} samples")
+    print(f"Test set: {len(test_dataset)} samples")
 
     # Test getting a sample
     rgb, depth, label = train_dataset[0]
@@ -617,7 +640,7 @@ if __name__ == "__main__":
 
     # Test dataloader
     print("\nTesting dataloaders...")
-    train_loader, val_loader = get_sunrgbd_dataloaders(batch_size=16, num_workers=0)
+    train_loader, val_loader, test_loader = get_sunrgbd_dataloaders(batch_size=16, num_workers=0)
 
     # Get one batch
     rgb_batch, depth_batch, labels_batch = next(iter(train_loader))

@@ -22,7 +22,7 @@ def measure_augmentation_strength():
     from src.data_utils.sunrgbd_dataset import SUNRGBDDataset
 
     # Load dataset to get raw images
-    dataset = SUNRGBDDataset(train=False, target_size=(224, 224))  # Val to get unaugmented
+    dataset = SUNRGBDDataset(split='val', target_size=(224, 224))  # Val to get unaugmented
 
     num_samples = 100
     rgb_diffs = []

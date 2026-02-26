@@ -18,15 +18,17 @@ print("=" * 80)
 if Path(LOCAL_DATASET_PATH).exists():
     print(f"✅ Dataset already on local disk: {LOCAL_DATASET_PATH}")
 
-    # Verify structure
+    # Verify structure (3-way split: train/val/test using official SUN RGB-D split)
     train_rgb = len(list(Path(LOCAL_DATASET_PATH).glob("train/rgb/*.png")))
     val_rgb = len(list(Path(LOCAL_DATASET_PATH).glob("val/rgb/*.png")))
+    test_rgb = len(list(Path(LOCAL_DATASET_PATH).glob("test/rgb/*.png")))
 
     print(f"   Train samples: {train_rgb}")
     print(f"   Val samples: {val_rgb}")
+    print(f"   Test samples: {test_rgb}")
 
-    if train_rgb == 8041 and val_rgb == 2018:
-        print(f"   ✅ Dataset complete!")
+    if train_rgb > 0 and val_rgb > 0 and test_rgb > 0:
+        print(f"   ✅ Dataset complete! ({train_rgb + val_rgb + test_rgb} total)")
     else:
         print(f"   ⚠ Dataset incomplete, will re-copy from Drive")
         shutil.rmtree(LOCAL_DATASET_PATH)
@@ -37,7 +39,6 @@ if not Path(LOCAL_DATASET_PATH).exists():
         print(f"\n📁 Found dataset on Drive: {DRIVE_DATASET_PATH}")
         print(f"📥 Copying to local disk for 10-20x faster training...")
         print(f"   This takes ~2-3 minutes but saves 60+ minutes during training!")
-        print(f"   Dataset size: ~4.3 GB")
 
         # Create parent directory
         Path(LOCAL_DATASET_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -56,14 +57,16 @@ if not Path(LOCAL_DATASET_PATH).exists():
             # Verify
             train_rgb = len(list(Path(LOCAL_DATASET_PATH).glob("train/rgb/*.png")))
             val_rgb = len(list(Path(LOCAL_DATASET_PATH).glob("val/rgb/*.png")))
+            test_rgb = len(list(Path(LOCAL_DATASET_PATH).glob("test/rgb/*.png")))
 
             print(f"   Train samples: {train_rgb}")
             print(f"   Val samples: {val_rgb}")
+            print(f"   Test samples: {test_rgb}")
 
-            if train_rgb == 8041 and val_rgb == 2018:
-                print(f"   ✅ All samples verified!")
+            if train_rgb > 0 and val_rgb > 0 and test_rgb > 0:
+                print(f"   ✅ All samples verified! ({train_rgb + val_rgb + test_rgb} total)")
             else:
-                print(f"   ⚠ Warning: Expected 8041 train / 2018 val samples")
+                print(f"   ⚠ Warning: Missing samples in one or more splits")
         else:
             print(f"✗ Copy failed: {result.stderr}")
             raise RuntimeError("Failed to copy dataset from Drive")
@@ -78,12 +81,16 @@ if not Path(LOCAL_DATASET_PATH).exists():
         print(f"      └── datasets/")
         print(f"          └── sunrgbd_15/")
         print(f"              ├── train/")
-        print(f"              │   ├── rgb/       (8041 images)")
-        print(f"              │   ├── depth/     (8041 images)")
+        print(f"              │   ├── rgb/       (training images)")
+        print(f"              │   ├── depth/     (training images)")
         print(f"              │   └── labels.txt")
         print(f"              ├── val/")
-        print(f"              │   ├── rgb/       (2018 images)")
-        print(f"              │   ├── depth/     (2018 images)")
+        print(f"              │   ├── rgb/       (validation images)")
+        print(f"              │   ├── depth/     (validation images)")
+        print(f"              │   └── labels.txt")
+        print(f"              ├── test/")
+        print(f"              │   ├── rgb/       (official test images)")
+        print(f"              │   ├── depth/     (official test images)")
         print(f"              │   └── labels.txt")
         print(f"              ├── class_names.txt")
         print(f"              └── dataset_info.txt")
@@ -95,7 +102,7 @@ print(f"✅ Dataset ready at: {LOCAL_DATASET_PATH}")
 print("=" * 80)
 print("\nYou can now proceed with training!")
 print(f"\nUsage in training code:")
-print(f"  train_loader, val_loader = get_sunrgbd_dataloaders(")
+print(f"  train_loader, val_loader, test_loader = get_sunrgbd_dataloaders(")
 print(f"      data_root='{LOCAL_DATASET_PATH}',")
 print(f"      batch_size=64,")
 print(f"      num_workers=2")
