@@ -7,6 +7,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.nn import functional as F
 from .conv import LIConv2d, LIBatchNorm2d
 from .container import LIReLU
 
@@ -134,12 +135,11 @@ class LIBasicBlock(nn.Module):
         stream_identities = stream_inputs.copy()
         integrated_identity = integrated_input
 
-        # First conv block (integration happens inside LIConv2d!)
+        # First conv block: conv1 → bn1+relu (fused)
         stream_outputs, integrated = self.conv1(stream_inputs, integrated_input, blanked_mask)
-        stream_outputs, integrated = self.bn1(stream_outputs, integrated, blanked_mask)
-        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated, blanked_mask, apply_relu=True)
 
-        # Second conv block (integration happens inside LIConv2d!)
+        # Second conv block: conv2 → bn2 (no relu — relu comes after residual)
         stream_outputs, integrated = self.conv2(stream_outputs, integrated, blanked_mask)
         stream_outputs, integrated = self.bn2(stream_outputs, integrated, blanked_mask)
 
@@ -150,15 +150,12 @@ class LIBasicBlock(nn.Module):
                 stream_identities, integrated_identity, blanked_mask
             )
 
-        # Residual connections (exact ResNet pattern)
+        # Residual connections + final activation
         # Note: for blanked samples, both stream_outputs and stream_identities are zeros
         # so the result is 0 + 0 = 0 (blanked samples stay zeroed)
-        stream_outputs = [s + s_id for s, s_id in zip(stream_outputs, stream_identities)]
+        stream_outputs = [F.relu(s + s_id, inplace=True) for s, s_id in zip(stream_outputs, stream_identities)]
         if integrated_identity is not None:
-            integrated = integrated + integrated_identity
-
-        # Final activation
-        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
+            integrated = F.relu(integrated + integrated_identity, inplace=True)
 
         return stream_outputs, integrated
 
@@ -174,7 +171,7 @@ class LIBasicBlock(nn.Module):
         # First conv block
         out = self.conv1.forward_stream(stream_idx, stream_input)
         out = self.bn1.forward_stream(stream_idx, out)
-        out = self.relu.forward_stream(stream_idx, out)
+        out = F.relu(out, inplace=True)
 
         # Second conv block
         out = self.conv2.forward_stream(stream_idx, out)
@@ -184,11 +181,8 @@ class LIBasicBlock(nn.Module):
         if self.downsample is not None:
             identity = self.downsample.forward_stream(stream_idx, identity)
 
-        # Residual connection
-        out = out + identity
-
-        # Final activation
-        out = self.relu.forward_stream(stream_idx, out)
+        # Residual connection + final activation
+        out = F.relu(out + identity, inplace=True)
 
         return out
 
@@ -280,14 +274,12 @@ class LIBottleneck(nn.Module):
         stream_identities = stream_inputs.copy()
         integrated_identity = integrated_input
 
-        # Three conv blocks (integration happens inside LIConv2d!)
+        # Three conv blocks: conv1 → bn1+relu, conv2 → bn2+relu, conv3 → bn3 (no relu)
         stream_outputs, integrated = self.conv1(stream_inputs, integrated_input, blanked_mask)
-        stream_outputs, integrated = self.bn1(stream_outputs, integrated, blanked_mask)
-        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated, blanked_mask, apply_relu=True)
 
         stream_outputs, integrated = self.conv2(stream_outputs, integrated, blanked_mask)
-        stream_outputs, integrated = self.bn2(stream_outputs, integrated, blanked_mask)
-        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.bn2(stream_outputs, integrated, blanked_mask, apply_relu=True)
 
         stream_outputs, integrated = self.conv3(stream_outputs, integrated, blanked_mask)
         stream_outputs, integrated = self.bn3(stream_outputs, integrated, blanked_mask)
@@ -299,15 +291,12 @@ class LIBottleneck(nn.Module):
                 stream_identities, integrated_identity, blanked_mask
             )
 
-        # Residual connections
+        # Residual connections + final activation
         # Note: for blanked samples, both stream_outputs and stream_identities are zeros
         # so the result is 0 + 0 = 0 (blanked samples stay zeroed)
-        stream_outputs = [s + s_id for s, s_id in zip(stream_outputs, stream_identities)]
+        stream_outputs = [F.relu(s + s_id, inplace=True) for s, s_id in zip(stream_outputs, stream_identities)]
         if integrated_identity is not None:
-            integrated = integrated + integrated_identity
-
-        # Final activation
-        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
+            integrated = F.relu(integrated + integrated_identity, inplace=True)
 
         return stream_outputs, integrated
 
@@ -323,11 +312,11 @@ class LIBottleneck(nn.Module):
         # Three conv blocks
         out = self.conv1.forward_stream(stream_idx, stream_input)
         out = self.bn1.forward_stream(stream_idx, out)
-        out = self.relu.forward_stream(stream_idx, out)
+        out = F.relu(out, inplace=True)
 
         out = self.conv2.forward_stream(stream_idx, out)
         out = self.bn2.forward_stream(stream_idx, out)
-        out = self.relu.forward_stream(stream_idx, out)
+        out = F.relu(out, inplace=True)
 
         out = self.conv3.forward_stream(stream_idx, out)
         out = self.bn3.forward_stream(stream_idx, out)
@@ -336,10 +325,7 @@ class LIBottleneck(nn.Module):
         if self.downsample is not None:
             identity = self.downsample.forward_stream(stream_idx, identity)
 
-        # Residual connection
-        out = out + identity
-
-        # Final activation
-        out = self.relu.forward_stream(stream_idx, out)
+        # Residual connection + final activation
+        out = F.relu(out + identity, inplace=True)
 
         return out

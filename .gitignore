@@ -31,6 +31,8 @@ dist/
 outputs/
 checkpoints/
 results/*.png
+tests/benchmarks/trace_*.json
+tests/benchmarks/benchmark_results.json
 results/mcresnet_baseline_grid_search/
 mcresnet_baseline_grid_search/
 diagnostics/

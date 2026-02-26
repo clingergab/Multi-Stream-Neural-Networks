@@ -6,7 +6,7 @@ that maintain independent pathways with unified neuron architecture.
 """
 
 import math
-from click import group
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -15,6 +15,12 @@ from torch.nn.parameter import Parameter
 from torch.nn.common_types import _size_2_t
 from torch.nn.modules.utils import _pair, _reverse_repeat_tuple
 from typing import Optional, Union
+
+# Flags to disable optimizations for A/B profiling.
+# USE_OPTIMIZED_OPS: When False, forces sequential per-stream convolution.
+# USE_CHANNELS_LAST: When False, skips channels_last conversion at model input.
+USE_OPTIMIZED_OPS = True
+USE_CHANNELS_LAST = True
 
 
 class _LIConvNd(nn.Module):
@@ -330,7 +336,12 @@ class LIConv2d(_LIConvNd):
             padding_mode,
             **factory_kwargs,
         )
-    
+
+        # Pre-allocated buffers for grouped cuDNN conv (avoids torch.cat malloc per forward)
+        # Only used when all streams have identical shapes (layers 1-4, not conv1)
+        self._grouped_weight_buffer: Optional[Tensor] = None
+        self._grouped_input_buffer: Optional[Tensor] = None
+
     def _conv_forward(
         self,
         stream_inputs: list[Tensor],
@@ -363,44 +374,136 @@ class LIConv2d(_LIConvNd):
         stream_outputs = []
         stream_outputs_raw = []  # Raw outputs for integration (without bias)
 
-        for i, (stream_input, stream_weight, stream_bias) in enumerate(
-            zip(stream_inputs, stream_weights, stream_biases)
-        ):
-            # Compute raw conv output (dendritic spatial filtering)
-            if self.padding_mode != "zeros":
-                stream_out_raw = F.conv2d(
-                    F.pad(
-                        stream_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
-                    ),
-                    stream_weight,
-                    None,  # No bias for raw output
-                    self.stride,
-                    _pair(0),
-                    self.dilation,
-                    self.groups,
-                )
+        # Check if grouped cuDNN conv can be used:
+        # - All streams same shape (layers 1-4, NOT conv1 which has [3,1,1])
+        # - Standard zero padding mode
+        # - All on same device
+        _shapes_uniform = (
+            USE_OPTIMIZED_OPS
+            and len(set(w.shape for w in stream_weights)) == 1
+            and self.padding_mode == "zeros"
+            and stream_inputs[0].is_cuda
+        )
+
+        if _shapes_uniform and len(stream_weights) == 3:
+            # Grouped cuDNN conv: pack N streams into single grouped conv
+            N = len(stream_weights)
+            C_out = stream_weights[0].shape[0]
+
+            # Pack weights and inputs via torch.cat.
+            # Pre-allocated buffers can't be used when any tensor requires grad
+            # because in-place writes break autograd graph on subsequent iterations.
+            needs_grad = (
+                any(w.requires_grad for w in stream_weights)
+                or any(s.requires_grad for s in stream_inputs)
+            )
+
+            if needs_grad:
+                grouped_weight = torch.cat(stream_weights, dim=0)
+                grouped_input = torch.cat(stream_inputs, dim=1)
             else:
-                stream_out_raw = F.conv2d(
-                    stream_input, stream_weight, None, self.stride, self.padding, self.dilation, self.groups
-                )
+                C_in_per_group = stream_weights[0].shape[1]
+                B = stream_inputs[0].shape[0]
+                H_in, W_in = stream_inputs[0].shape[2], stream_inputs[0].shape[3]
 
-            # Add bias for stream's own output (pathway-specific baseline)
-            if stream_bias is not None:
-                stream_out = stream_out_raw + stream_bias.view(1, -1, 1, 1)
-            else:
-                stream_out = stream_out_raw
+                weight_shape = (N * C_out, C_in_per_group, *stream_weights[0].shape[2:])
+                if (
+                    self._grouped_weight_buffer is None
+                    or self._grouped_weight_buffer.shape != weight_shape
+                    or self._grouped_weight_buffer.device != stream_weights[0].device
+                    or self._grouped_weight_buffer.dtype != stream_weights[0].dtype
+                ):
+                    self._grouped_weight_buffer = torch.empty(
+                        weight_shape, device=stream_weights[0].device,
+                        dtype=stream_weights[0].dtype,
+                    )
+                for i, w in enumerate(stream_weights):
+                    self._grouped_weight_buffer[i * C_out:(i + 1) * C_out] = w
 
-            # === PER-SAMPLE MASKING: Zero blanked samples for modality dropout ===
-            stream_blanked = blanked_mask.get(i) if blanked_mask else None
-            if stream_blanked is not None and stream_blanked.any():
-                # mask: [batch_size, 1, 1, 1] for broadcasting, 1.0 for active, 0.0 for blanked
-                mask = (~stream_blanked).float().view(-1, 1, 1, 1)
-                # OPTIMIZATION: Use in-place operations to avoid creating temporary tensors
-                stream_out.mul_(mask)
-                stream_out_raw.mul_(mask)  # Critical: zeros for integration
+                C_in = stream_inputs[0].shape[1]
+                input_shape = (B, N * C_in, H_in, W_in)
+                if (
+                    self._grouped_input_buffer is None
+                    or self._grouped_input_buffer.shape != input_shape
+                    or self._grouped_input_buffer.device != stream_inputs[0].device
+                    or self._grouped_input_buffer.dtype != stream_inputs[0].dtype
+                ):
+                    mem_fmt = torch.channels_last if stream_inputs[0].is_contiguous(memory_format=torch.channels_last) else torch.contiguous_format
+                    self._grouped_input_buffer = torch.empty(
+                        input_shape, device=stream_inputs[0].device,
+                        dtype=stream_inputs[0].dtype, memory_format=mem_fmt,
+                    )
+                for i, inp in enumerate(stream_inputs):
+                    self._grouped_input_buffer[:, i * C_in:(i + 1) * C_in] = inp
 
-            stream_outputs.append(stream_out)  # Biased output for stream pathway
-            stream_outputs_raw.append(stream_out_raw)  # Raw output for integration
+                grouped_weight = self._grouped_weight_buffer
+                grouped_input = self._grouped_input_buffer
+
+            # Single cuDNN grouped conv
+            grouped_raw = F.conv2d(
+                grouped_input, grouped_weight, None,
+                self.stride, self.padding, self.dilation,
+                self.groups * N,  # N groups for N streams
+            )
+
+            # Split output back into per-stream tensors
+            raw_splits = torch.split(grouped_raw, C_out, dim=1)
+
+            for i, (stream_out_raw, stream_bias) in enumerate(
+                zip(raw_splits, stream_biases)
+            ):
+                # Make writable (split returns views)
+                stream_out_raw = stream_out_raw.contiguous()
+
+                if stream_bias is not None:
+                    stream_out = stream_out_raw + stream_bias.view(1, -1, 1, 1)
+                else:
+                    stream_out = stream_out_raw
+
+                # Per-sample masking for modality dropout
+                stream_blanked = blanked_mask.get(i) if blanked_mask else None
+                if stream_blanked is not None and stream_blanked.any():
+                    mask = (~stream_blanked).float().view(-1, 1, 1, 1)
+                    stream_out = stream_out * mask
+                    stream_out_raw = stream_out_raw * mask
+
+                stream_outputs.append(stream_out)
+                stream_outputs_raw.append(stream_out_raw)
+        else:
+            # Sequential fallback (conv1 with heterogeneous channels, or non-zero padding)
+            for i, (stream_input, stream_weight, stream_bias) in enumerate(
+                zip(stream_inputs, stream_weights, stream_biases)
+            ):
+                if self.padding_mode != "zeros":
+                    stream_out_raw = F.conv2d(
+                        F.pad(
+                            stream_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
+                        ),
+                        stream_weight,
+                        None,
+                        self.stride,
+                        _pair(0),
+                        self.dilation,
+                        self.groups,
+                    )
+                else:
+                    stream_out_raw = F.conv2d(
+                        stream_input, stream_weight, None, self.stride, self.padding, self.dilation, self.groups
+                    )
+
+                if stream_bias is not None:
+                    stream_out = stream_out_raw + stream_bias.view(1, -1, 1, 1)
+                else:
+                    stream_out = stream_out_raw
+
+                stream_blanked = blanked_mask.get(i) if blanked_mask else None
+                if stream_blanked is not None and stream_blanked.any():
+                    mask = (~stream_blanked).float().view(-1, 1, 1, 1)
+                    stream_out.mul_(mask)
+                    stream_out_raw.mul_(mask)
+
+                stream_outputs.append(stream_out)
+                stream_outputs_raw.append(stream_out_raw)
 
         # ===== Process integrated pathway (Soma Integration) =====
         # Apply Linear Integration on RAW conv outputs (dendritic signals without bias)
@@ -702,7 +805,8 @@ class _LIBatchNorm(_LINormBase):
         self,
         stream_inputs: list[Tensor],
         integrated_input: Optional[Tensor] = None,
-        blanked_mask: Optional[dict[int, Tensor]] = None
+        blanked_mask: Optional[dict[int, Tensor]] = None,
+        apply_relu: bool = False,
     ) -> tuple[list[Tensor], Tensor]:
         """
         Forward pass - implements the exact same algorithm as _BatchNorm.forward() for N streams.
@@ -713,6 +817,7 @@ class _LIBatchNorm(_LINormBase):
             blanked_mask: Optional per-sample blanking mask for modality dropout.
                          dict[stream_idx] -> bool tensor [batch_size] where True = blanked.
                          For blanked samples, BN is skipped and zeros are passed through.
+            apply_relu: If True, apply ReLU after BN. Eliminates separate relu call.
         """
         # Check input dimensions for all inputs
         for stream_input in stream_inputs:
@@ -749,6 +854,7 @@ class _LIBatchNorm(_LINormBase):
                     self.stream_weights[i] if self.affine else None,
                     self.stream_biases[i] if self.affine else None,
                     exponential_average_factor,
+                    apply_relu=apply_relu,
                 )
             elif stream_blanked.all():
                 # All samples blanked - pass through zeros unchanged
@@ -767,6 +873,7 @@ class _LIBatchNorm(_LINormBase):
                     self.stream_weights[i] if self.affine else None,
                     self.stream_biases[i] if self.affine else None,
                     exponential_average_factor,
+                    apply_relu=apply_relu,
                 )
 
                 # OPTIMIZATION: Use scatter operation with new_zeros for efficiency
@@ -785,6 +892,7 @@ class _LIBatchNorm(_LINormBase):
                 self.integrated_weight,
                 self.integrated_bias,
                 exponential_average_factor,
+                apply_relu=apply_relu,
             )
         else:
             integrated_out = None
@@ -799,12 +907,16 @@ class _LIBatchNorm(_LINormBase):
         weight: Optional[Tensor],
         bias: Optional[Tensor],
         exponential_average_factor: float,
+        apply_relu: bool = False,
     ) -> Tensor:
         """
-        Forward pass for a single pathway - applies batch normalization.
+        Forward pass for a single pathway - applies batch normalization + optional ReLU.
 
         Note: exponential_average_factor is pre-computed in forward() to ensure
         num_batches_tracked is only incremented once per forward pass, not per stream.
+
+        Args:
+            apply_relu: If True, apply ReLU after BN (eliminates separate relu call).
         """
         # Decide whether the mini-batch stats should be used for normalization rather than the buffers.
         # Mini-batch stats are used in training mode, and in eval mode when buffers are None.
@@ -814,7 +926,7 @@ class _LIBatchNorm(_LINormBase):
             bn_training = (running_mean is None) and (running_var is None)
 
         # Buffers are only updated if they are to be tracked and we are in training mode.
-        return F.batch_norm(
+        out = F.batch_norm(
             input,
             # If buffers are not to be tracked, ensure that they won't be updated
             running_mean if not self.training or self.track_running_stats else None,
@@ -825,6 +937,9 @@ class _LIBatchNorm(_LINormBase):
             exponential_average_factor,
             self.eps,
         )
+        if apply_relu:
+            out = F.relu(out, inplace=True)
+        return out
 
 
 class LIBatchNorm2d(_LIBatchNorm):

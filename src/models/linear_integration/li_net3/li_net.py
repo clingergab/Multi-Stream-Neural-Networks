@@ -48,6 +48,7 @@ except:
     from tqdm import tqdm
 
 # Import the linear integration components
+from . import conv as _conv_module
 from .conv import LIConv2d, LIBatchNorm2d
 from .blocks import LIBasicBlock, LIBottleneck
 from .container import LISequential, LIReLU
@@ -291,10 +292,13 @@ class LINet(BaseModel):
         Returns:
             Classification logits [batch_size, num_classes] from integrated stream
         """
+        # Convert inputs to channels_last for better cuDNN performance
+        if _conv_module.USE_CHANNELS_LAST:
+            stream_inputs = [s.contiguous(memory_format=torch.channels_last) for s in stream_inputs]
+
         # Initial convolution (creates integrated stream from all input streams)
         stream_outputs, integrated = self.conv1(stream_inputs, None, blanked_mask)  # integrated_input=None for first layer
-        stream_outputs, integrated = self.bn1(stream_outputs, integrated, blanked_mask)
-        stream_outputs, integrated = self.relu(stream_outputs, integrated, blanked_mask)
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated, blanked_mask, apply_relu=True)
 
         # Max pooling (all N streams + integrated)
         stream_outputs, integrated = self.maxpool(stream_outputs, integrated, blanked_mask)
@@ -1805,7 +1809,7 @@ class LINet(BaseModel):
         # This avoids corrupting BN running stats for other streams
         stream_x = self.conv1.forward_stream(stream_idx, stream_input)
         stream_x = self.bn1.forward_stream(stream_idx, stream_x)
-        stream_x = self.relu.forward_stream(stream_idx, stream_x)
+        stream_x = torch.nn.functional.relu(stream_x, inplace=True)
         stream_x = self.maxpool.forward_stream(stream_idx, stream_x)
 
         # ResNet layers (each layer has forward_stream that processes all blocks)
@@ -1837,8 +1841,7 @@ class LINet(BaseModel):
         """
         # Initial convolution (creates integrated stream from N streams)
         stream_outputs, integrated = self.conv1(stream_inputs, None)
-        stream_outputs, integrated = self.bn1(stream_outputs, integrated)
-        stream_outputs, integrated = self.relu(stream_outputs, integrated)
+        stream_outputs, integrated = self.bn1(stream_outputs, integrated, apply_relu=True)
 
         # Max pooling (all N streams + integrated)
         stream_outputs, integrated = self.maxpool(stream_outputs, integrated)
