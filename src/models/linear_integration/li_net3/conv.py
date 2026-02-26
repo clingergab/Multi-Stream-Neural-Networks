@@ -16,10 +16,7 @@ from torch.nn.common_types import _size_2_t
 from torch.nn.modules.utils import _pair, _reverse_repeat_tuple
 from typing import Optional, Union
 
-# Flags to disable optimizations for A/B profiling.
-# USE_OPTIMIZED_OPS: When False, forces sequential per-stream convolution.
-# USE_CHANNELS_LAST: When False, skips channels_last conversion at model input.
-USE_OPTIMIZED_OPS = True
+# When False, skips channels_last conversion at model input/weights.
 USE_CHANNELS_LAST = True
 
 
@@ -337,11 +334,6 @@ class LIConv2d(_LIConvNd):
             **factory_kwargs,
         )
 
-        # Pre-allocated buffers for grouped cuDNN conv (avoids torch.cat malloc per forward)
-        # Only used when all streams have identical shapes (layers 1-4, not conv1)
-        self._grouped_weight_buffer: Optional[Tensor] = None
-        self._grouped_input_buffer: Optional[Tensor] = None
-
     def _conv_forward(
         self,
         stream_inputs: list[Tensor],
@@ -374,136 +366,39 @@ class LIConv2d(_LIConvNd):
         stream_outputs = []
         stream_outputs_raw = []  # Raw outputs for integration (without bias)
 
-        # Check if grouped cuDNN conv can be used:
-        # - All streams same shape (layers 1-4, NOT conv1 which has [3,1,1])
-        # - Standard zero padding mode
-        # - All on same device
-        _shapes_uniform = (
-            USE_OPTIMIZED_OPS
-            and len(set(w.shape for w in stream_weights)) == 1
-            and self.padding_mode == "zeros"
-            and stream_inputs[0].is_cuda
-        )
-
-        if _shapes_uniform and len(stream_weights) == 3:
-            # Grouped cuDNN conv: pack N streams into single grouped conv
-            N = len(stream_weights)
-            C_out = stream_weights[0].shape[0]
-
-            # Pack weights and inputs via torch.cat.
-            # Pre-allocated buffers can't be used when any tensor requires grad
-            # because in-place writes break autograd graph on subsequent iterations.
-            needs_grad = (
-                any(w.requires_grad for w in stream_weights)
-                or any(s.requires_grad for s in stream_inputs)
-            )
-
-            if needs_grad:
-                grouped_weight = torch.cat(stream_weights, dim=0)
-                grouped_input = torch.cat(stream_inputs, dim=1)
+        for i, (stream_input, stream_weight, stream_bias) in enumerate(
+            zip(stream_inputs, stream_weights, stream_biases)
+        ):
+            if self.padding_mode != "zeros":
+                stream_out_raw = F.conv2d(
+                    F.pad(
+                        stream_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
+                    ),
+                    stream_weight,
+                    None,
+                    self.stride,
+                    _pair(0),
+                    self.dilation,
+                    self.groups,
+                )
             else:
-                C_in_per_group = stream_weights[0].shape[1]
-                B = stream_inputs[0].shape[0]
-                H_in, W_in = stream_inputs[0].shape[2], stream_inputs[0].shape[3]
+                stream_out_raw = F.conv2d(
+                    stream_input, stream_weight, None, self.stride, self.padding, self.dilation, self.groups
+                )
 
-                weight_shape = (N * C_out, C_in_per_group, *stream_weights[0].shape[2:])
-                if (
-                    self._grouped_weight_buffer is None
-                    or self._grouped_weight_buffer.shape != weight_shape
-                    or self._grouped_weight_buffer.device != stream_weights[0].device
-                    or self._grouped_weight_buffer.dtype != stream_weights[0].dtype
-                ):
-                    self._grouped_weight_buffer = torch.empty(
-                        weight_shape, device=stream_weights[0].device,
-                        dtype=stream_weights[0].dtype,
-                    )
-                for i, w in enumerate(stream_weights):
-                    self._grouped_weight_buffer[i * C_out:(i + 1) * C_out] = w
+            if stream_bias is not None:
+                stream_out = stream_out_raw + stream_bias.view(1, -1, 1, 1)
+            else:
+                stream_out = stream_out_raw
 
-                C_in = stream_inputs[0].shape[1]
-                input_shape = (B, N * C_in, H_in, W_in)
-                if (
-                    self._grouped_input_buffer is None
-                    or self._grouped_input_buffer.shape != input_shape
-                    or self._grouped_input_buffer.device != stream_inputs[0].device
-                    or self._grouped_input_buffer.dtype != stream_inputs[0].dtype
-                ):
-                    mem_fmt = torch.channels_last if stream_inputs[0].is_contiguous(memory_format=torch.channels_last) else torch.contiguous_format
-                    self._grouped_input_buffer = torch.empty(
-                        input_shape, device=stream_inputs[0].device,
-                        dtype=stream_inputs[0].dtype, memory_format=mem_fmt,
-                    )
-                for i, inp in enumerate(stream_inputs):
-                    self._grouped_input_buffer[:, i * C_in:(i + 1) * C_in] = inp
+            stream_blanked = blanked_mask.get(i) if blanked_mask else None
+            if stream_blanked is not None and stream_blanked.any():
+                mask = (~stream_blanked).float().view(-1, 1, 1, 1)
+                stream_out.mul_(mask)
+                stream_out_raw.mul_(mask)
 
-                grouped_weight = self._grouped_weight_buffer
-                grouped_input = self._grouped_input_buffer
-
-            # Single cuDNN grouped conv
-            grouped_raw = F.conv2d(
-                grouped_input, grouped_weight, None,
-                self.stride, self.padding, self.dilation,
-                self.groups * N,  # N groups for N streams
-            )
-
-            # Split output back into per-stream tensors
-            raw_splits = torch.split(grouped_raw, C_out, dim=1)
-
-            for i, (stream_out_raw, stream_bias) in enumerate(
-                zip(raw_splits, stream_biases)
-            ):
-                # Make writable (split returns views)
-                stream_out_raw = stream_out_raw.contiguous()
-
-                if stream_bias is not None:
-                    stream_out = stream_out_raw + stream_bias.view(1, -1, 1, 1)
-                else:
-                    stream_out = stream_out_raw
-
-                # Per-sample masking for modality dropout
-                stream_blanked = blanked_mask.get(i) if blanked_mask else None
-                if stream_blanked is not None and stream_blanked.any():
-                    mask = (~stream_blanked).float().view(-1, 1, 1, 1)
-                    stream_out = stream_out * mask
-                    stream_out_raw = stream_out_raw * mask
-
-                stream_outputs.append(stream_out)
-                stream_outputs_raw.append(stream_out_raw)
-        else:
-            # Sequential fallback (conv1 with heterogeneous channels, or non-zero padding)
-            for i, (stream_input, stream_weight, stream_bias) in enumerate(
-                zip(stream_inputs, stream_weights, stream_biases)
-            ):
-                if self.padding_mode != "zeros":
-                    stream_out_raw = F.conv2d(
-                        F.pad(
-                            stream_input, self._reversed_padding_repeated_twice, mode=self.padding_mode
-                        ),
-                        stream_weight,
-                        None,
-                        self.stride,
-                        _pair(0),
-                        self.dilation,
-                        self.groups,
-                    )
-                else:
-                    stream_out_raw = F.conv2d(
-                        stream_input, stream_weight, None, self.stride, self.padding, self.dilation, self.groups
-                    )
-
-                if stream_bias is not None:
-                    stream_out = stream_out_raw + stream_bias.view(1, -1, 1, 1)
-                else:
-                    stream_out = stream_out_raw
-
-                stream_blanked = blanked_mask.get(i) if blanked_mask else None
-                if stream_blanked is not None and stream_blanked.any():
-                    mask = (~stream_blanked).float().view(-1, 1, 1, 1)
-                    stream_out.mul_(mask)
-                    stream_out_raw.mul_(mask)
-
-                stream_outputs.append(stream_out)
-                stream_outputs_raw.append(stream_out_raw)
+            stream_outputs.append(stream_out)
+            stream_outputs_raw.append(stream_out_raw)
 
         # ===== Process integrated pathway (Soma Integration) =====
         # Apply Linear Integration on RAW conv outputs (dendritic signals without bias)

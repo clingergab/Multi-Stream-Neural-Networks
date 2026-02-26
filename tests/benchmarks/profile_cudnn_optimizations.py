@@ -1,23 +1,18 @@
 """
-Profile cuDNN optimizations for LINet3: channels_last + grouped conv.
+Profile channels_last optimization for LINet3.
 
-Benchmarks three configurations to isolate the effect of each optimization:
+Benchmarks two configurations to measure the effect of channels_last:
 1. BASELINE  — NCHW format, sequential per-stream conv (original)
 2. CL_ONLY   — channels_last format, sequential per-stream conv
-3. ALL_ON    — channels_last format + grouped cuDNN conv
 
 Generates Chrome trace files and wall-clock timing for each.
 Open traces in chrome://tracing or https://ui.perfetto.dev/ to compare.
 
 Usage:
-    python3 tests/benchmarks/profile_cudnn_optimizations.py [--mode all|baseline|cl_only|all_on] [--warmup 5] [--iters 3]
+    python3 tests/benchmarks/profile_cudnn_optimizations.py [--mode all|baseline|cl_only] [--warmup 5] [--iters 3]
 
     # Quick comparison (wall-clock only, no trace files):
     python3 tests/benchmarks/profile_cudnn_optimizations.py --mode all --iters 0 --timing-iters 30
-
-    # Only channels_last vs baseline:
-    python3 tests/benchmarks/profile_cudnn_optimizations.py --mode baseline --iters 0 --timing-iters 30
-    python3 tests/benchmarks/profile_cudnn_optimizations.py --mode cl_only --iters 0 --timing-iters 30
 """
 
 import argparse
@@ -48,18 +43,10 @@ STREAM_INPUT_CHANNELS = [3, 1, 1]  # RGB, Depth, Orth
 # Optimization toggle
 # ============================================================================
 
-def set_optimizations(grouped_conv: bool = True, channels_last: bool = True):
-    """Toggle individual optimizations for A/B profiling.
-
-    Args:
-        grouped_conv: If True, use grouped cuDNN conv for uniform-shape layers.
-                      If False, use sequential per-stream convolution.
-        channels_last: If True, convert inputs to NHWC memory format.
-                       If False, keep NCHW (original baseline).
-    """
+def set_channels_last(enabled: bool = True):
+    """Toggle channels_last optimization for A/B profiling."""
     import src.models.linear_integration.li_net3.conv as mod_conv
-    mod_conv.USE_OPTIMIZED_OPS = grouped_conv
-    mod_conv.USE_CHANNELS_LAST = channels_last
+    mod_conv.USE_CHANNELS_LAST = enabled
 
 
 # ============================================================================
@@ -177,22 +164,14 @@ def run_wall_clock(model, stream_batches, targets, warmup: int, iters: int):
 # Main
 # ============================================================================
 
-def _clear_grouped_conv_buffers(model):
-    """Clear any cached grouped conv buffers."""
-    for module in model.modules():
-        for attr in ("_grouped_weight_buffer", "_grouped_input_buffer"):
-            if hasattr(module, attr):
-                setattr(module, attr, None)
-
-
 def _run_config(name, label, model, state_dict, targets, output_dir, drive_output_dir, args,
-                grouped_conv, channels_last):
+                channels_last):
     """Run profiling + wall-clock for a single configuration."""
     print(f"\n{'='*70}")
     print(label)
     print(f"{'='*70}")
 
-    set_optimizations(grouped_conv=grouped_conv, channels_last=channels_last)
+    set_channels_last(enabled=channels_last)
 
     # Recreate model with correct memory format
     if channels_last:
@@ -200,7 +179,6 @@ def _run_config(name, label, model, state_dict, targets, output_dir, drive_outpu
     else:
         model = model.to(memory_format=torch.contiguous_format)
     model.load_state_dict(state_dict)
-    _clear_grouped_conv_buffers(model)
 
     # Create inputs matching the memory format
     stream_batches, _ = create_inputs(channels_last=channels_last)
@@ -220,18 +198,17 @@ def _run_config(name, label, model, state_dict, targets, output_dir, drive_outpu
     return {"mean_ms": mean_ms, "min_ms": min_ms, "max_ms": max_ms}
 
 
-# Named configurations: (grouped_conv, channels_last, label)
+# Named configurations: (channels_last, label)
 CONFIGS = {
-    "baseline": (False, False, "BASELINE (NCHW, sequential per-stream conv — original)"),
-    "cl_only":  (False, True,  "CHANNELS_LAST ONLY (NHWC, sequential per-stream conv)"),
-    "all_on":   (True,  True,  "ALL ON (NHWC + grouped cuDNN conv + BN-ReLU fusion)"),
+    "baseline": (False, "BASELINE (NCHW, sequential per-stream conv — original)"),
+    "cl_only":  (True,  "CHANNELS_LAST (NHWC, sequential per-stream conv)"),
 }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Profile cuDNN optimizations for LINet3")
-    parser.add_argument("--mode", choices=["all", "baseline", "cl_only", "all_on"], default="all",
-                        help="Which config(s) to profile (default: all three)")
+    parser = argparse.ArgumentParser(description="Profile channels_last optimization for LINet3")
+    parser.add_argument("--mode", choices=["all", "baseline", "cl_only"], default="all",
+                        help="Which config(s) to profile (default: both)")
     parser.add_argument("--warmup", type=int, default=5,
                         help="Warmup iterations before profiling")
     parser.add_argument("--iters", type=int, default=3,
@@ -265,24 +242,24 @@ def main():
 
     # Create model and save initial state for fair comparison across configs.
     print("\nCreating shared model...")
-    set_optimizations(grouped_conv=True, channels_last=True)
+    set_channels_last(enabled=True)
     model = create_model(channels_last=True)
     state_dict = {k: v.clone() for k, v in model.state_dict().items()}
     _, targets = create_inputs(channels_last=True)
 
     # Select configs to run
     if args.mode == "all":
-        configs_to_run = ["baseline", "cl_only", "all_on"]
+        configs_to_run = ["baseline", "cl_only"]
     else:
         configs_to_run = [args.mode]
 
     results = {}
     for config_name in configs_to_run:
-        grouped_conv, channels_last, label = CONFIGS[config_name]
+        channels_last, label = CONFIGS[config_name]
         results[config_name] = _run_config(
             config_name, label, model, state_dict, targets,
             output_dir, drive_output_dir, args,
-            grouped_conv=grouped_conv, channels_last=channels_last,
+            channels_last=channels_last,
         )
 
     del model
@@ -295,7 +272,7 @@ def main():
         print(f"{'='*70}")
 
         for name, r in results.items():
-            _, _, label = CONFIGS[name]
+            _, label = CONFIGS[name]
             print(f"  {name:12s}: {r['mean_ms']:7.1f} ms  — {label}")
 
         if "baseline" in results:
