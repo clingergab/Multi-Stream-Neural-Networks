@@ -115,6 +115,11 @@ class LINet(BaseModel):
             use_amp=use_amp
         )
 
+        # Convert model weights to channels_last for better cuDNN performance.
+        # This avoids internal weight reformat on every conv call.
+        if _conv_module.USE_CHANNELS_LAST:
+            self.to(memory_format=torch.channels_last)
+
         # Apply torch.compile for speedup (PyTorch 2.0+)
         # Use 'default' mode for training (maintains FP32 precision)
         torch.compile(self, mode='default')
