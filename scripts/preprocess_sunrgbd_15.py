@@ -16,27 +16,34 @@ data/sunrgbd_15/
       00000.png
       00001.png
       ...
+    rgb_tensors.pt    # [N, 3, 416, 544] uint8 pre-resized
+    depth_tensors.pt  # [N, 1, 416, 544] uint8 pre-resized
     labels.txt  # One label per line (0-14)
   val/
     rgb/
     depth/
+    rgb_tensors.pt
+    depth_tensors.pt
     labels.txt
   test/
     rgb/
     depth/
+    rgb_tensors.pt
+    depth_tensors.pt
     labels.txt
 
 Also creates metadata files with class names and statistics.
 """
 
 import os
-import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
 import scipy.io as sio
+import torch
 from PIL import Image
+from torchvision import transforms
 from tqdm import tqdm
 
 from scripts.sunrgbd_15_category_mapping import map_raw_scene_to_15, SUNRGBD_15_CATEGORIES, get_class_idx
@@ -51,6 +58,98 @@ TRAIN_SPLIT_FILE = os.path.join(TOOLBOX_PATH, "traintestSUNRGBD/allsplit.mat")
 
 # Prefix used in allsplit.mat paths (maps to local SUNRGBD_BASE)
 MAT_PATH_PREFIX = "/n/fs/sun3d/data/SUNRGBD/"
+
+# Target resolution for pre-resized tensor files
+TARGET_SIZE = (416, 544)
+
+
+def _create_tensor_files(split_name, num_samples):
+    """
+    Create pre-resized uint8 tensor files from the PNG images already saved by _process_split.
+
+    Reads PNGs from data/sunrgbd_15/{split}/rgb/ and depth/, resizes to TARGET_SIZE,
+    and saves as uint8 tensors:
+      - rgb_tensors.pt:   [N, 3, H, W] uint8
+      - depth_tensors.pt: [N, 1, H, W] uint8
+
+    Depth images (16-bit) are scaled to 0-255 uint8 range via: uint8 = (raw / 65535 * 255).
+
+    At load time, the dataset converts back to float32 via: float = tensor / 255.0
+    This introduces negligible quantization error (~0.2% for 8-bit) while reducing
+    file sizes by ~2x vs float32 and eliminating PNG decode + resize from __getitem__.
+    """
+    split_dir = os.path.join(OUTPUT_BASE, split_name)
+    rgb_dir = os.path.join(split_dir, 'rgb')
+    depth_dir = os.path.join(split_dir, 'depth')
+
+    print(f"\nCreating tensor files for {split_name} ({num_samples} samples, {TARGET_SIZE})...")
+
+    # Pre-allocate tensors
+    H, W = TARGET_SIZE
+    rgb_tensors = torch.empty(num_samples, 3, H, W, dtype=torch.uint8)
+    depth_tensors = torch.empty(num_samples, 1, H, W, dtype=torch.uint8)
+
+    for idx in tqdm(range(num_samples)):
+        # RGB: load PNG, resize, convert to [3, H, W] uint8
+        rgb_path = os.path.join(rgb_dir, f'{idx:05d}.png')
+        rgb = Image.open(rgb_path).convert('RGB')
+        rgb = transforms.functional.resize(rgb, TARGET_SIZE)
+        # to_tensor converts PIL [0,255] uint8 -> [0,1] float; we want uint8 directly
+        rgb_arr = np.array(rgb, dtype=np.uint8)  # [H, W, 3]
+        rgb_tensors[idx] = torch.from_numpy(rgb_arr).permute(2, 0, 1)  # [3, H, W]
+
+        # Depth: load 16-bit PNG, scale to 0-255 uint8, resize
+        depth_path = os.path.join(depth_dir, f'{idx:05d}.png')
+        depth = Image.open(depth_path)
+
+        if depth.mode in ('I', 'I;16', 'I;16B'):
+            # 16-bit depth: scale to [0, 255] uint8
+            depth_arr = np.array(depth, dtype=np.float32)
+            depth_arr = np.clip(depth_arr / 65535.0 * 255.0, 0, 255).astype(np.uint8)
+            depth = Image.fromarray(depth_arr, mode='L')
+        else:
+            depth = depth.convert('L')
+
+        depth = transforms.functional.resize(depth, TARGET_SIZE)
+        depth_arr = np.array(depth, dtype=np.uint8)  # [H, W]
+        depth_tensors[idx] = torch.from_numpy(depth_arr).unsqueeze(0)  # [1, H, W]
+
+    # Orth: generate if orth PNGs exist (from preprocess_orthogonal_clean.py)
+    orth_dir = os.path.join(split_dir, 'orth')
+    has_orth = os.path.exists(orth_dir) and len(os.listdir(orth_dir)) >= num_samples
+
+    if has_orth:
+        orth_tensors = torch.empty(num_samples, 1, H, W, dtype=torch.uint8)
+        print(f"  Orth directory found, creating orth_tensors.pt...")
+        for idx in tqdm(range(num_samples), desc="  orth"):
+            orth_path = os.path.join(orth_dir, f'{idx:05d}.png')
+            orth = Image.open(orth_path)
+            if orth.mode in ('I', 'I;16', 'I;16B'):
+                orth_arr = np.array(orth, dtype=np.float32)
+                orth_arr = np.clip(orth_arr / 65535.0 * 255.0, 0, 255).astype(np.uint8)
+                orth = Image.fromarray(orth_arr, mode='L')
+            else:
+                orth = orth.convert('L')
+            orth = transforms.functional.resize(orth, TARGET_SIZE)
+            orth_arr = np.array(orth, dtype=np.uint8)
+            orth_tensors[idx] = torch.from_numpy(orth_arr).unsqueeze(0)
+
+    # Save tensor files
+    rgb_path = os.path.join(split_dir, 'rgb_tensors.pt')
+    depth_path = os.path.join(split_dir, 'depth_tensors.pt')
+    torch.save(rgb_tensors, rgb_path)
+    torch.save(depth_tensors, depth_path)
+
+    rgb_mb = os.path.getsize(rgb_path) / (1024 * 1024)
+    depth_mb = os.path.getsize(depth_path) / (1024 * 1024)
+    print(f"  rgb_tensors.pt:   {rgb_tensors.shape} → {rgb_mb:.1f} MB")
+    print(f"  depth_tensors.pt: {depth_tensors.shape} → {depth_mb:.1f} MB")
+
+    if has_orth:
+        orth_out_path = os.path.join(split_dir, 'orth_tensors.pt')
+        torch.save(orth_tensors, orth_out_path)
+        orth_mb = os.path.getsize(orth_out_path) / (1024 * 1024)
+        print(f"  orth_tensors.pt:  {orth_tensors.shape} → {orth_mb:.1f} MB")
 
 
 def load_official_split():
@@ -276,10 +375,13 @@ def create_preprocessed_dataset(samples, train_paths, test_paths, val_ratio=0.2,
     print(f"  Test:  {len(test_samples)} (official test set)")
     print(f"  Total: {len(train_samples) + len(val_samples) + len(test_samples)}")
 
-    # Process all three splits
+    # Process all three splits (save PNGs + create pre-resized tensor files)
     train_labels = _process_split('train', train_samples)
+    _create_tensor_files('train', len(train_samples))
     val_labels = _process_split('val', val_samples)
+    _create_tensor_files('val', len(val_samples))
     test_labels = _process_split('test', test_samples)
+    _create_tensor_files('test', len(test_samples))
 
     # Write class names
     with open(os.path.join(OUTPUT_BASE, 'class_names.txt'), 'w') as f:

@@ -138,15 +138,24 @@ class SUNRGBDDataset(Dataset):
 
         self.num_samples = len(self.labels)
 
-        # RGB and depth directories
-        self.rgb_dir = os.path.join(self.split_dir, 'rgb')
-        self.depth_dir = os.path.join(self.split_dir, 'depth')
-
-        # Verify directories exist
-        assert os.path.exists(self.rgb_dir), f"RGB directory not found: {self.rgb_dir}"
-        assert os.path.exists(self.depth_dir), f"Depth directory not found: {self.depth_dir}"
-
-        print(f"Loaded SUN RGB-D {split} set: {self.num_samples} samples, 15 classes")
+        # Try to load pre-resized tensor files (fast path)
+        rgb_tensor_path = os.path.join(self.split_dir, 'rgb_tensors.pt')
+        depth_tensor_path = os.path.join(self.split_dir, 'depth_tensors.pt')
+        if os.path.exists(rgb_tensor_path) and os.path.exists(depth_tensor_path):
+            self.rgb_tensors = torch.load(rgb_tensor_path, weights_only=True)
+            self.depth_tensors = torch.load(depth_tensor_path, weights_only=True)
+            self.use_tensors = True
+            print(f"Loaded SUN RGB-D {split} set: {self.num_samples} samples, 15 classes (pre-resized tensors)")
+        else:
+            self.rgb_tensors = None
+            self.depth_tensors = None
+            self.use_tensors = False
+            # RGB and depth directories (fallback PNG path)
+            self.rgb_dir = os.path.join(self.split_dir, 'rgb')
+            self.depth_dir = os.path.join(self.split_dir, 'depth')
+            assert os.path.exists(self.rgb_dir), f"RGB directory not found: {self.rgb_dir}"
+            assert os.path.exists(self.depth_dir), f"Depth directory not found: {self.depth_dir}"
+            print(f"Loaded SUN RGB-D {split} set: {self.num_samples} samples, 15 classes (PNG fallback)")
 
         # Log augmentation config if scaling is applied
         if split == 'train' and any(p != 1.0 for p in [rgb_aug_prob, rgb_aug_mag, depth_aug_prob, depth_aug_mag]):
@@ -219,6 +228,42 @@ class SUNRGBDDataset(Dataset):
         print(f"    [Depth] Noise std: {BASE_DEPTH_NOISE_STD:.3f} -> {self._depth_noise_std:.3f}")
         print(f"    [Depth] Erasing prob: {BASE_DEPTH_ERASING_P:.2f} -> {self._depth_erasing_p:.3f}")
 
+    def _load_images_tensor(self, idx):
+        """Load pre-resized uint8 images from tensor files and convert to PIL."""
+        # RGB: [3, H, W] uint8 → PIL RGB
+        rgb_uint8 = self.rgb_tensors[idx]  # [3, H, W] uint8
+        rgb = Image.fromarray(rgb_uint8.permute(1, 2, 0).numpy(), mode='RGB')
+
+        # Depth: [1, H, W] uint8 → PIL mode F (float32 in [0, 1])
+        depth_uint8 = self.depth_tensors[idx, 0]  # [H, W] uint8
+        depth_arr = depth_uint8.numpy().astype(np.float32) / 255.0
+        depth = Image.fromarray(depth_arr, mode='F')
+
+        return rgb, depth
+
+    def _load_images_png(self, idx):
+        """Load images from PNG files (fallback path)."""
+        # RGB
+        rgb_path = os.path.join(self.rgb_dir, f'{idx:05d}.png')
+        rgb = Image.open(rgb_path).convert('RGB')
+
+        # Depth
+        depth_path = os.path.join(self.depth_dir, f'{idx:05d}.png')
+        depth = Image.open(depth_path)
+
+        # Convert Depth to Mode F (Float32) with global normalization
+        if depth.mode in ('I', 'I;16', 'I;16B'):
+            depth_arr = np.array(depth, dtype=np.float32)
+            depth_arr = np.clip(depth_arr / 65535.0, 0.0, 1.0)
+            depth = Image.fromarray(depth_arr, mode='F')
+        else:
+            depth = depth.convert('F')
+            if np.array(depth).max() > 1.0:
+                depth_arr = np.array(depth)
+                depth = Image.fromarray(depth_arr / 255.0, mode='F')
+
+        return rgb, depth
+
     def __getitem__(self, idx):
         """
         Returns:
@@ -226,30 +271,13 @@ class SUNRGBDDataset(Dataset):
             depth: Depth image tensor [1, H, W]
             label: Class label (0-14)
         """
-        # Load RGB image
-        rgb_path = os.path.join(self.rgb_dir, f'{idx:05d}.png')
-        rgb = Image.open(rgb_path).convert('RGB')
-
-        # Load depth image
-        depth_path = os.path.join(self.depth_dir, f'{idx:05d}.png')
-        depth = Image.open(depth_path)
-
-        # Convert Depth to Mode F (Float32) with global normalization
-        # Use global normalization to maintain semantic consistency across images
-        # (same depth value should normalize to same output value regardless of image content)
-        if depth.mode in ('I', 'I;16', 'I;16B'):
-            depth_arr = np.array(depth, dtype=np.float32)
-            # Global normalization: divide by max possible depth value (16-bit)
-            # Using 65535.0 to cover full range and avoid clipping (max observed: 65528)
-            depth_arr = np.clip(depth_arr / 65535.0, 0.0, 1.0)
-            depth = Image.fromarray(depth_arr, mode='F')
+        # Load images (tensor fast path or PNG fallback)
+        if self.use_tensors:
+            rgb, depth = self._load_images_tensor(idx)
+            images_already_resized = True
         else:
-            # Fallback for other modes
-            depth = depth.convert('F')
-            # If it was 0-255, scale to 0-1
-            if np.array(depth).max() > 1.0:
-                depth_arr = np.array(depth)
-                depth = Image.fromarray(depth_arr / 255.0, mode='F')
+            rgb, depth = self._load_images_png(idx)
+            images_already_resized = False
 
         # ==================== TRAINING AUGMENTATION ====================
         if self.split == 'train':
@@ -270,8 +298,7 @@ class SUNRGBDDataset(Dataset):
                 )
                 rgb = transforms.functional.resized_crop(rgb, i, j, h, w, self.target_size)
                 depth = transforms.functional.resized_crop(depth, i, j, h, w, self.target_size)
-            else:
-                # No crop - preserve full scene context
+            elif not images_already_resized:
                 rgb = transforms.functional.resize(rgb, self.target_size)
                 depth = transforms.functional.resize(depth, self.target_size)
 
@@ -329,8 +356,8 @@ class SUNRGBDDataset(Dataset):
                 depth_array = np.clip(depth_array, 0.0, 1.0).astype(np.float32)
                 depth = Image.fromarray(depth_array, mode='F')
 
-        else:
-            # Validation: just resize (no augmentation)
+        elif not images_already_resized:
+            # Validation: just resize (no augmentation) — only needed for PNG path
             rgb = transforms.functional.resize(rgb, self.target_size)
             depth = transforms.functional.resize(depth, self.target_size)
 
