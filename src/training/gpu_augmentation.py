@@ -89,11 +89,11 @@ class GPUAugmentation(nn.Module):
         >>> gpu_aug = GPUAugmentation(rgb_aug_prob=1.5, rgb_aug_mag=1.2).to('cuda')
     """
 
-    # SUN RGB-D training set statistics (official split, 4613 samples)
-    DEFAULT_RGB_MEAN = [0.4974685511366709, 0.4657685752251157, 0.4418713446646282]
-    DEFAULT_RGB_STD = [0.2772972605813588, 0.2859611184863525, 0.2896814863955933]
-    DEFAULT_DEPTH_MEAN = [0.2911]
-    DEFAULT_DEPTH_STD = [0.1514]
+    # SUN RGB-D training set statistics (official split 80:20, 4101 samples)
+    DEFAULT_RGB_MEAN = [0.49829878533942046, 0.4667760665084003, 0.44289694564460663]
+    DEFAULT_RGB_STD = [0.27731416732781294, 0.28601699847044426, 0.2899506179157605]
+    DEFAULT_DEPTH_MEAN = [0.2908]
+    DEFAULT_DEPTH_STD = [0.1504]
 
     def __init__(
         self,

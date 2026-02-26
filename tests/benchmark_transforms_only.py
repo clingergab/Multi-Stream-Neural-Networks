@@ -96,11 +96,11 @@ def apply_full_augmentation(rgb, depth, target_size=(416, 544)):
     # 7. Normalization
     rgb = transforms.functional.normalize(
         rgb,
-        mean=[0.4974685511366709, 0.4657685752251157, 0.4418713446646282],
-        std=[0.2772972605813588, 0.2859611184863525, 0.2896814863955933]
+        mean=[0.49829878533942046, 0.4667760665084003, 0.44289694564460663],
+        std=[0.27731416732781294, 0.28601699847044426, 0.2899506179157605]
     )
     depth = transforms.functional.normalize(
-        depth, mean=[0.2911], std=[0.1514]
+        depth, mean=[0.2908], std=[0.1504]
     )
 
     # 8. Random Erasing RGB (17%)

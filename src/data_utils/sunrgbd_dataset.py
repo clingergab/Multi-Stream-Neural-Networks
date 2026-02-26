@@ -346,16 +346,16 @@ class SUNRGBDDataset(Dataset):
         # When normalize=False (GPU augmentation mode), skip normalization here.
         # GPU augmentation will handle normalization after applying augmentations.
         if self.normalize:
-            # RGB: Use exact computed training statistics (official split)
+            # RGB: Use exact computed training statistics (official split, 80:20)
             rgb = transforms.functional.normalize(
                 rgb,
-                mean=[0.4974685511366709, 0.4657685752251157, 0.4418713446646282],
-                std=[0.2772972605813588, 0.2859611184863525, 0.2896814863955933]
+                mean=[0.49829878533942046, 0.4667760665084003, 0.44289694564460663],
+                std=[0.27731416732781294, 0.28601699847044426, 0.2899506179157605]
             )
 
-            # Depth: Use exact computed training statistics (official split)
+            # Depth: Use exact computed training statistics (official split, 80:20)
             depth = transforms.functional.normalize(
-                depth, mean=[0.2911], std=[0.1514]
+                depth, mean=[0.2908], std=[0.1504]
             )
 
             # 7. Post-normalization Random Erasing (CPU mode only)

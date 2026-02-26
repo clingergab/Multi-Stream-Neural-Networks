@@ -2,7 +2,7 @@
 Preprocess SUN RGB-D dataset into 15 categories with official train/test split.
 
 Uses the official SUN RGB-D train/test split from SUNRGBDtoolbox/allsplit.mat,
-then sub-splits the official training set into train (90%) and val (10%) for
+then sub-splits the official training set into train (80%) and val (20%) for
 model selection / early stopping. The official test set is preserved as-is.
 
 Creates a new directory structure:
@@ -206,7 +206,7 @@ def _process_split(split_name, split_samples):
     return labels
 
 
-def create_preprocessed_dataset(samples, train_paths, test_paths, val_ratio=0.1, seed=42):
+def create_preprocessed_dataset(samples, train_paths, test_paths, val_ratio=0.2, seed=42):
     """
     Create preprocessed dataset with official 3-way split (train/val/test).
 
@@ -249,7 +249,7 @@ def create_preprocessed_dataset(samples, train_paths, test_paths, val_ratio=0.1,
     print(f"  Train: {len(official_train_samples)} matched ({unmatched_train} filtered by 15-cat mapping)")
     print(f"  Test:  {len(official_test_samples)} matched ({unmatched_test} filtered by 15-cat mapping)")
 
-    # Sub-split official train into train (90%) and val (10%) — stratified by class
+    # Sub-split official train into train (80%) and val (20%) — stratified by class
     class_groups = defaultdict(list)
     for idx, sample in enumerate(official_train_samples):
         class_idx = sample[3]
@@ -271,8 +271,8 @@ def create_preprocessed_dataset(samples, train_paths, test_paths, val_ratio=0.1,
     test_samples = official_test_samples
 
     print(f"\n3-way split:")
-    print(f"  Train: {len(train_samples)} (90% of official train)")
-    print(f"  Val:   {len(val_samples)} (10% of official train)")
+    print(f"  Train: {len(train_samples)} (80% of official train)")
+    print(f"  Val:   {len(val_samples)} (20% of official train)")
     print(f"  Test:  {len(test_samples)} (official test set)")
     print(f"  Total: {len(train_samples) + len(val_samples) + len(test_samples)}")
 
