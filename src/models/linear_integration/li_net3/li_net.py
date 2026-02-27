@@ -335,10 +335,19 @@ class LINet(BaseModel):
         """
         Validate that GPU augmentation setting matches dataset normalize setting.
 
-        Warns if there's a mismatch that could cause:
+        Raises ValueError if there's a mismatch that would cause:
         - Double normalization (normalize=True + gpu_augmentation=True)
         - Missing normalization (normalize=False + gpu_augmentation=False)
+        - GPU augmentation enabled but module not initialized
         """
+        # Fail-fast: gpu_augmentation=True but gpu_aug module is None
+        if self.gpu_augmentation and self.gpu_aug is None:
+            raise RuntimeError(
+                "gpu_augmentation=True but GPU augmentation module is not initialized. "
+                "This means normalization will be silently skipped. "
+                "Call compile(gpu_augmentation=True) to initialize the module."
+            )
+
         # Try to get normalize attribute from dataset
         dataset = train_loader.dataset
 
@@ -354,19 +363,17 @@ class LINet(BaseModel):
 
         # Check for mismatched configurations
         if self.gpu_augmentation and dataset_normalize:
-            if verbose:
-                print(
-                    "⚠️  Warning: GPU augmentation is enabled but dataset has normalize=True.\n"
-                    "   This will cause DOUBLE NORMALIZATION (CPU + GPU).\n"
-                    "   Fix: Use normalize=False when creating dataset for GPU augmentation."
-                )
+            raise ValueError(
+                "GPU augmentation is enabled but dataset has normalize=True. "
+                "This will cause DOUBLE NORMALIZATION (CPU + GPU). "
+                "Fix: Use normalize=False when creating dataset for GPU augmentation."
+            )
         elif not self.gpu_augmentation and not dataset_normalize:
-            if verbose:
-                print(
-                    "⚠️  Warning: GPU augmentation is disabled but dataset has normalize=False.\n"
-                    "   Data will NOT be normalized, which may cause poor training.\n"
-                    "   Fix: Either enable gpu_augmentation=True in compile(), or use normalize=True in dataset."
-                )
+            raise ValueError(
+                "GPU augmentation is disabled but dataset has normalize=False. "
+                "Data will NOT be normalized, which will cause broken training. "
+                "Fix: Either enable gpu_augmentation=True in compile(), or use normalize=True in dataset."
+            )
 
     # ==================== Early Stopping Helper Methods ====================
 

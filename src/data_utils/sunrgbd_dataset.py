@@ -12,7 +12,8 @@ import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
-from torchvision import transforms
+from torchvision.transforms import v2
+from torchvision.transforms.v2 import functional as F2
 
 from src.training.augmentation_config import (
     # Probability baselines
@@ -213,6 +214,25 @@ class SUNRGBDDataset(Dataset):
         self._depth_erasing_scale_min = BASE_ERASING_SCALE_MIN
         self._depth_erasing_scale_max = min(BASE_ERASING_SCALE_MAX * self.depth_aug_mag, MAX_ERASING_SCALE)
 
+        # === PRE-CREATE REUSABLE TRANSFORM INSTANCES ===
+        # Avoids constructing new instances per __getitem__ call
+        self._color_jitter_transform = v2.ColorJitter(
+            brightness=self._brightness,
+            contrast=self._contrast,
+            saturation=self._saturation,
+            hue=self._hue,
+        )
+        self._rgb_erasing_transform = v2.RandomErasing(
+            p=1.0,  # probability handled externally
+            scale=(self._rgb_erasing_scale_min, self._rgb_erasing_scale_max),
+            ratio=(BASE_ERASING_RATIO_MIN, BASE_ERASING_RATIO_MAX),
+        )
+        self._depth_erasing_transform = v2.RandomErasing(
+            p=1.0,  # probability handled externally
+            scale=(self._depth_erasing_scale_min, self._depth_erasing_scale_max),
+            ratio=(BASE_ERASING_RATIO_MIN, BASE_ERASING_RATIO_MAX),
+        )
+
     def _log_augmentation_config(self):
         """Log computed augmentation values when scaling is applied."""
         print(f"\nAugmentation scaling applied:")
@@ -233,49 +253,48 @@ class SUNRGBDDataset(Dataset):
         print(f"    [Depth] Erasing prob: {BASE_DEPTH_ERASING_P:.2f} -> {self._depth_erasing_p:.3f}")
 
     def _load_images_tensor(self, idx):
-        """Load pre-resized uint8 images from tensor files and convert to PIL."""
-        # RGB: [3, H, W] uint8 → [H, W, 3] numpy → PIL RGB
-        # Use numpy transpose instead of torch permute to avoid torch overhead on mmap'd tensors
-        rgb_arr = self.rgb_tensors[idx].numpy().transpose(1, 2, 0)
-        rgb = Image.fromarray(np.ascontiguousarray(rgb_arr), mode='RGB')
-
-        # Depth: [1, H, W] uint8 → [H, W] float32 in [0, 1] → PIL mode F
-        depth_arr = self.depth_tensors[idx, 0].numpy()
-        depth = Image.fromarray(depth_arr.astype(np.float32) / 255.0, mode='F')
-
+        """Load pre-resized uint8 images from tensor files as tensors (no PIL)."""
+        rgb = self.rgb_tensors[idx]      # [3, H, W] uint8
+        depth = self.depth_tensors[idx]  # [1, H, W] uint8
         return rgb, depth
 
     def _load_images_png(self, idx):
-        """Load images from PNG files (fallback path)."""
-        # RGB
+        """Load images from PNG files (fallback path), return as tensors."""
+        # RGB: load PIL, convert to uint8 tensor immediately
         rgb_path = os.path.join(self.rgb_dir, f'{idx:05d}.png')
-        rgb = Image.open(rgb_path).convert('RGB')
+        rgb_pil = Image.open(rgb_path).convert('RGB')
+        rgb = F2.pil_to_tensor(rgb_pil)  # [3, H, W] uint8
 
-        # Depth
+        # Depth: handle various PIL modes, normalize to [0,1], then quantize to uint8
         depth_path = os.path.join(self.depth_dir, f'{idx:05d}.png')
-        depth = Image.open(depth_path)
+        depth_pil = Image.open(depth_path)
 
-        # Convert Depth to Mode F (Float32) with global normalization
-        if depth.mode in ('I', 'I;16', 'I;16B'):
-            depth_arr = np.array(depth, dtype=np.float32)
+        if depth_pil.mode in ('I', 'I;16', 'I;16B'):
+            depth_arr = np.array(depth_pil, dtype=np.float32)
             depth_arr = np.clip(depth_arr / 65535.0, 0.0, 1.0)
-            depth = Image.fromarray(depth_arr, mode='F')
         else:
-            depth = depth.convert('F')
-            if np.array(depth).max() > 1.0:
-                depth_arr = np.array(depth)
-                depth = Image.fromarray(depth_arr / 255.0, mode='F')
+            depth_arr = np.array(depth_pil.convert('L'), dtype=np.float32)
+            if depth_arr.max() > 1.0:
+                depth_arr = depth_arr / 255.0
+
+        # Convert to uint8 tensor to match tensor fast path format.
+        # Note: for mode 'L' with values 0-255, this divides by 255 then multiplies
+        # by 255 (a no-op with rounding). Intentional — normalizes all depth formats
+        # to the same uint8 output regardless of input mode.
+        depth = torch.from_numpy(
+            (depth_arr * 255).clip(0, 255).astype(np.uint8)
+        ).unsqueeze(0)  # [1, H, W] uint8
 
         return rgb, depth
 
     def __getitem__(self, idx):
         """
         Returns:
-            rgb: RGB image tensor [3, H, W]
-            depth: Depth image tensor [1, H, W]
+            rgb: RGB image tensor [3, H, W] float32
+            depth: Depth image tensor [1, H, W] float32
             label: Class label (0-14)
         """
-        # Load images (tensor fast path or PNG fallback)
+        # Load images as uint8 tensors (no PIL conversion)
         if self.use_tensors:
             rgb, depth = self._load_images_tensor(idx)
             images_already_resized = True
@@ -283,137 +302,105 @@ class SUNRGBDDataset(Dataset):
             rgb, depth = self._load_images_png(idx)
             images_already_resized = False
 
+        # At this point: rgb [3, H, W] uint8, depth [1, H, W] uint8
+
         # ==================== TRAINING AUGMENTATION ====================
         if self.split == 'train':
             # 1. Synchronized Random Horizontal Flip
-            # Uses pre-computed _flip_p (scaled by sync_prob)
             if np.random.random() < self._flip_p:
-                rgb = rgb.transpose(Image.FLIP_LEFT_RIGHT)
-                depth = depth.transpose(Image.FLIP_LEFT_RIGHT)
+                rgb = F2.horizontal_flip(rgb)
+                depth = F2.horizontal_flip(depth)
 
             # 2. Synchronized Random Resized Crop
-            # Uses pre-computed _crop_p and _crop_scale_min (scaled by sync_prob/sync_mag)
-            # Scene classification needs context, so crop is probabilistic
             if np.random.random() < self._crop_p:
-                i, j, h, w = transforms.RandomResizedCrop.get_params(
+                i, j, h, w = v2.RandomResizedCrop.get_params(
                     rgb,
                     scale=(self._crop_scale_min, self._crop_scale_max),
-                    ratio=(self._crop_ratio_min, self._crop_ratio_max)
+                    ratio=(self._crop_ratio_min, self._crop_ratio_max),
                 )
-                rgb = transforms.functional.resized_crop(rgb, i, j, h, w, self.target_size)
-                depth = transforms.functional.resized_crop(depth, i, j, h, w, self.target_size)
+                rgb = F2.resized_crop(rgb, i, j, h, w, self.target_size)
+                depth = F2.resized_crop(depth, i, j, h, w, self.target_size)
             elif not images_already_resized:
-                rgb = transforms.functional.resize(rgb, self.target_size)
-                depth = transforms.functional.resize(depth, self.target_size)
+                rgb = F2.resize(rgb, self.target_size)
+                depth = F2.resize(depth, self.target_size)
 
-            # 3-5. RGB-Only Appearance Augmentation (ColorJitter, Blur, Grayscale)
-            # Skip these when normalize=False (GPU augmentation mode) because
-            # GPUAugmentation will apply them on GPU after transfer.
+            # 3-5. RGB-Only Appearance Augmentation
+            # Skip when normalize=False (GPU augmentation mode handles these)
             if self.normalize:
-                # 3. RGB-Only: Color Jitter
-                # Uses pre-computed _color_jitter_p and magnitude values (scaled by rgb_aug_prob/mag)
+                # 3. Color Jitter (pre-created instance, operates on uint8)
                 if np.random.random() < self._color_jitter_p:
-                    color_jitter = transforms.ColorJitter(
-                        brightness=self._brightness,
-                        contrast=self._contrast,
-                        saturation=self._saturation,
-                        hue=self._hue
-                    )
-                    rgb = color_jitter(rgb)
+                    rgb = self._color_jitter_transform(rgb)
 
-                # 4. RGB-Only: Gaussian Blur
-                # Uses pre-computed _blur_p and _blur_sigma_max (scaled by rgb_aug_prob/mag)
+                # 4. Gaussian Blur
                 if np.random.random() < self._blur_p:
                     kernel_size = int(np.random.choice([3, 5, 7]))
                     sigma = float(np.random.uniform(self._blur_sigma_min, self._blur_sigma_max))
-                    rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
+                    rgb = F2.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
 
-                # 5. RGB-Only: Occasional Grayscale
-                # Uses pre-computed _grayscale_p (scaled by rgb_aug_prob)
+                # 5. Grayscale
                 if np.random.random() < self._grayscale_p:
-                    rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
+                    rgb = F2.rgb_to_grayscale(rgb, num_output_channels=3)
 
-            # 6. Depth-Only: Combined Appearance Augmentation
-            # Uses pre-computed _depth_aug_p and magnitude values (scaled by depth_aug_prob/mag)
+            # 6. Depth-Only: Combined Appearance Augmentation (torch ops, no numpy/PIL)
             if np.random.random() < self._depth_aug_p:
-                depth_array = np.array(depth, dtype=np.float32)
+                depth = depth.float() / 255.0  # uint8 → float32 [0, 1]
 
-                # Apply brightness and contrast using pre-computed scaled magnitudes
                 brightness_factor = np.random.uniform(
                     1.0 - self._depth_brightness,
-                    1.0 + self._depth_brightness
+                    1.0 + self._depth_brightness,
                 )
                 contrast_factor = np.random.uniform(
                     1.0 - self._depth_contrast,
-                    1.0 + self._depth_contrast
+                    1.0 + self._depth_contrast,
                 )
 
                 # Apply contrast then brightness (same order as ColorJitter)
-                # Note: depth_array is in [0, 1] range, so use 0.5 as midpoint
-                depth_array = (depth_array - 0.5) * contrast_factor + 0.5
-                depth_array = depth_array * brightness_factor
+                depth = (depth - 0.5) * contrast_factor + 0.5
+                depth = depth * brightness_factor
 
-                # Add Gaussian noise using pre-computed scaled std
-                noise = np.random.normal(0, self._depth_noise_std, depth_array.shape).astype(np.float32)
-                depth_array = depth_array + noise
+                # Add Gaussian noise
+                depth = depth + torch.randn_like(depth) * self._depth_noise_std
 
-                depth_array = np.clip(depth_array, 0.0, 1.0).astype(np.float32)
-                depth = Image.fromarray(depth_array, mode='F')
+                depth = depth.clamp(0.0, 1.0)
+                # depth is now float32 [0, 1] — skips later uint8→float conversion
 
         elif not images_already_resized:
             # Validation: just resize (no augmentation) — only needed for PNG path
-            rgb = transforms.functional.resize(rgb, self.target_size)
-            depth = transforms.functional.resize(depth, self.target_size)
+            rgb = F2.resize(rgb, self.target_size)
+            depth = F2.resize(depth, self.target_size)
 
-        # ==================== TO TENSOR ====================
-        # Convert to tensor (always needed)
-        rgb = transforms.functional.to_tensor(rgb)
-        depth = transforms.functional.to_tensor(depth)
+        # ==================== TO FLOAT32 ====================
+        # Convert uint8 → float32 [0, 1] (replaces to_tensor() which did CHW permute + /255;
+        # our tensors are already CHW, so just need dtype conversion).
+        # Dtype guard: if depth aug triggered, depth is already float32 — no double-division.
+        if rgb.dtype == torch.uint8:
+            rgb = rgb.float() / 255.0
+        if depth.dtype == torch.uint8:
+            depth = depth.float() / 255.0
 
         # ==================== NORMALIZATION ====================
-        # Statistics computed from training samples at (416, 544) resolution
-        # after scaling to [0, 1] range
-        #
-        # When normalize=False (GPU augmentation mode), skip normalization here.
-        # GPU augmentation will handle normalization after applying augmentations.
+        # When normalize=False (GPU augmentation mode), skip — GPU handles it.
         if self.normalize:
-            # RGB: Use exact computed training statistics (official split, 80:20)
-            rgb = transforms.functional.normalize(
+            # RGB: exact training statistics (official split, 80:20)
+            rgb = F2.normalize(
                 rgb,
                 mean=[0.49829878533942046, 0.4667760665084003, 0.44289694564460663],
-                std=[0.27731416732781294, 0.28601699847044426, 0.2899506179157605]
+                std=[0.27731416732781294, 0.28601699847044426, 0.2899506179157605],
             )
 
-            # Depth: Use exact computed training statistics (official split, 80:20)
-            depth = transforms.functional.normalize(
-                depth, mean=[0.2908], std=[0.1504]
-            )
+            # Depth: exact training statistics (official split, 80:20)
+            depth = F2.normalize(depth, mean=[0.2908], std=[0.1504])
 
             # 7. Post-normalization Random Erasing (CPU mode only)
-            # When using GPU augmentation, erasing is done on GPU after normalization
-            # Uses pre-computed _rgb_erasing_p and _depth_erasing_p (scaled by aug_prob/mag)
+            # GPU augmentation handles erasing on GPU after normalization
             if self.split == 'train':
-                # RGB random erasing
                 if np.random.random() < self._rgb_erasing_p:
-                    erasing = transforms.RandomErasing(
-                        p=1.0,
-                        scale=(self._rgb_erasing_scale_min, self._rgb_erasing_scale_max),
-                        ratio=(BASE_ERASING_RATIO_MIN, BASE_ERASING_RATIO_MAX)
-                    )
-                    rgb = erasing(rgb)
+                    rgb = self._rgb_erasing_transform(rgb)
 
-                # Depth random erasing
                 if np.random.random() < self._depth_erasing_p:
-                    erasing = transforms.RandomErasing(
-                        p=1.0,
-                        scale=(self._depth_erasing_scale_min, self._depth_erasing_scale_max),
-                        ratio=(BASE_ERASING_RATIO_MIN, BASE_ERASING_RATIO_MAX)
-                    )
-                    depth = erasing(depth)
+                    depth = self._depth_erasing_transform(depth)
 
-        # Get label
         label = self.labels[idx]
-
         return rgb, depth, label
 
     def get_class_weights(self):

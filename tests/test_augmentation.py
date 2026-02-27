@@ -31,8 +31,8 @@ def test_train_vs_val_augmentation():
 
     # Create both datasets (using same data_root, just different splits)
     try:
-        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
-        val_dataset = SUNRGBDDataset(split='val', target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(416, 544))
+        val_dataset = SUNRGBDDataset(split='val', target_size=(416, 544))
     except Exception as e:
         print(f"⚠️  Could not load datasets: {e}")
         print("   Skipping this test (dataset may not be available)")
@@ -89,7 +89,7 @@ def test_synchronized_cropping():
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(416, 544))
     except Exception as e:
         print(f"⚠️  Could not load dataset: {e}")
         return
@@ -124,7 +124,7 @@ def test_rgb_independent_augmentation():
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(416, 544))
     except Exception as e:
         print(f"⚠️  Could not load dataset: {e}")
         return
@@ -180,7 +180,7 @@ def test_depth_independent_augmentation():
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(416, 544))
     except Exception as e:
         print(f"⚠️  Could not load dataset: {e}")
         return
@@ -220,8 +220,8 @@ def visualize_augmentation():
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
-        val_dataset = SUNRGBDDataset(split='val', target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(416, 544))
+        val_dataset = SUNRGBDDataset(split='val', target_size=(416, 544))
     except Exception as e:
         print(f"⚠️  Could not load datasets: {e}")
         return
@@ -316,7 +316,7 @@ def test_augmentation_probabilities():
     print("=" * 80)
 
     try:
-        train_dataset = SUNRGBDDataset(split='train', target_size=(224, 224))
+        train_dataset = SUNRGBDDataset(split='train', target_size=(416, 544))
     except Exception as e:
         print(f"⚠️  Could not load dataset: {e}")
         return

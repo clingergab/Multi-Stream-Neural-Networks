@@ -11,7 +11,8 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
-from torchvision import transforms
+from torchvision.transforms import v2
+from torchvision.transforms.v2 import functional as F2
 
 
 class SUNRGBD3StreamDataset(Dataset):
@@ -100,68 +101,80 @@ class SUNRGBD3StreamDataset(Dataset):
             assert os.path.exists(self.orth_dir), f"Orthogonal directory not found: {self.orth_dir}"
             print(f"Loaded SUN RGB-D 3-Stream {self.split} set: {self.num_samples} samples, 15 classes (PNG fallback)")
 
+        # Pre-create reusable transform instances (avoids per-__getitem__ construction)
+        self._color_jitter_transform = v2.ColorJitter(
+            brightness=0.37, contrast=0.37, saturation=0.37, hue=0.11,
+        )
+        self._rgb_erasing_transform = v2.RandomErasing(
+            p=1.0, scale=(0.02, 0.10), ratio=(0.5, 2.0),
+        )
+        self._depth_erasing_transform = v2.RandomErasing(
+            p=1.0, scale=(0.02, 0.1), ratio=(0.5, 2.0),
+        )
+        self._orth_erasing_transform = v2.RandomErasing(
+            p=1.0, scale=(0.02, 0.1), ratio=(0.5, 2.0),
+        )
+
     def __len__(self):
         return self.num_samples
 
     def _load_images_tensor(self, idx):
-        """Load pre-resized uint8 images from tensor files and convert to PIL."""
-        # RGB: [3, H, W] uint8 → [H, W, 3] numpy → PIL RGB
-        rgb_arr = self.rgb_tensors[idx].numpy().transpose(1, 2, 0)
-        rgb = Image.fromarray(np.ascontiguousarray(rgb_arr), mode='RGB')
-
-        # Depth: [1, H, W] uint8 → [H, W] float32 in [0, 1] → PIL mode F
-        depth_arr = self.depth_tensors[idx, 0].numpy()
-        depth = Image.fromarray(depth_arr.astype(np.float32) / 255.0, mode='F')
-
-        # Orth: [1, H, W] uint8 → [H, W] float32 in [0, 1] → PIL mode F
-        orth_arr = self.orth_tensors[idx, 0].numpy()
-        orth = Image.fromarray(orth_arr.astype(np.float32) / 255.0, mode='F')
-
+        """Load pre-resized uint8 images from tensor files as tensors (no PIL)."""
+        rgb = self.rgb_tensors[idx]      # [3, H, W] uint8
+        depth = self.depth_tensors[idx]  # [1, H, W] uint8
+        orth = self.orth_tensors[idx]    # [1, H, W] uint8
         return rgb, depth, orth
 
     def _load_images_png(self, idx):
-        """Load images from PNG files (fallback path)."""
-        # RGB
+        """Load images from PNG files (fallback path), return as tensors."""
+        # RGB: load PIL, convert to uint8 tensor immediately
         rgb_path = os.path.join(self.rgb_dir, f'{idx:05d}.png')
-        rgb = Image.open(rgb_path).convert('RGB')
+        rgb_pil = Image.open(rgb_path).convert('RGB')
+        rgb = F2.pil_to_tensor(rgb_pil)  # [3, H, W] uint8
 
-        # Depth
+        # Depth: handle various PIL modes, normalize to [0,1], then quantize to uint8
         depth_path = os.path.join(self.depth_dir, f'{idx:05d}.png')
-        depth = Image.open(depth_path)
-        if depth.mode in ('I', 'I;16', 'I;16B'):
-            depth_arr = np.array(depth, dtype=np.float32)
+        depth_pil = Image.open(depth_path)
+        if depth_pil.mode in ('I', 'I;16', 'I;16B'):
+            depth_arr = np.array(depth_pil, dtype=np.float32)
             depth_arr = np.clip(depth_arr / 65535.0, 0.0, 1.0)
-            depth = Image.fromarray(depth_arr, mode='F')
         else:
-            depth = depth.convert('F')
-            if np.array(depth).max() > 1.0:
-                depth_arr = np.array(depth)
-                depth = Image.fromarray(depth_arr / 255.0, mode='F')
+            depth_arr = np.array(depth_pil.convert('L'), dtype=np.float32)
+            if depth_arr.max() > 1.0:
+                depth_arr = depth_arr / 255.0
+        # Convert to uint8 tensor to match tensor fast path format.
+        # Note: for mode 'L' with values 0-255, this divides by 255 then multiplies
+        # by 255 (a no-op with rounding). Intentional — normalizes all depth formats
+        # to the same uint8 output regardless of input mode.
+        depth = torch.from_numpy(
+            (depth_arr * 255).clip(0, 255).astype(np.uint8)
+        ).unsqueeze(0)  # [1, H, W] uint8
 
-        # Orth
+        # Orth: same handling as depth
         orth_path = os.path.join(self.orth_dir, f'{idx:05d}.png')
-        orth = Image.open(orth_path)
-        if orth.mode in ('I', 'I;16', 'I;16B'):
-            orth_arr = np.array(orth, dtype=np.float32)
+        orth_pil = Image.open(orth_path)
+        if orth_pil.mode in ('I', 'I;16', 'I;16B'):
+            orth_arr = np.array(orth_pil, dtype=np.float32)
             orth_arr = np.clip(orth_arr / 65535.0, 0.0, 1.0)
-            orth = Image.fromarray(orth_arr, mode='F')
         else:
-            orth = orth.convert('F')
-            if np.array(orth).max() > 1.0:
-                orth_arr = np.array(orth)
-                orth = Image.fromarray(orth_arr / 255.0, mode='F')
+            orth_arr = np.array(orth_pil.convert('L'), dtype=np.float32)
+            if orth_arr.max() > 1.0:
+                orth_arr = orth_arr / 255.0
+        orth = torch.from_numpy(
+            (orth_arr * 255).clip(0, 255).astype(np.uint8)
+        ).unsqueeze(0)  # [1, H, W] uint8
 
         return rgb, depth, orth
 
     def __getitem__(self, idx):
         """
         Returns:
-            rgb: RGB image tensor [3, H, W]
-            depth: Depth image tensor [1, H, W]
-            orth: Orthogonal image tensor [1, H, W]
+            rgb: RGB image tensor [3, H, W] float32
+            depth: Depth image tensor [1, H, W] float32
+            orth: Orthogonal image tensor [1, H, W] float32
             label: Class label (0-14)
         """
-        # Load images (tensor fast path or PNG fallback)
+        # Load images as uint8 tensors (no PIL conversion)
         if self.use_tensors:
             rgb, depth, orth = self._load_images_tensor(idx)
             images_already_resized = True
@@ -169,113 +182,103 @@ class SUNRGBD3StreamDataset(Dataset):
             rgb, depth, orth = self._load_images_png(idx)
             images_already_resized = False
 
+        # At this point: rgb [3, H, W] uint8, depth [1, H, W] uint8, orth [1, H, W] uint8
+
         # ==================== TRAINING AUGMENTATION ====================
         if self.split == 'train':
             # 1. Synchronized Random Horizontal Flip (50%)
             if np.random.random() < 0.5:
-                rgb = rgb.transpose(Image.FLIP_LEFT_RIGHT)
-                depth = depth.transpose(Image.FLIP_LEFT_RIGHT)
-                orth = orth.transpose(Image.FLIP_LEFT_RIGHT)
+                rgb = F2.horizontal_flip(rgb)
+                depth = F2.horizontal_flip(depth)
+                orth = F2.horizontal_flip(orth)
 
             # 2. Synchronized Random Resized Crop (50% probability)
             if np.random.random() < 0.5:
-                i, j, h, w = transforms.RandomResizedCrop.get_params(
+                i, j, h, w = v2.RandomResizedCrop.get_params(
                     rgb, scale=(0.9, 1.0), ratio=(0.95, 1.05)
                 )
-                rgb = transforms.functional.resized_crop(rgb, i, j, h, w, self.target_size)
-                depth = transforms.functional.resized_crop(depth, i, j, h, w, self.target_size)
-                orth = transforms.functional.resized_crop(orth, i, j, h, w, self.target_size)
+                rgb = F2.resized_crop(rgb, i, j, h, w, self.target_size)
+                depth = F2.resized_crop(depth, i, j, h, w, self.target_size)
+                orth = F2.resized_crop(orth, i, j, h, w, self.target_size)
             elif not images_already_resized:
-                rgb = transforms.functional.resize(rgb, self.target_size)
-                depth = transforms.functional.resize(depth, self.target_size)
-                orth = transforms.functional.resize(orth, self.target_size)
+                rgb = F2.resize(rgb, self.target_size)
+                depth = F2.resize(depth, self.target_size)
+                orth = F2.resize(orth, self.target_size)
 
-            # 3. RGB-Only: Color Jitter (43% probability)
+            # 3. RGB-Only: Color Jitter (43% probability, pre-created instance)
             if np.random.random() < 0.43:
-                color_jitter = transforms.ColorJitter(
-                    brightness=0.37,
-                    contrast=0.37,
-                    saturation=0.37,
-                    hue=0.11
-                )
-                rgb = color_jitter(rgb)
+                rgb = self._color_jitter_transform(rgb)
 
             # 4. RGB-Only: Gaussian Blur (25% probability)
             if np.random.random() < 0.25:
                 kernel_size = int(np.random.choice([3, 5, 7]))
                 sigma = float(np.random.uniform(0.1, 1.7))
-                rgb = transforms.functional.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
+                rgb = F2.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
 
             # 5. RGB-Only: Occasional Grayscale (17%)
             if np.random.random() < 0.17:
-                rgb = transforms.functional.to_grayscale(rgb, num_output_channels=3)
+                rgb = F2.rgb_to_grayscale(rgb, num_output_channels=3)
 
             # 6. Depth & Orth: Appearance Augmentation (50% probability each)
+            # Uses torch ops instead of numpy/PIL
             if np.random.random() < 0.5:
-                depth_array = np.array(depth, dtype=np.float32)
+                depth = depth.float() / 255.0  # uint8 → float32 [0, 1]
                 brightness_factor = np.random.uniform(0.75, 1.25)
                 contrast_factor = np.random.uniform(0.75, 1.25)
-                depth_array = (depth_array - 0.5) * contrast_factor + 0.5
-                depth_array = depth_array * brightness_factor
-                noise = np.random.normal(0, 0.06, depth_array.shape).astype(np.float32)
-                depth_array = depth_array + noise
-                depth_array = np.clip(depth_array, 0.0, 1.0).astype(np.float32)
-                depth = Image.fromarray(depth_array, mode='F')
+                depth = (depth - 0.5) * contrast_factor + 0.5
+                depth = depth * brightness_factor
+                depth = depth + torch.randn_like(depth) * 0.06
+                depth = depth.clamp(0.0, 1.0)
+                # depth is now float32 [0, 1] — skips later uint8→float conversion
 
             if np.random.random() < 0.5:
-                orth_array = np.array(orth, dtype=np.float32)
+                orth = orth.float() / 255.0  # uint8 → float32 [0, 1]
                 brightness_factor = np.random.uniform(0.75, 1.25)
                 contrast_factor = np.random.uniform(0.75, 1.25)
-                orth_array = (orth_array - 0.5) * contrast_factor + 0.5
-                orth_array = orth_array * brightness_factor
-                noise = np.random.normal(0, 0.06, orth_array.shape).astype(np.float32)
-                orth_array = orth_array + noise
-                orth_array = np.clip(orth_array, 0.0, 1.0).astype(np.float32)
-                orth = Image.fromarray(orth_array, mode='F')
+                orth = (orth - 0.5) * contrast_factor + 0.5
+                orth = orth * brightness_factor
+                orth = orth + torch.randn_like(orth) * 0.06
+                orth = orth.clamp(0.0, 1.0)
+                # orth is now float32 [0, 1] — skips later uint8→float conversion
 
         elif not images_already_resized:
             # Validation: just resize (no augmentation) — only needed for PNG path
-            rgb = transforms.functional.resize(rgb, self.target_size)
-            depth = transforms.functional.resize(depth, self.target_size)
-            orth = transforms.functional.resize(orth, self.target_size)
+            rgb = F2.resize(rgb, self.target_size)
+            depth = F2.resize(depth, self.target_size)
+            orth = F2.resize(orth, self.target_size)
+
+        # ==================== TO FLOAT32 ====================
+        # Convert uint8 → float32 [0, 1] (replaces to_tensor() which did CHW permute + /255;
+        # our tensors are already CHW, so just need dtype conversion).
+        # Dtype guard: if depth/orth aug triggered, they are already float32 — no double-division.
+        if rgb.dtype == torch.uint8:
+            rgb = rgb.float() / 255.0
+        if depth.dtype == torch.uint8:
+            depth = depth.float() / 255.0
+        if orth.dtype == torch.uint8:
+            orth = orth.float() / 255.0
 
         # ==================== NORMALIZATION ====================
-        rgb = transforms.functional.to_tensor(rgb)
-        rgb = transforms.functional.normalize(
+        rgb = F2.normalize(
             rgb,
             mean=[0.49829878533942046, 0.4667760665084003, 0.44289694564460663],
-            std=[0.27731416732781294, 0.28601699847044426, 0.2899506179157605]
+            std=[0.27731416732781294, 0.28601699847044426, 0.2899506179157605],
         )
 
-        depth = transforms.functional.to_tensor(depth)
-        depth = transforms.functional.normalize(
-            depth, mean=[0.2908], std=[0.1504]
-        )
+        depth = F2.normalize(depth, mean=[0.2908], std=[0.1504])
 
-        orth = transforms.functional.to_tensor(orth)
-        orth = transforms.functional.normalize(
-            orth, mean=[0.4944], std=[0.2065]
-        )
+        orth = F2.normalize(orth, mean=[0.4944], std=[0.2065])
 
-        # 7. Post-normalization Random Erasing
+        # 7. Post-normalization Random Erasing (pre-created instances)
         if self.split == 'train':
             if np.random.random() < 0.17:
-                erasing = transforms.RandomErasing(
-                    p=1.0, scale=(0.02, 0.10), ratio=(0.5, 2.0)
-                )
-                rgb = erasing(rgb)
+                rgb = self._rgb_erasing_transform(rgb)
 
             if np.random.random() < 0.1:
-                erasing = transforms.RandomErasing(
-                    p=1.0, scale=(0.02, 0.1), ratio=(0.5, 2.0)
-                )
-                depth = erasing(depth)
+                depth = self._depth_erasing_transform(depth)
 
             if np.random.random() < 0.1:
-                erasing = transforms.RandomErasing(
-                    p=1.0, scale=(0.02, 0.1), ratio=(0.5, 2.0)
-                )
-                orth = erasing(orth)
+                orth = self._orth_erasing_transform(orth)
 
         label = self.labels[idx]
 

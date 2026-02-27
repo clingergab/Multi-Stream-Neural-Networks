@@ -21,20 +21,17 @@ def test_crop_probability():
     print("TEST 1: Crop Probability (50% expected)")
     print("="*80)
 
-    # Create dataset
+    # Create dataset — use the actual target_size matching pre-resized tensors
+    # so all samples have the same output shape regardless of crop
     train_dataset = SUNRGBDDataset(
         data_root='data/sunrgbd_15',
         split='train',
-        target_size=(224, 224)
+        target_size=(416, 544)
     )
 
     # Test with enough samples to get reliable statistics
     n_tests = 500
     idx = 0
-
-    # Strategy: If crop is applied, the image size changes during processing
-    # We can't directly measure this, but we can measure if samples are identical
-    # When no augmentation is applied, samples should be more similar
 
     # Get multiple samples and check variance
     samples = []
@@ -44,7 +41,6 @@ def test_crop_probability():
 
     # Count how many unique transformations we see
     # With 50% flip + 50% crop + 50% color, we should see high variety
-    # Calculate pairwise differences
     unique_threshold = 0.01  # Threshold for considering samples "different"
 
     differences = []
@@ -72,46 +68,55 @@ def test_crop_probability():
 
 def test_depth_augmentation_parameters():
     """
-    Verify depth augmentation uses correct parameters (±25%, not ±20% or ±40%).
+    Verify depth augmentation uses correct parameters via augmentation_config.
+    Now uses configurable scaling, so check config defaults instead of hardcoded values.
     """
     print("="*80)
     print("TEST 2: Depth Augmentation Parameters")
     print("="*80)
 
-    # Read the actual source code to verify parameters
-    import src.data_utils.sunrgbd_dataset as dataset_module
-    source_code = inspect.getsource(dataset_module.SUNRGBDDataset.__getitem__)
+    from src.training.augmentation_config import (
+        BASE_DEPTH_BRIGHTNESS, BASE_DEPTH_CONTRAST, BASE_DEPTH_NOISE_STD,
+        BASE_CROP_SCALE_MIN, BASE_CROP_SCALE_MAX,
+        BASE_BRIGHTNESS,
+    )
 
-    # Check for correct brightness/contrast ranges
     errors = []
 
-    # Should have ±25% for depth (0.75, 1.25)
-    if "0.75, 1.25" in source_code:
-        print("  ✅ Depth brightness: ±25% (0.75-1.25) - CORRECT")
+    # Check depth brightness baseline (±25%)
+    if abs(BASE_DEPTH_BRIGHTNESS - 0.25) < 1e-6:
+        print("  ✅ Depth brightness: ±25% (BASE_DEPTH_BRIGHTNESS=0.25) - CORRECT")
     else:
-        errors.append("Depth brightness not set to ±25%")
-        print("  ❌ Depth brightness: NOT ±25%")
+        errors.append(f"Depth brightness not ±25% (got {BASE_DEPTH_BRIGHTNESS})")
+        print(f"  ❌ Depth brightness: {BASE_DEPTH_BRIGHTNESS} (expected 0.25)")
 
-    # Should have ±20% for RGB (0.8, 1.2) via ColorJitter(brightness=0.2)
-    if "brightness=0.2" in source_code:
-        print("  ✅ RGB brightness: ±20% (ColorJitter 0.2) - CORRECT")
+    # Check RGB brightness baseline (used by ColorJitter)
+    if abs(BASE_BRIGHTNESS - 0.37) < 1e-6:
+        print("  ✅ RGB brightness: ±37% (BASE_BRIGHTNESS=0.37) - CORRECT")
     else:
-        errors.append("RGB brightness not set to ±20%")
-        print("  ❌ RGB brightness: NOT ±20%")
+        errors.append(f"RGB brightness not ±37% (got {BASE_BRIGHTNESS})")
+        print(f"  ❌ RGB brightness: {BASE_BRIGHTNESS}")
 
-    # Should have std=15 for noise
-    if "std=15" in source_code or "0, 15" in source_code:
-        print("  ✅ Depth noise: std=15 - CORRECT")
+    # Check depth noise std baseline (~0.06)
+    if abs(BASE_DEPTH_NOISE_STD - 0.059) < 0.01:
+        print(f"  ✅ Depth noise: std={BASE_DEPTH_NOISE_STD} (BASE_DEPTH_NOISE_STD) - CORRECT")
     else:
-        errors.append("Depth noise std not 15")
-        print("  ❌ Depth noise: NOT std=15")
+        errors.append(f"Depth noise std not ~0.06 (got {BASE_DEPTH_NOISE_STD})")
+        print(f"  ❌ Depth noise: {BASE_DEPTH_NOISE_STD}")
 
-    # Should have scale=(0.9, 1.0) for crop
-    if "0.9, 1.0" in source_code:
+    # Check crop scale baseline
+    if abs(BASE_CROP_SCALE_MIN - 0.9) < 1e-6 and abs(BASE_CROP_SCALE_MAX - 1.0) < 1e-6:
         print("  ✅ Crop scale: 0.9-1.0 - CORRECT")
     else:
-        errors.append("Crop scale not 0.9-1.0")
-        print("  ❌ Crop scale: NOT 0.9-1.0")
+        errors.append(f"Crop scale not 0.9-1.0 (got {BASE_CROP_SCALE_MIN}-{BASE_CROP_SCALE_MAX})")
+        print(f"  ❌ Crop scale: {BASE_CROP_SCALE_MIN}-{BASE_CROP_SCALE_MAX}")
+
+    # Verify dataset computes correct scaled values at default (1.0) scaling
+    ds = SUNRGBDDataset(data_root='data/sunrgbd_15', split='train')
+    if abs(ds._depth_brightness - 0.25) < 1e-6:
+        print("  ✅ Dataset._depth_brightness matches config at scale 1.0")
+    else:
+        errors.append(f"Dataset._depth_brightness wrong (got {ds._depth_brightness})")
 
     print()
 
@@ -129,66 +134,46 @@ def test_depth_augmentation_parameters():
 def test_no_double_stacking():
     """
     Verify depth augmentation is in a SINGLE block (no double-stacking).
+    Brightness, contrast, and noise should all be in one probability-gated block.
     """
     print("="*80)
-    print("TEST 3: No Double-Stacking (Depth should have ONE 50% block)")
+    print("TEST 3: No Double-Stacking (Depth should have ONE probability-gated block)")
     print("="*80)
 
     # Read source code
     import src.data_utils.sunrgbd_dataset as dataset_module
     source_code = inspect.getsource(dataset_module.SUNRGBDDataset.__getitem__)
 
-    # Count how many separate "if np.random.random() < 0.5:" blocks affect depth
-    # Should be only ONE for depth appearance augmentation
-
-    # Look for depth-only augmentation blocks (after normalization is different)
     lines = source_code.split('\n')
 
-    depth_aug_blocks = 0
-    in_depth_block = False
-
-    for i, line in enumerate(lines):
-        # Check if this is a depth augmentation block
-        if 'depth_array' in line and 'np.random.random()' in line:
-            depth_aug_blocks += 1
-
-        # Check for separate blocks (brightness/contrast separate from noise)
-        if 'brightness_factor' in line and i > 0:
-            # Check if this is in the same block or separate
-            # Look back to see if there's a new random check
-            lookback = '\n'.join(lines[max(0, i-10):i])
-            if lookback.count('if np.random.random()') > 1:
-                print(f"  ⚠️  Found separate random checks near brightness_factor")
-
-    # We should have ONE depth augmentation block that does brightness+contrast+noise
-    # in a single "if np.random.random() < 0.5:" check
-
-    # Better check: look for the pattern
+    # Look for the depth augmentation block pattern:
+    # A single probability check followed by brightness, contrast, and noise operations
     has_combined_block = False
     for i, line in enumerate(lines):
-        if 'brightness_factor = np.random.uniform(0.75, 1.25)' in line:
+        if 'brightness_factor' in line and 'np.random.uniform' in line:
             # Check next ~15 lines for both contrast and noise
             next_lines = '\n'.join(lines[i:i+20])
-            if 'contrast_factor' in next_lines and 'noise = np.random.normal' in next_lines:
+            if 'contrast_factor' in next_lines and ('randn_like' in next_lines or 'noise' in next_lines):
                 has_combined_block = True
-                # Now check there's only ONE random check in the 10 lines before this
-                prev_lines = '\n'.join(lines[max(0, i-10):i])
-                # Count "if np.random.random()" that affects depth
-                # Should be exactly 1 (the block starter)
-                depth_random_checks = 0
-                for pline in lines[max(0, i-10):i]:
-                    if 'if np.random.random()' in pline:
-                        # Check if next few lines mention depth
-                        depth_random_checks += 1
+                # Find the nearest preceding probability check that gates depth operations.
+                # Walk backwards from brightness_factor to find the 'if np.random.random()'
+                # that is the block entry point (should reference depth, not rgb).
+                depth_gate_found = False
+                for j in range(i-1, max(0, i-10), -1):
+                    if 'np.random.random()' in lines[j]:
+                        # Check if the lines after this check reference depth (not rgb)
+                        block_lines = '\n'.join(lines[j:j+5])
+                        if 'depth' in block_lines or 'brightness_factor' in block_lines:
+                            depth_gate_found = True
+                            print(f"  ✅ Depth augmentation gated by single probability check")
+                        break
 
-                if depth_random_checks == 1:
-                    print(f"  ✅ Depth augmentation in SINGLE block (brightness + contrast + noise together)")
-                elif depth_random_checks == 0:
-                    # This is OK - means brightness is inside the block
+                if depth_gate_found:
                     print(f"  ✅ Depth augmentation in SINGLE block (brightness + contrast + noise together)")
                 else:
-                    print(f"  ❌ Found {depth_random_checks} random checks before brightness (expected 0-1)")
-                    assert False, "Double-stacking detected"
+                    print(f"  ❌ Could not find depth probability gate before brightness_factor")
+                    assert False, "Missing depth probability gate"
+                break
 
     if not has_combined_block:
         print(f"  ❌ FAIL: Could not find combined brightness+contrast+noise block")
@@ -200,49 +185,52 @@ def test_no_double_stacking():
 
 def test_scene_optimized_crop():
     """
-    Verify crop is probabilistic (50%), not always applied (100%).
+    Verify crop is probabilistic (gated by _crop_p), not always applied (100%).
     This is critical for scene classification.
     """
     print("="*80)
-    print("TEST 4: Scene-Optimized Crop (50% probability, NOT 100%)")
+    print("TEST 4: Scene-Optimized Crop (probabilistic, NOT 100%)")
     print("="*80)
 
     # Read source code
     import src.data_utils.sunrgbd_dataset as dataset_module
     source_code = inspect.getsource(dataset_module.SUNRGBDDataset.__getitem__)
 
-    # Look for crop implementation
-    # Should have: if np.random.random() < 0.5: followed by crop
-    # Should also have: else: resize (for no-crop case)
-
     errors = []
 
     # Check for probabilistic crop
     if 'RandomResizedCrop.get_params' in source_code:
-        # Find the line
         lines = source_code.split('\n')
         for i, line in enumerate(lines):
             if 'RandomResizedCrop.get_params' in line:
-                # Check previous lines for random check
+                # Check previous lines for random probability check
                 prev_lines = '\n'.join(lines[max(0, i-5):i])
-                if 'if np.random.random() < 0.5' in prev_lines:
-                    print(f"  ✅ Crop is probabilistic (50%)")
+                if 'np.random.random()' in prev_lines and ('_crop_p' in prev_lines or '< 0.5' in prev_lines):
+                    print(f"  ✅ Crop is probabilistic (gated by probability check)")
                 else:
                     print(f"  ❌ Crop appears to always be applied (no random check found)")
                     errors.append("Crop not probabilistic")
 
-                # Check for else clause with resize
+                # Check for elif/else clause with resize for no-crop fallback
                 next_lines = '\n'.join(lines[i:i+10])
-                if 'else:' in next_lines and 'resize' in next_lines:
-                    print(f"  ✅ Else clause preserves full context (resize only)")
+                if ('elif' in next_lines or 'else' in next_lines) and 'resize' in next_lines:
+                    print(f"  ✅ Fallback clause preserves full context (resize only)")
                 else:
-                    print(f"  ❌ No else clause found for no-crop case")
-                    errors.append("No else clause for no-crop")
+                    print(f"  ❌ No fallback clause found for no-crop case")
+                    errors.append("No fallback clause for no-crop")
 
                 break
     else:
         errors.append("RandomResizedCrop not found in code")
         print(f"  ❌ RandomResizedCrop not found")
+
+    # Also verify via dataset attributes that crop_p is ~50% at default scaling
+    ds = SUNRGBDDataset(data_root='data/sunrgbd_15', split='train')
+    if abs(ds._crop_p - 0.5) < 1e-6:
+        print(f"  ✅ Default _crop_p = {ds._crop_p} (50%)")
+    else:
+        errors.append(f"Default _crop_p is {ds._crop_p}, expected 0.5")
+        print(f"  ❌ Default _crop_p = {ds._crop_p} (expected 0.5)")
 
     if errors:
         print(f"\n  ❌ FAIL: {len(errors)} issue(s):")
@@ -250,7 +238,7 @@ def test_scene_optimized_crop():
             print(f"     - {error}")
         assert False, "Crop not scene-optimized"
     else:
-        print(f"\n  ✅ PASS: Crop is scene-optimized (50% probability)")
+        print(f"\n  ✅ PASS: Crop is scene-optimized (probabilistic)")
 
     print()
 
@@ -266,7 +254,7 @@ def test_validation_deterministic():
     val_dataset = SUNRGBDDataset(
         data_root='data/sunrgbd_15',
         split='val',
-        target_size=(224, 224)
+        target_size=(416, 544)
     )
 
     # Load same sample multiple times

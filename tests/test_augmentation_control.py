@@ -14,6 +14,7 @@ import warnings
 from dataclasses import asdict
 
 import pytest
+import torch
 
 from src.training.augmentation_config import (
     AugmentationConfig,
@@ -1708,6 +1709,83 @@ class TestIntegration:
             assert depth.dim() == 4
 
         assert batch_count > 0
+
+
+class TestGPUAugmentationValidation:
+    """Test that mismatched GPU augmentation / normalize settings raise errors."""
+
+    def _make_mock_loader(self, normalize):
+        """Create a minimal mock DataLoader with a dataset that has a normalize attribute."""
+
+        class FakeDataset:
+            def __init__(self, normalize):
+                self.normalize = normalize
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, idx):
+                return torch.zeros(3, 64, 64), torch.zeros(1, 64, 64), 0
+
+        return torch.utils.data.DataLoader(FakeDataset(normalize), batch_size=1)
+
+    def _make_model(self):
+        """Create a minimal LINet model (CPU only, no weights needed)."""
+        from src.models.linear_integration.li_net3.li_net import li_resnet18
+
+        model = li_resnet18(num_classes=15, device="cpu", use_amp=False)
+        return model
+
+    def test_gpu_aug_true_normalize_false_is_valid(self):
+        """gpu_augmentation=True + normalize=False is the correct GPU aug config."""
+        model = self._make_model()
+        model.gpu_augmentation = True
+        # Simulate a working gpu_aug module (just needs to not be None)
+        model.gpu_aug = torch.nn.Identity()
+
+        loader = self._make_mock_loader(normalize=False)
+        # Should NOT raise
+        model._validate_augmentation_config(loader, verbose=True)
+
+    def test_gpu_aug_false_normalize_true_is_valid(self):
+        """gpu_augmentation=False + normalize=True is the correct CPU aug config."""
+        model = self._make_model()
+        model.gpu_augmentation = False
+        model.gpu_aug = None
+
+        loader = self._make_mock_loader(normalize=True)
+        # Should NOT raise
+        model._validate_augmentation_config(loader, verbose=True)
+
+    def test_gpu_aug_true_normalize_true_raises(self):
+        """gpu_augmentation=True + normalize=True causes double normalization — must raise."""
+        model = self._make_model()
+        model.gpu_augmentation = True
+        model.gpu_aug = torch.nn.Identity()
+
+        loader = self._make_mock_loader(normalize=True)
+        with pytest.raises(ValueError, match="DOUBLE NORMALIZATION"):
+            model._validate_augmentation_config(loader, verbose=True)
+
+    def test_gpu_aug_false_normalize_false_raises(self):
+        """gpu_augmentation=False + normalize=False means no normalization at all — must raise."""
+        model = self._make_model()
+        model.gpu_augmentation = False
+        model.gpu_aug = None
+
+        loader = self._make_mock_loader(normalize=False)
+        with pytest.raises(ValueError, match="NOT be normalized"):
+            model._validate_augmentation_config(loader, verbose=True)
+
+    def test_gpu_aug_true_but_module_none_raises(self):
+        """gpu_augmentation=True but gpu_aug is None means normalization silently skipped — must raise."""
+        model = self._make_model()
+        model.gpu_augmentation = True
+        model.gpu_aug = None  # Module not initialized
+
+        loader = self._make_mock_loader(normalize=False)
+        with pytest.raises(RuntimeError, match="not initialized"):
+            model._validate_augmentation_config(loader, verbose=True)
 
 
 if __name__ == "__main__":
