@@ -75,16 +75,17 @@ class SUNRGBD3StreamDataset(Dataset):
         self.num_samples = len(self.labels)
 
         # Try to load pre-resized tensor files (fast path)
+        # mmap=True avoids copy-on-write overhead when DataLoader forks workers
         rgb_tensor_path = os.path.join(self.split_dir, 'rgb_tensors.pt')
         depth_tensor_path = os.path.join(self.split_dir, 'depth_tensors.pt')
         orth_tensor_path = os.path.join(self.split_dir, 'orth_tensors.pt')
         if (os.path.exists(rgb_tensor_path) and os.path.exists(depth_tensor_path)
                 and os.path.exists(orth_tensor_path)):
-            self.rgb_tensors = torch.load(rgb_tensor_path, weights_only=True)
-            self.depth_tensors = torch.load(depth_tensor_path, weights_only=True)
-            self.orth_tensors = torch.load(orth_tensor_path, weights_only=True)
+            self.rgb_tensors = torch.load(rgb_tensor_path, weights_only=True, mmap=True)
+            self.depth_tensors = torch.load(depth_tensor_path, weights_only=True, mmap=True)
+            self.orth_tensors = torch.load(orth_tensor_path, weights_only=True, mmap=True)
             self.use_tensors = True
-            print(f"Loaded SUN RGB-D 3-Stream {self.split} set: {self.num_samples} samples, 15 classes (pre-resized tensors)")
+            print(f"Loaded SUN RGB-D 3-Stream {self.split} set: {self.num_samples} samples, 15 classes (pre-resized tensors, mmap)")
         else:
             self.rgb_tensors = None
             self.depth_tensors = None
@@ -104,19 +105,17 @@ class SUNRGBD3StreamDataset(Dataset):
 
     def _load_images_tensor(self, idx):
         """Load pre-resized uint8 images from tensor files and convert to PIL."""
-        # RGB: [3, H, W] uint8 → PIL RGB
-        rgb_uint8 = self.rgb_tensors[idx]
-        rgb = Image.fromarray(rgb_uint8.permute(1, 2, 0).numpy(), mode='RGB')
+        # RGB: [3, H, W] uint8 → [H, W, 3] numpy → PIL RGB
+        rgb_arr = self.rgb_tensors[idx].numpy().transpose(1, 2, 0)
+        rgb = Image.fromarray(np.ascontiguousarray(rgb_arr), mode='RGB')
 
-        # Depth: [1, H, W] uint8 → PIL mode F (float32 in [0, 1])
-        depth_uint8 = self.depth_tensors[idx, 0]
-        depth_arr = depth_uint8.numpy().astype(np.float32) / 255.0
-        depth = Image.fromarray(depth_arr, mode='F')
+        # Depth: [1, H, W] uint8 → [H, W] float32 in [0, 1] → PIL mode F
+        depth_arr = self.depth_tensors[idx, 0].numpy()
+        depth = Image.fromarray(depth_arr.astype(np.float32) / 255.0, mode='F')
 
-        # Orth: [1, H, W] uint8 → PIL mode F (float32 in [0, 1])
-        orth_uint8 = self.orth_tensors[idx, 0]
-        orth_arr = orth_uint8.numpy().astype(np.float32) / 255.0
-        orth = Image.fromarray(orth_arr, mode='F')
+        # Orth: [1, H, W] uint8 → [H, W] float32 in [0, 1] → PIL mode F
+        orth_arr = self.orth_tensors[idx, 0].numpy()
+        orth = Image.fromarray(orth_arr.astype(np.float32) / 255.0, mode='F')
 
         return rgb, depth, orth
 
