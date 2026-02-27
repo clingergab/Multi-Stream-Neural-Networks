@@ -5,6 +5,9 @@ Uses the official SUN RGB-D train/test split from SUNRGBDtoolbox/allsplit.mat,
 then sub-splits the official training set into train (80%) and val (20%) for
 model selection / early stopping. The official test set is preserved as-is.
 
+With --no-val-split, skips the train/val sub-split and outputs all official
+training samples as a single train/ split (for k-fold CV in Ray Tune HPO).
+
 Creates a new directory structure:
 data/sunrgbd_15/
   train/
@@ -35,6 +38,7 @@ data/sunrgbd_15/
 Also creates metadata files with class names and statistics.
 """
 
+import argparse
 import os
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -63,11 +67,11 @@ MAT_PATH_PREFIX = "/n/fs/sun3d/data/SUNRGBD/"
 TARGET_SIZE = (416, 544)
 
 
-def _create_tensor_files(split_name, num_samples):
+def _create_tensor_files(split_name, num_samples, output_base=None):
     """
     Create pre-resized uint8 tensor files from the PNG images already saved by _process_split.
 
-    Reads PNGs from data/sunrgbd_15/{split}/rgb/ and depth/, resizes to TARGET_SIZE,
+    Reads PNGs from {output_base}/{split}/rgb/ and depth/, resizes to TARGET_SIZE,
     and saves as uint8 tensors:
       - rgb_tensors.pt:   [N, 3, H, W] uint8
       - depth_tensors.pt: [N, 1, H, W] uint8
@@ -78,7 +82,9 @@ def _create_tensor_files(split_name, num_samples):
     This introduces negligible quantization error (~0.2% for 8-bit) while reducing
     file sizes by ~2x vs float32 and eliminating PNG decode + resize from __getitem__.
     """
-    split_dir = os.path.join(OUTPUT_BASE, split_name)
+    if output_base is None:
+        output_base = OUTPUT_BASE
+    split_dir = os.path.join(output_base, split_name)
     rgb_dir = os.path.join(split_dir, 'rgb')
     depth_dir = os.path.join(split_dir, 'depth')
 
@@ -266,31 +272,35 @@ def collect_all_samples():
     return samples
 
 
-def _process_split(split_name, split_samples):
+def _process_split(split_name, split_samples, output_base=None):
     """
     Process a single split: copy images and write labels.
 
     Args:
         split_name: One of 'train', 'val', 'test'
         split_samples: List of sample tuples for this split
+        output_base: Output directory (defaults to OUTPUT_BASE)
 
     Returns:
         List of class labels for this split
     """
+    if output_base is None:
+        output_base = OUTPUT_BASE
+
     # Create output directories
     for subdir in ['rgb', 'depth']:
-        os.makedirs(os.path.join(OUTPUT_BASE, split_name, subdir), exist_ok=True)
+        os.makedirs(os.path.join(output_base, split_name, subdir), exist_ok=True)
 
     print(f"\nProcessing {split_name} set ({len(split_samples)} samples)...")
     labels = []
     for idx, (sample_dir, raw_scene, mapped_scene, class_idx, rgb_path, depth_path) in enumerate(tqdm(split_samples)):
         # Copy RGB image
-        rgb_out = os.path.join(OUTPUT_BASE, split_name, 'rgb', f'{idx:05d}.png')
+        rgb_out = os.path.join(output_base, split_name, 'rgb', f'{idx:05d}.png')
         img = Image.open(rgb_path).convert('RGB')
         img.save(rgb_out)
 
         # Copy depth image
-        depth_out = os.path.join(OUTPUT_BASE, split_name, 'depth', f'{idx:05d}.png')
+        depth_out = os.path.join(output_base, split_name, 'depth', f'{idx:05d}.png')
         depth = Image.open(depth_path)
         depth.save(depth_out)
 
@@ -298,7 +308,7 @@ def _process_split(split_name, split_samples):
         labels.append(class_idx)
 
     # Save labels
-    with open(os.path.join(OUTPUT_BASE, split_name, 'labels.txt'), 'w') as f:
+    with open(os.path.join(output_base, split_name, 'labels.txt'), 'w') as f:
         for label in labels:
             f.write(f"{label}\n")
 
@@ -419,7 +429,113 @@ def create_preprocessed_dataset(samples, train_paths, test_paths, val_ratio=0.2,
     print(f"Test: {len(test_samples)} samples")
 
 
+def create_trainval_dataset(samples, train_paths, test_paths, output_base):
+    """
+    Create preprocessed dataset with 2-way split (train/test only, no val).
+
+    All official training samples go into train/ (no sub-split). This is used
+    for k-fold cross-validation in Ray Tune HPO, where each trial creates its
+    own train/val split from the full training set.
+
+    Args:
+        samples: List of sample tuples from collect_all_samples()
+        train_paths: Set of relative paths for official training samples
+        test_paths: Set of relative paths for official test samples
+        output_base: Output directory path
+    """
+    # Build lookup: relative path -> sample
+    path_to_sample = {}
+    for sample in samples:
+        sample_dir = sample[0]
+        rel_path = os.path.relpath(sample_dir, SUNRGBD_BASE)
+        path_to_sample[rel_path] = sample
+
+    # Match samples to official splits
+    official_train_samples = []
+    official_test_samples = []
+    unmatched_train = 0
+    unmatched_test = 0
+
+    for path in train_paths:
+        if path in path_to_sample:
+            official_train_samples.append(path_to_sample[path])
+        else:
+            unmatched_train += 1
+
+    for path in test_paths:
+        if path in path_to_sample:
+            official_test_samples.append(path_to_sample[path])
+        else:
+            unmatched_test += 1
+
+    print(f"\nOfficial split matching:")
+    print(f"  Train: {len(official_train_samples)} matched ({unmatched_train} filtered by 15-cat mapping)")
+    print(f"  Test:  {len(official_test_samples)} matched ({unmatched_test} filtered by 15-cat mapping)")
+
+    print(f"\n2-way split (no val):")
+    print(f"  Train: {len(official_train_samples)} (ALL official train)")
+    print(f"  Test:  {len(official_test_samples)} (official test set)")
+    print(f"  Total: {len(official_train_samples) + len(official_test_samples)}")
+
+    # Process both splits (save PNGs + create pre-resized tensor files)
+    train_labels = _process_split('train', official_train_samples, output_base=output_base)
+    _create_tensor_files('train', len(official_train_samples), output_base=output_base)
+    test_labels = _process_split('test', official_test_samples, output_base=output_base)
+    _create_tensor_files('test', len(official_test_samples), output_base=output_base)
+
+    # Write class names
+    with open(os.path.join(output_base, 'class_names.txt'), 'w') as f:
+        for idx, name in enumerate(SUNRGBD_15_CATEGORIES):
+            f.write(f"{idx}: {name}\n")
+
+    # Write statistics
+    with open(os.path.join(output_base, 'dataset_info.txt'), 'w') as f:
+        f.write("SUN RGB-D 15-Category Dataset (Official Split, No Val)\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"Split: Official train/test from SUNRGBDtoolbox allsplit.mat\n")
+        f.write(f"No train/val sub-split (for k-fold CV)\n\n")
+        f.write(f"Number of classes: 15\n")
+        f.write(f"Train samples: {len(official_train_samples)}\n")
+        f.write(f"Test samples: {len(official_test_samples)}\n")
+        f.write(f"Total: {len(official_train_samples) + len(official_test_samples)}\n\n")
+
+        f.write("Class names:\n")
+        for idx, name in enumerate(SUNRGBD_15_CATEGORIES):
+            f.write(f"  {idx:2d}: {name}\n")
+
+        for split_name, split_labels in [('Train', train_labels), ('Test', test_labels)]:
+            f.write(f"\n{split_name} distribution:\n")
+            counter = Counter(split_labels)
+            for class_idx in range(15):
+                class_name = SUNRGBD_15_CATEGORIES[class_idx]
+                count = counter.get(class_idx, 0)
+                f.write(f"  {class_idx:2d} {class_name:20s}: {count:5d}\n")
+
+    print(f"\n\u2713 Dataset preprocessed successfully!")
+    print(f"Output directory: {output_base}")
+    print(f"Train: {len(official_train_samples)} samples (all official train)")
+    print(f"Test: {len(official_test_samples)} samples")
+
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="Preprocess SUN RGB-D dataset into 15 categories."
+    )
+    parser.add_argument(
+        "--no-val-split",
+        action="store_true",
+        help="Skip train/val sub-split. Output all official training samples "
+             "as a single train/ split (for k-fold CV).",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Output directory. Defaults to data/sunrgbd_15 (normal) or "
+             "data/sunrgbd_15_trainval (--no-val-split).",
+    )
+    args = parser.parse_args()
+
     # Collect all samples
     samples = collect_all_samples()
     print(f"\nFound {len(samples)} valid samples")
@@ -435,8 +551,14 @@ def main():
     # Load official split
     train_paths, test_paths = load_official_split()
 
-    # Create preprocessed dataset with 3-way split
-    create_preprocessed_dataset(samples, train_paths, test_paths)
+    if args.no_val_split:
+        output_base = args.output_dir or "data/sunrgbd_15_trainval"
+        create_trainval_dataset(samples, train_paths, test_paths, output_base=output_base)
+    else:
+        if args.output_dir:
+            global OUTPUT_BASE
+            OUTPUT_BASE = args.output_dir
+        create_preprocessed_dataset(samples, train_paths, test_paths)
 
 
 if __name__ == "__main__":
