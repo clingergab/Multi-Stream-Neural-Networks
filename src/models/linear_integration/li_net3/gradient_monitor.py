@@ -7,13 +7,22 @@ to detect pathway collapse or gradient imbalance between streams.
 Usage:
     monitor = GradientMonitor(model)
     stats = monitor.compute_pathway_stats()  # Call after loss.backward()
+
+    # For training loop integration:
+    tracker = GradientHealthTracker(model)
+    # ... after loss.backward(), before optimizer.step():
+    tracker.step()
+    # ... at epoch end:
+    summary = tracker.get_epoch_summary()
+    tracker.reset_epoch()
 """
 
 import re
+import numpy as np
 import torch
 import torch.nn as nn
 from typing import Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 
 # Optional matplotlib import for plotting
 try:
@@ -80,6 +89,11 @@ class GradientMonitor:
         """
         # Match patterns like .stream_weights.0 or .stream_weights.0.weight
         match = re.search(r'\.stream_weights\.(\d+)(?:\.|$)', param_name)
+        if match:
+            return int(match.group(1))
+
+        # Match patterns like .stream_biases.0 or .stream_biases.0.weight
+        match = re.search(r'\.stream_biases\.(\d+)(?:\.|$)', param_name)
         if match:
             return int(match.group(1))
 
@@ -441,3 +455,263 @@ class GradientLogger:
             print(f"Plot saved to {save_path}")
         else:
             plt.show()
+
+
+class GradientHealthTracker:
+    """
+    Track gradient health during training with sliding-window analysis.
+
+    Wraps GradientMonitor to provide:
+    - Per-step gradient norm recording (pre-clip norms)
+    - Health assessment: vanishing, exploding, oscillating, or healthy
+    - Epoch-level summaries for training history
+    - Total gradient norm as a byproduct (for progress bar display)
+
+    Usage in training loop:
+        tracker = GradientHealthTracker(model)
+        for epoch in range(epochs):
+            for batch in dataloader:
+                loss.backward()
+                # For AMP: scaler.unscale_(optimizer)
+                # Call BEFORE gradient clipping and optimizer.step()
+                tracker.step()
+                # clip_grad_norm_(...)
+                # optimizer.step()
+            summary = tracker.get_epoch_summary()
+            tracker.reset_epoch()
+
+    Note: NOT compatible with DataParallel or concurrent forward passes.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        window_size: int = 20,
+        vanishing_threshold: float = 1e-7,
+        exploding_threshold: float = 100.0,
+        oscillation_flip_rate: float = 0.7
+    ):
+        """
+        Initialize gradient health tracker.
+
+        Args:
+            model: The LINet model to monitor
+            window_size: Sliding window size for oscillation detection (default: 20)
+            vanishing_threshold: Per-stream norm below this is vanishing (default: 1e-7)
+            exploding_threshold: Per-stream norm above this is exploding (default: 100.0)
+            oscillation_flip_rate: Sign-flip rate above this is oscillating (default: 0.7)
+        """
+        self.model = model
+        self.num_streams = getattr(model, 'num_streams', 2)
+        self.window_size = window_size
+        self.vanishing_threshold = vanishing_threshold
+        self.exploding_threshold = exploding_threshold
+        self.oscillation_flip_rate = oscillation_flip_rate
+
+        # Pre-categorize parameters for fast iteration
+        self._param_categories = self._build_param_index()
+
+        # Per-epoch accumulators
+        self._epoch_norms = []  # List of per-step norm dicts
+        self._total_norm_history = deque(maxlen=window_size)  # For oscillation detection
+
+        # Latest stats (for progress bar)
+        self._latest_stats = None
+        self._latest_total_norm = 0.0
+
+    def _build_param_index(self) -> dict[str, list[tuple[str, torch.nn.Parameter]]]:
+        """Pre-categorize all parameters into stream/integrated/shared buckets."""
+        monitor = GradientMonitor(self.model)
+        categories = {
+            'shared': []
+        }
+        for i in range(self.num_streams):
+            categories[f'stream_{i}'] = []
+        categories['integrated'] = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            stream_idx = monitor._get_stream_index(name)
+            if stream_idx is not None and stream_idx < self.num_streams:
+                categories[f'stream_{stream_idx}'].append((name, param))
+            elif 'integrated' in name:
+                categories['integrated'].append((name, param))
+            else:
+                categories['shared'].append((name, param))
+
+        return categories
+
+    def step(self) -> dict:
+        """
+        Record current gradient statistics and return health assessment.
+
+        Call this AFTER loss.backward() + scaler.unscale_() (for AMP),
+        BEFORE gradient clipping and optimizer.step().
+        Pre-clip norms are recorded to detect actual gradient health.
+
+        Returns:
+            Dict with per-stream norms, total norm, and health status.
+        """
+        # Compute norms from pre-categorized parameters (fast path)
+        norms = {}
+        total_norm_sq = 0.0
+
+        for category, params in self._param_categories.items():
+            cat_norm_sq = 0.0
+            for _, param in params:
+                if param.grad is not None:
+                    grad_norm_sq = param.grad.norm().item() ** 2
+                    cat_norm_sq += grad_norm_sq
+            norm = cat_norm_sq ** 0.5
+            norms[category] = norm
+            total_norm_sq += cat_norm_sq
+
+        total_norm = total_norm_sq ** 0.5
+        norms['total'] = total_norm
+
+        # Store for epoch summary
+        self._epoch_norms.append(norms)
+        self._total_norm_history.append(total_norm)
+
+        # Update latest for progress bar
+        self._latest_stats = norms
+        self._latest_total_norm = total_norm
+
+        return norms
+
+    def get_latest_total_norm(self) -> float:
+        """Get the most recent total gradient norm (for progress bar display)."""
+        return self._latest_total_norm
+
+    def _assess_health(self) -> dict[str, str]:
+        """
+        Assess gradient health from accumulated history.
+
+        Returns:
+            Dict with:
+            - 'status': 'warming_up', 'healthy', 'vanishing', 'exploding', 'oscillating'
+            - 'details': Human-readable description
+            - 'per_stream': Dict of per-stream status
+        """
+        num_steps = len(self._epoch_norms)
+
+        # Cold-start: not enough history for reliable assessment
+        if num_steps < self.window_size:
+            return {
+                'status': 'warming_up',
+                'details': f'Collecting data ({num_steps}/{self.window_size} steps)',
+                'per_stream': {}
+            }
+
+        # Use the most recent window_size steps
+        recent = self._epoch_norms[-self.window_size:]
+        issues = []
+        per_stream = {}
+
+        # Check each stream
+        for i in range(self.num_streams):
+            key = f'stream_{i}'
+            stream_norms = [step[key] for step in recent]
+            mean_norm = np.mean(stream_norms)
+            max_norm = np.max(stream_norms)
+
+            if mean_norm < self.vanishing_threshold:
+                per_stream[key] = 'vanishing'
+                issues.append(f'Stream_{i} vanishing (mean norm: {mean_norm:.2e})')
+            elif max_norm > self.exploding_threshold:
+                per_stream[key] = 'exploding'
+                issues.append(f'Stream_{i} exploding (max norm: {max_norm:.2e})')
+            else:
+                per_stream[key] = 'healthy'
+
+        # Check integrated
+        int_norms = [step['integrated'] for step in recent]
+        int_mean = np.mean(int_norms)
+        int_max = np.max(int_norms)
+        if int_mean < self.vanishing_threshold:
+            per_stream['integrated'] = 'vanishing'
+            issues.append(f'Integrated vanishing (mean norm: {int_mean:.2e})')
+        elif int_max > self.exploding_threshold:
+            per_stream['integrated'] = 'exploding'
+            issues.append(f'Integrated exploding (max norm: {int_max:.2e})')
+        else:
+            per_stream['integrated'] = 'healthy'
+
+        # Check oscillation via sign-flip rate on total norm deltas
+        total_norms = list(self._total_norm_history)
+        if len(total_norms) >= self.window_size:
+            deltas = [total_norms[t] - total_norms[t - 1] for t in range(1, len(total_norms))]
+            if len(deltas) > 1:
+                sign_flips = sum(
+                    1 for t in range(1, len(deltas))
+                    if (deltas[t] > 0) != (deltas[t - 1] > 0)
+                )
+                flip_rate = sign_flips / max(len(deltas) - 1, 1)
+                if flip_rate > self.oscillation_flip_rate:
+                    issues.append(f'Total gradient oscillating (flip rate: {flip_rate:.2f})')
+
+        # Determine overall status
+        if not issues:
+            status = 'healthy'
+            details = 'All gradient pathways healthy'
+        else:
+            # Prioritize: exploding > vanishing > oscillating
+            if any('exploding' in i for i in issues):
+                status = 'exploding'
+            elif any('vanishing' in i for i in issues):
+                status = 'vanishing'
+            else:
+                status = 'oscillating'
+            details = '; '.join(issues)
+
+        return {
+            'status': status,
+            'details': details,
+            'per_stream': per_stream
+        }
+
+    def get_epoch_summary(self) -> dict:
+        """
+        Get summary statistics for the current epoch.
+
+        Returns:
+            Dict with:
+            - 'norms': Dict of mean/max/min norms per stream for this epoch
+            - 'health': Health assessment dict
+            - 'total_norm_mean': Mean total gradient norm for progress display
+            - 'num_steps': Number of gradient steps recorded
+        """
+        if not self._epoch_norms:
+            return {
+                'norms': {},
+                'health': {'status': 'no_data', 'details': 'No gradient steps recorded', 'per_stream': {}},
+                'total_norm_mean': 0.0,
+                'num_steps': 0
+            }
+
+        # Aggregate norms across all steps in this epoch
+        summary_norms = {}
+        categories = list(self._epoch_norms[0].keys())
+        for cat in categories:
+            cat_values = [step[cat] for step in self._epoch_norms]
+            summary_norms[cat] = {
+                'mean': float(np.mean(cat_values)),
+                'max': float(np.max(cat_values)),
+                'min': float(np.min(cat_values)),
+            }
+
+        health = self._assess_health()
+        total_norms = [step.get('total', 0.0) for step in self._epoch_norms]
+
+        return {
+            'norms': summary_norms,
+            'health': health,
+            'total_norm_mean': float(np.mean(total_norms)),
+            'num_steps': len(self._epoch_norms)
+        }
+
+    def reset_epoch(self):
+        """Clear per-epoch accumulators. Call at the start of each epoch."""
+        self._epoch_norms = []
+        # Note: _total_norm_history is NOT cleared -- it spans epochs for oscillation detection

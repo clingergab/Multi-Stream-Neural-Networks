@@ -76,6 +76,11 @@ class StreamMonitor:
         if match:
             return int(match.group(1))
 
+        # Match patterns like .stream_biases.0 or .stream_biases.0.weight
+        match = re.search(r'\.stream_biases\.(\d+)(?:\.|$)', param_name)
+        if match:
+            return int(match.group(1))
+
         # Match patterns like .integration_from_streams.0 or .integration_from_streams.0.weight
         match = re.search(r'\.integration_from_streams\.(\d+)(?:\.|$)', param_name)
         if match:

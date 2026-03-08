@@ -27,6 +27,7 @@ from src.models.common import (
     finalize_progress_bar,
     update_history
 )
+from src.models.linear_integration.li_net3.gradient_monitor import GradientHealthTracker
 
 # Smart tqdm import - detect environment
 if TYPE_CHECKING:
@@ -699,6 +700,26 @@ class LINet(BaseModel):
 
     # ==================== End Early Stopping Helpers ====================
 
+    # ==================== Integration Weight Tracking ====================
+
+    def _compute_integration_weight_norms(self) -> dict:
+        """Compute L2 norms of integration_from_streams weights per layer and stream."""
+        norms = {}
+        for name, param in self.named_parameters():
+            if 'integration_from_streams' in name:
+                norms[name] = param.data.norm().item()
+        return norms
+
+    def _get_integration_weight_snapshot(self) -> dict:
+        """Get a full snapshot of integration_from_streams weights (for saving to disk)."""
+        snapshot = {}
+        for name, param in self.named_parameters():
+            if 'integration_from_streams' in name:
+                snapshot[name] = param.data.cpu().clone()
+        return snapshot
+
+    # ==================== End Integration Weight Tracking ====================
+
     def fit(
         self,
         train_loader: DataLoader,
@@ -724,6 +745,13 @@ class LINet(BaseModel):
         modality_dropout_start: int = 0,  # Epoch to start modality dropout
         modality_dropout_ramp: int = 20,  # Epochs to ramp dropout from 0 to final rate
         modality_dropout_rate: float = 0.2,  # Final dropout rate (prob of blanking ANY stream per sample)
+        # Gradient monitoring parameters
+        gradient_monitoring: bool = False,  # Enable gradient health tracking during training
+        gradient_log_freq: int = 0,  # Log every N batches (0 = last batch only per epoch)
+        # Integration weight tracking parameters
+        track_integration_weights: bool = False,  # Track integration weight norms per epoch
+        integration_snapshot_path: Optional[str] = None,  # Path to save full weight snapshots
+        integration_snapshot_freq: int = 10,  # Save full snapshots every N epochs
     ) -> dict:
         """
         Train the model with optional early stopping.
@@ -763,6 +791,15 @@ class LINet(BaseModel):
             modality_dropout_start: Epoch to start modality dropout (default: 0)
             modality_dropout_ramp: Number of epochs to ramp dropout from 0% to final rate (default: 20)
             modality_dropout_rate: Final dropout probability (per-sample probability of blanking ANY stream)
+            gradient_monitoring: Enable gradient health tracking. Records pre-clip gradient norms
+                               per stream and detects vanishing/exploding/oscillating gradients.
+            gradient_log_freq: How often to log gradients. 0 = last batch only per epoch (minimal overhead),
+                             >0 = every N batches (more detailed but slower).
+            track_integration_weights: Track integration_from_streams weight norms at each epoch.
+                                     Stored in history['integration_weight_norms'].
+            integration_snapshot_path: Path to save full integration weight snapshots to disk.
+                                    If None, only lightweight norms are tracked in memory.
+            integration_snapshot_freq: Save full weight snapshots every N epochs (default: 10).
 
         Returns:
             Training history dictionary
@@ -873,6 +910,19 @@ class LINet(BaseModel):
                 history[f'stream_{i}_lr'] = []
                 history[f'stream_{i}_frozen_epoch'] = None
 
+        # Add gradient monitoring tracking (if enabled)
+        gradient_health_tracker = None
+        if gradient_monitoring:
+            gradient_health_tracker = GradientHealthTracker(self)
+            history['gradient_norms'] = []
+            history['gradient_health'] = []
+            if verbose:
+                print(f"Gradient monitoring enabled (log_freq={gradient_log_freq}, pre-clip norms)")
+
+        # Add integration weight tracking (if enabled)
+        if track_integration_weights:
+            history['integration_weight_norms'] = []
+
         # Add modality dropout tracking (if enabled)
         if modality_dropout:
             history['modality_dropout_prob'] = []
@@ -917,11 +967,17 @@ class LINet(BaseModel):
             # Create progress bar for the entire epoch
             pbar = create_progress_bar(verbose, epoch, epochs, total_steps)
 
+            # Reset gradient health tracker for this epoch
+            if gradient_health_tracker is not None:
+                gradient_health_tracker.reset_epoch()
+
             # Training phase - use helper method
             avg_train_loss, train_accuracy, stream_train_accs = self._train_epoch(
                 train_loader, history, pbar, gradient_accumulation_steps, grad_clip_norm, clear_cache_per_epoch,
                 stream_monitoring=stream_monitoring, aux_optimizer=aux_optimizer,
-                modality_dropout_prob=modality_dropout_prob
+                modality_dropout_prob=modality_dropout_prob,
+                gradient_health_tracker=gradient_health_tracker,
+                gradient_log_freq=gradient_log_freq
             )
 
             # Validation phase
@@ -1047,6 +1103,30 @@ class LINet(BaseModel):
                         stream_stats[f'stream_{i}_train_acc'] = stream_train_accs[i]
                         stream_stats[f'stream_{i}_val_acc'] = stream_val_accs[i]
                         stream_stats[f'stream_{i}_val_loss'] = stream_val_losses[i]
+
+            # Gradient monitoring epoch summary
+            if gradient_health_tracker is not None:
+                epoch_grad_summary = gradient_health_tracker.get_epoch_summary()
+                history['gradient_norms'].append(epoch_grad_summary['norms'])
+                history['gradient_health'].append(epoch_grad_summary['health'])
+
+                # Print warnings if unhealthy
+                health_status = epoch_grad_summary['health']['status']
+                if health_status not in ('healthy', 'warming_up', 'no_data') and verbose:
+                    print(f"  WARNING: Gradient health: {epoch_grad_summary['health']['details']}")
+
+            # Track integration weight norms
+            if track_integration_weights:
+                epoch_int_norms = self._compute_integration_weight_norms()
+                history['integration_weight_norms'].append(epoch_int_norms)
+
+                # Save full snapshots to disk at configured intervals
+                if integration_snapshot_path and (epoch + 1) % integration_snapshot_freq == 0:
+                    snapshot = self._get_integration_weight_snapshot()
+                    snapshot_file = f"{integration_snapshot_path}/epoch_{epoch + 1}_integration_weights.pt"
+                    torch.save(snapshot, snapshot_file)
+                    if verbose:
+                        print(f"  Saved integration weight snapshot: {snapshot_file}")
 
             # Print modality dropout epoch summary (after stream monitoring, before early stopping)
             if modality_dropout and '_dropout_epoch_stats' in history and history['_dropout_epoch_stats']:
@@ -1286,7 +1366,9 @@ class LINet(BaseModel):
                      gradient_accumulation_steps: int = 1, grad_clip_norm: Optional[float] = None,
                      clear_cache_per_epoch: bool = False, stream_monitoring: bool = False,
                      aux_optimizer: Optional[torch.optim.Optimizer] = None,
-                     modality_dropout_prob: float = 0.0) -> tuple:
+                     modality_dropout_prob: float = 0.0,
+                     gradient_health_tracker: Optional[GradientHealthTracker] = None,
+                     gradient_log_freq: int = 0) -> tuple:
         """
         Train the model for one epoch with GPU optimizations and gradient accumulation.
 
@@ -1316,6 +1398,9 @@ class LINet(BaseModel):
         # Per-stream active sample counters (accounts for modality dropout)
         stream_train_correct = [0] * self.num_streams
         stream_train_active = [0] * self.num_streams
+        # Per-stream auxiliary loss tracking (for loss decomposition)
+        stream_train_loss = [0.0] * self.num_streams
+        stream_train_loss_count = [0] * self.num_streams
 
         # Modality dropout statistics tracking (epoch-level accumulators)
         dropout_stats = {
@@ -1386,9 +1471,20 @@ class LINet(BaseModel):
 
                 # OPTIMIZATION 5: Only step optimizer every accumulation_steps
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx == len(train_loader) - 1:
+                    # Unscale gradients for clipping and/or monitoring
+                    # Must unscale before reading gradient values
+                    if grad_clip_norm is not None or gradient_health_tracker is not None:
+                        self.scaler.unscale_(self.optimizer)
+
+                    # Gradient health monitoring (pre-clip norms)
+                    if gradient_health_tracker is not None:
+                        _should_log = (gradient_log_freq == 0 and batch_idx == len(train_loader) - 1) or \
+                                      (gradient_log_freq > 0 and batch_idx % gradient_log_freq == 0)
+                        if _should_log:
+                            gradient_health_tracker.step()
+
                     # Gradient clipping (if enabled)
                     if grad_clip_norm is not None:
-                        self.scaler.unscale_(self.optimizer)
                         clip_grad_norm_(self.parameters(), grad_clip_norm)
 
                     self.scaler.step(self.optimizer)
@@ -1414,6 +1510,13 @@ class LINet(BaseModel):
 
                 # OPTIMIZATION 5: Only step optimizer every accumulation_steps
                 if (batch_idx + 1) % gradient_accumulation_steps == 0 or batch_idx == len(train_loader) - 1:
+                    # Gradient health monitoring (pre-clip norms)
+                    if gradient_health_tracker is not None:
+                        _should_log = (gradient_log_freq == 0 and batch_idx == len(train_loader) - 1) or \
+                                      (gradient_log_freq > 0 and batch_idx % gradient_log_freq == 0)
+                        if _should_log:
+                            gradient_health_tracker.step()
+
                     # Gradient clipping (if enabled)
                     if grad_clip_norm is not None:
                         clip_grad_norm_(self.parameters(), grad_clip_norm)
@@ -1470,11 +1573,17 @@ class LINet(BaseModel):
                         if len(active_idx) > 0:
                             aux_loss = self.criterion(stream_outputs[active_idx], targets[active_idx])
                             aux_losses.append(aux_loss)
+                            # Track per-stream loss for decomposition
+                            stream_train_loss[i] += aux_loss.item()
+                            stream_train_loss_count[i] += 1
                         # If all samples blanked for this stream, skip this stream's aux loss
                     else:
                         # No blanking - use all samples
                         aux_loss = self.criterion(stream_outputs, targets)
                         aux_losses.append(aux_loss)
+                        # Track per-stream loss for decomposition
+                        stream_train_loss[i] += aux_loss.item()
+                        stream_train_loss_count[i] += 1
 
                 # Restore training mode for auxiliary classifier backward pass
                 # (fc_streams don't have BN, so this is safe)
@@ -1551,6 +1660,12 @@ class LINet(BaseModel):
                 # Add lr (scientific notation for small LRs)
                 postfix['lr'] = f'{current_lr:.2e}'
 
+                # Add gradient norm if monitoring (byproduct of existing pass, no extra computation)
+                if gradient_health_tracker is not None:
+                    grad_norm = gradient_health_tracker.get_latest_total_norm()
+                    if grad_norm > 0:
+                        postfix['grad'] = f'{grad_norm:.2e}'
+
                 # Add dropout stats if active (after lr so lr appears first)
                 if dropout_stats is not None and dropout_stats['total_samples'] > 0:
                     pct_blanked = 100 * dropout_stats['total_blanked'] / dropout_stats['total_samples']
@@ -1576,6 +1691,15 @@ class LINet(BaseModel):
             stream_train_correct[i] / max(stream_train_active[i], 1) if stream_monitoring else 0.0
             for i in range(self.num_streams)
         ]
+
+        # Store per-stream training losses in history (loss decomposition)
+        if stream_monitoring:
+            for i in range(self.num_streams):
+                key = f'stream_{i}_train_loss'
+                if key not in history:
+                    history[key] = []
+                avg_stream_loss = stream_train_loss[i] / max(stream_train_loss_count[i], 1)
+                history[key].append(avg_stream_loss)
 
         # End-of-epoch modality dropout summary - store in history for analysis
         # Note: Printing is done by fit() after the progress bar closes to avoid output interference

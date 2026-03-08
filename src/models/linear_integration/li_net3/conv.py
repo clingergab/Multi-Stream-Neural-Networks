@@ -226,6 +226,13 @@ class _LIConvNd(nn.Module):
             for i in range(num_streams)
         ])
 
+        # Contribution capture flag for stream decomposition visualization.
+        # When True, _conv_forward stores per-stream contributions to integrated output.
+        # NOT compatible with DataParallel or concurrent forward passes.
+        # Use only for single-threaded visualization in eval mode.
+        self._capture_contributions = False
+        self._last_contributions = None
+
         self.reset_parameters()
     
     def reset_parameters(self) -> None:
@@ -420,17 +427,30 @@ class LIConv2d(_LIConvNd):
         # Key difference from Original: Use stream_outputs_raw (without bias) instead of stream_outputs (with bias)
         # Use sequential addition (not sum()) to match Original's floating-point behavior
         integrated_out = integrated_from_prev
+
+        if self._capture_contributions:
+            contributions = {
+                'integrated_from_prev': integrated_from_prev.detach().cpu() if isinstance(integrated_from_prev, Tensor) else integrated_from_prev,
+                'stream_contributions': [],
+            }
+
         for stream_out_raw, integration_weight in zip(stream_outputs_raw, integration_from_streams_weights):
             integrated_contrib = F.conv2d(
                 stream_out_raw, integration_weight, None,  # Integrate RAW dendritic signals
                 stride=1, padding=0  # 1x1 conv, stride=1 (already spatially aligned)
             )
             integrated_out = integrated_out + integrated_contrib
+            if self._capture_contributions:
+                contributions['stream_contributions'].append(integrated_contrib.detach().cpu())
 
         # Add integrated bias (soma's firing threshold)
         # This is the ONLY bias for integration, representing the membrane potential threshold
         if integrated_bias is not None:
             integrated_out = integrated_out + integrated_bias.view(1, -1, 1, 1)
+
+        if self._capture_contributions:
+            contributions['integrated_bias'] = integrated_bias.detach().cpu() if integrated_bias is not None else None
+            self._last_contributions = contributions
 
         return stream_outputs, integrated_out
     
