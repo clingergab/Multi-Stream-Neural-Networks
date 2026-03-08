@@ -401,6 +401,39 @@ class StreamContributionVisualizer:
         return results
 
     @torch.no_grad()
+    def compute(
+        self,
+        stream_inputs: list[torch.Tensor],
+        layer: str = "layer4",
+        aggregation: str = "l2",
+    ) -> Optional[dict]:
+        """Compute per-stream contribution maps without plotting.
+
+        Args:
+            stream_inputs: list of [1, C, H, W] tensors.
+            layer: target layer name.
+            aggregation: 'l2', 'mean', or 'max' across channels.
+
+        Returns:
+            dict with 'stream_contributions' (list of [H, W] numpy arrays),
+            'dominance_map', and 'entropy_map', or None if no contributions captured.
+        """
+        self.model.eval()
+        inputs = [s.to(self.device) for s in stream_inputs]
+
+        self._enable_capture(layer)
+        self.model(inputs)
+        contribs = self._collect_contributions(layer)
+        self._disable_capture()
+
+        if not contribs:
+            print(f"No contributions captured at layer '{layer}'.")
+            return None
+
+        last = contribs[-1]
+        return self._compute_contribution_maps(last, aggregation)
+
+    @torch.no_grad()
     def visualize(
         self,
         stream_inputs: list[torch.Tensor],
@@ -418,23 +451,13 @@ class StreamContributionVisualizer:
 
         Returns:
             dict with 'stream_contributions' (list of [H, W] numpy arrays),
-            'integrated_from_prev' ([H, W] or scalar), and 'dominance_map'.
+            'dominance_map', and 'entropy_map'.
         """
-        self.model.eval()
-        inputs = [s.to(self.device) for s in stream_inputs]
-
-        self._enable_capture(layer)
-        self.model(inputs)
-        contribs = self._collect_contributions(layer)
-        self._disable_capture()
-
-        if not contribs:
-            print(f"No contributions captured at layer '{layer}'.")
+        result = self.compute(stream_inputs, layer, aggregation)
+        if result is None:
             return None
-
-        # Use last conv in the layer (deepest)
-        last = contribs[-1]
-        return self._plot_contributions(last, aggregation, layer, save_path)
+        self._plot_contribution_maps(result, aggregation, layer, save_path)
+        return result
 
     @torch.no_grad()
     def visualize_batch(
@@ -491,13 +514,15 @@ class StreamContributionVisualizer:
             print("No samples matched criteria.")
             return None
 
-        # Build a fake single-sample contrib dict for plotting
+        # Build a fake single-sample contrib dict for computation
         fake_last = {
             "stream_contributions": [rc.unsqueeze(0) for rc in running_contribs],
             "integrated_from_prev": 0,
             "name": f"{layer} (batch avg, n={count})",
         }
-        return self._plot_contributions(fake_last, aggregation, layer, save_path)
+        result = self._compute_contribution_maps(fake_last, aggregation)
+        self._plot_contribution_maps(result, aggregation, layer, save_path)
+        return result
 
     def sanity_check(self, stream_inputs: list[torch.Tensor], layer: str = "layer4") -> float:
         """Verify sum(contributions) + bias ≈ integrated_output. Returns max abs error."""
@@ -569,25 +594,34 @@ class StreamContributionVisualizer:
             return tensor.max(dim=0)[0].numpy()
         raise ValueError(f"Unknown aggregation: {method}")
 
-    def _plot_contributions(self, contrib_dict: dict, aggregation: str,
-                            layer: str, save_path: Optional[str]) -> dict:
-        """Plot per-stream contribution maps and dominance map."""
+    def _compute_contribution_maps(self, contrib_dict: dict, aggregation: str) -> dict:
+        """Compute per-stream contribution maps, dominance, and entropy from raw contributions."""
         stream_maps = []
         for si in range(self.num_streams):
             hmap = self._aggregate_channels(contrib_dict["stream_contributions"][si], aggregation)
             stream_maps.append(hmap)
 
-        # Dominance map
         stacked = np.stack(stream_maps, axis=0)  # [N, H, W]
         winner = np.argmax(stacked, axis=0)  # [H, W]
 
-        # Entropy map
         eps = 1e-8
         total = stacked.sum(axis=0, keepdims=True) + eps
         probs = stacked / total
         entropy = -(probs * np.log(probs + eps)).sum(axis=0)
 
-        # Plot
+        return {
+            "stream_contributions": stream_maps,
+            "dominance_map": winner,
+            "entropy_map": entropy,
+        }
+
+    def _plot_contribution_maps(self, result: dict, aggregation: str,
+                                layer: str, save_path: Optional[str]) -> None:
+        """Plot pre-computed contribution maps."""
+        stream_maps = result["stream_contributions"]
+        winner = result["dominance_map"]
+        entropy = result["entropy_map"]
+
         ncols = self.num_streams + 2  # streams + winner + entropy
         fig, axes = plt.subplots(1, ncols, figsize=(ncols * 3, 3))
         fig.suptitle(f"Stream contributions @ {layer} ({aggregation})", fontsize=12)
@@ -597,7 +631,6 @@ class StreamContributionVisualizer:
             axes[si].set_title(self.labels[si], fontsize=9)
             axes[si].axis("off")
 
-        # Winner-takes-all with distinct colors
         cmap = plt.cm.get_cmap("tab10", self.num_streams)
         axes[-2].imshow(winner, cmap=cmap, vmin=0, vmax=self.num_streams - 1)
         axes[-2].set_title("Dominance", fontsize=9)
@@ -609,8 +642,11 @@ class StreamContributionVisualizer:
 
         # Barycentric coloring for 3 streams
         if self.num_streams == 3:
+            stacked = np.stack(stream_maps, axis=0)
+            eps = 1e-8
+            total = stacked.sum(axis=0, keepdims=True) + eps
+            normalized = stacked / total
             fig2, ax2 = plt.subplots(1, 1, figsize=(4, 4))
-            normalized = stacked / (total + eps)
             rgb_map = np.stack([
                 _percentile_normalize(normalized[0]),
                 _percentile_normalize(normalized[1]),
@@ -624,18 +660,10 @@ class StreamContributionVisualizer:
                 bary_path = save_path.rsplit(".", 1)
                 bary_path = f"{bary_path[0]}_barycentric.{bary_path[1]}" if len(bary_path) == 2 else save_path + "_barycentric"
                 fig2.savefig(bary_path, dpi=150, bbox_inches="tight")
-                plt.close(fig2)
-            else:
-                plt.show()
+            plt.show()
 
         plt.tight_layout()
         _save_or_show(fig, save_path)
-
-        return {
-            "stream_contributions": stream_maps,
-            "dominance_map": winner,
-            "entropy_map": entropy,
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -718,7 +746,7 @@ class StreamGradCAM:
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
-    def _gradcam_integrated(self, stream_inputs, layer, target_class, overlay_input, save_path):
+    def _gradcam_integrated(self, stream_inputs, layer, target_class, overlay_input, save_path, _plot=True):
         """Standard Grad-CAM on integrated stream."""
         inputs = [s.to(self.device) for s in stream_inputs]
         activations = {}
@@ -758,8 +786,9 @@ class StreamGradCAM:
         bwd_h.remove()
 
         heatmap = self._compute_heatmap(activations.get("val"), gradients.get("val"))
-        self._plot_gradcam(heatmap, f"Integrated Grad-CAM @ {layer} (class {target_class})",
-                           overlay_input, save_path)
+        if _plot:
+            self._plot_gradcam(heatmap, f"Integrated Grad-CAM @ {layer} (class {target_class})",
+                               overlay_input, save_path)
         return heatmap
 
     def _gradcam_stream(self, stream_inputs, stream_idx, layer, target_class, overlay_input, save_path):
@@ -808,11 +837,11 @@ class StreamGradCAM:
 
     def _gradcam_decomposed(self, stream_inputs, layer, target_class, overlay_input, save_path):
         """Decomposed Grad-CAM: stream contributions weighted by integrated Grad-CAM."""
-        # Get integrated Grad-CAM
-        int_heatmap = self._gradcam_integrated(stream_inputs, layer, target_class, None, None)
+        # Get integrated Grad-CAM (no intermediate plot)
+        int_heatmap = self._gradcam_integrated(stream_inputs, layer, target_class, None, None, _plot=False)
 
-        # Get stream contributions
-        contrib_result = self._contrib_viz.visualize(stream_inputs, layer, save_path=None)
+        # Get stream contributions (no intermediate plot)
+        contrib_result = self._contrib_viz.compute(stream_inputs, layer)
         if contrib_result is None:
             return None
 
@@ -1092,14 +1121,14 @@ def compare_samples(
         true_label = sample.get("true_label", "?")
         pred_label = sample.get("predicted_label", true_label)
 
-        # Integrated Grad-CAM
-        heatmap = gradcam._gradcam_integrated(inputs, layer, None, None, None)
+        # Integrated Grad-CAM (no intermediate plot)
+        heatmap = gradcam._gradcam_integrated(inputs, layer, None, None, None, _plot=False)
         axes[row, 0].imshow(heatmap, cmap="jet")
         axes[row, 0].set_title(f"Grad-CAM\ntrue={true_label} pred={pred_label}", fontsize=8)
         axes[row, 0].axis("off")
 
-        # Stream contributions
-        contrib_result = contrib.visualize(inputs, layer, save_path=None)
+        # Stream contributions (compute only, no intermediate plot)
+        contrib_result = contrib.compute(inputs, layer)
         if contrib_result is not None:
             for si in range(num_streams):
                 axes[row, si + 1].imshow(

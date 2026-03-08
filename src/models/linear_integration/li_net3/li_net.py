@@ -328,6 +328,54 @@ class LINet(BaseModel):
         logits = self.fc(integrated_features)
         return logits
 
+    # ==================== Stream Balance Loss ====================
+
+    def _enable_balance_capture(self, target_layer: str = 'layer4'):
+        """Enable balance norm capture on all LIConv2d modules in the target layer."""
+        layer = getattr(self, target_layer)
+        for m in layer.modules():
+            if isinstance(m, _conv_module.LIConv2d):
+                m._capture_balance_norms = True
+
+    def _disable_balance_capture(self, target_layer: str = 'layer4'):
+        """Disable balance norm capture and clear stored norms."""
+        layer = getattr(self, target_layer)
+        for m in layer.modules():
+            if isinstance(m, _conv_module.LIConv2d):
+                m._capture_balance_norms = False
+                m._last_balance_norms = None
+
+    def compute_stream_balance_loss(self, target_layer: str = 'layer4') -> Tensor:
+        """Compute stream balance penalty from captured contribution norms.
+
+        Call AFTER forward pass with balance capture enabled. Penalizes imbalance
+        between stream contribution norms at the target layer.
+
+        Formula: variance of log-norms across streams, averaged over all LIConv2d
+        modules in the target layer. This is symmetric (penalizes any stream
+        dominating) and scale-invariant (operates on ratios, not absolute magnitudes).
+
+        Args:
+            target_layer: Which layer to compute balance at (default: 'layer4')
+
+        Returns:
+            Scalar loss tensor with gradients attached.
+        """
+        layer = getattr(self, target_layer)
+        balance_losses = []
+        eps = 1e-8
+
+        for m in layer.modules():
+            if isinstance(m, _conv_module.LIConv2d) and m._last_balance_norms is not None:
+                norms = m._last_balance_norms  # list of N scalar tensors
+                log_norms = torch.stack([torch.log(n + eps) for n in norms])
+                balance_losses.append(log_norms.var())
+
+        if not balance_losses:
+            return torch.tensor(0.0, device=self.device)
+
+        return torch.stack(balance_losses).mean()
+
     # ==================== Configuration Validation ====================
 
     def _validate_augmentation_config(self, train_loader: DataLoader, verbose: bool) -> None:
@@ -743,6 +791,9 @@ class LINet(BaseModel):
         modality_dropout_start: int = 0,  # Epoch to start modality dropout
         modality_dropout_ramp: int = 20,  # Epochs to ramp dropout from 0 to final rate
         modality_dropout_rate: float = 0.2,  # Final dropout rate (prob of blanking ANY stream per sample)
+        # Stream balance loss parameters
+        stream_balance_weight: float = 0.0,  # Weight for stream balance penalty (0 = disabled)
+        stream_balance_layer: str = 'layer4',  # Layer to compute balance at
         # Gradient monitoring parameters
         gradient_monitoring: bool = False,  # Enable gradient health tracking during training
         gradient_log_freq: int = 0,  # Log every N batches (0 = last batch only per epoch)
@@ -886,6 +937,12 @@ class LINet(BaseModel):
                     weight_decay=main_group.get('weight_decay', 0)
                 )
 
+        # Auxiliary criterion: CrossEntropyLoss WITHOUT label smoothing.
+        # Auxiliary classifiers are monitoring tools — hard targets give accurate
+        # stream discriminability measurements. Label smoothing would systematically
+        # understate each stream's capability.
+        self.aux_criterion = nn.CrossEntropyLoss()
+
         # Best model tracking
         best_val_acc = 0.0
         # When no val set, track best train loss for save_path and restore_best_weights
@@ -920,6 +977,12 @@ class LINet(BaseModel):
             history['gradient_health'] = []
             if verbose:
                 print(f"Gradient monitoring enabled (log_freq={gradient_log_freq}, pre-clip norms)")
+
+        # Add stream balance loss tracking (if enabled)
+        if stream_balance_weight > 0:
+            history['stream_balance_loss'] = []
+            if verbose:
+                print(f"Stream balance loss enabled (weight={stream_balance_weight}, layer={stream_balance_layer})")
 
         # Add integration weight tracking (if enabled)
         if track_integration_weights:
@@ -979,7 +1042,9 @@ class LINet(BaseModel):
                 stream_monitoring=stream_monitoring, aux_optimizer=aux_optimizer,
                 modality_dropout_prob=modality_dropout_prob,
                 gradient_health_tracker=gradient_health_tracker,
-                gradient_log_freq=gradient_log_freq
+                gradient_log_freq=gradient_log_freq,
+                stream_balance_weight=stream_balance_weight,
+                stream_balance_layer=stream_balance_layer
             )
 
             # Validation phase
@@ -1407,7 +1472,9 @@ class LINet(BaseModel):
                      aux_optimizer: Optional[torch.optim.Optimizer] = None,
                      modality_dropout_prob: float = 0.0,
                      gradient_health_tracker: Optional[GradientHealthTracker] = None,
-                     gradient_log_freq: int = 0) -> tuple:
+                     gradient_log_freq: int = 0,
+                     stream_balance_weight: float = 0.0,
+                     stream_balance_layer: str = 'layer4') -> tuple:
         """
         Train the model for one epoch with GPU optimizations and gradient accumulation.
 
@@ -1440,6 +1507,13 @@ class LINet(BaseModel):
         # Per-stream auxiliary loss tracking (for loss decomposition)
         stream_train_loss = [0.0] * self.num_streams
         stream_train_loss_count = [0] * self.num_streams
+
+        # Stream balance loss tracking
+        balance_loss_accum = 0.0
+        balance_loss_count = 0
+        use_balance_loss = stream_balance_weight > 0
+        if use_balance_loss:
+            self._enable_balance_capture(stream_balance_layer)
 
         # Modality dropout statistics tracking (epoch-level accumulators)
         dropout_stats = {
@@ -1501,9 +1575,17 @@ class LINet(BaseModel):
                 with autocast(device_type=self.device.type):
                     outputs = self(stream_batches, blanked_mask=blanked_mask)
                     loss = self.criterion(outputs, targets)
-                    # Scale loss for gradient accumulation
-                    if gradient_accumulation_steps > 1:
-                        loss = loss / gradient_accumulation_steps
+
+                # Stream balance penalty (computed in FP32, outside autocast)
+                if use_balance_loss:
+                    bal_loss = self.compute_stream_balance_loss(stream_balance_layer)
+                    loss = loss + stream_balance_weight * bal_loss
+                    balance_loss_accum += bal_loss.item()
+                    balance_loss_count += 1
+
+                # Scale loss for gradient accumulation
+                if gradient_accumulation_steps > 1:
+                    loss = loss / gradient_accumulation_steps
 
                 # Scale loss and backward pass
                 self.scaler.scale(loss).backward()
@@ -1542,6 +1624,14 @@ class LINet(BaseModel):
                 # Standard precision training
                 outputs = self(stream_batches, blanked_mask=blanked_mask)
                 loss = self.criterion(outputs, targets)
+
+                # Stream balance penalty
+                if use_balance_loss:
+                    bal_loss = self.compute_stream_balance_loss(stream_balance_layer)
+                    loss = loss + stream_balance_weight * bal_loss
+                    balance_loss_accum += bal_loss.item()
+                    balance_loss_count += 1
+
                 # Scale loss for gradient accumulation
                 if gradient_accumulation_steps > 1:
                     loss = loss / gradient_accumulation_steps
@@ -1606,11 +1696,12 @@ class LINet(BaseModel):
                     stream_outputs = self.fc_streams[i](stream_features_detached)
 
                     # Compute auxiliary loss ONLY for non-blanked samples
+                    # Uses aux_criterion (no label smoothing) for accurate stream monitoring
                     if stream_blanked is not None and stream_blanked.any():
                         # Get indices of active (non-blanked) samples
                         active_idx = (~stream_blanked).nonzero(as_tuple=True)[0]
                         if len(active_idx) > 0:
-                            aux_loss = self.criterion(stream_outputs[active_idx], targets[active_idx])
+                            aux_loss = self.aux_criterion(stream_outputs[active_idx], targets[active_idx])
                             aux_losses.append(aux_loss)
                             # Track per-stream loss for decomposition
                             stream_train_loss[i] += aux_loss.item()
@@ -1618,7 +1709,7 @@ class LINet(BaseModel):
                         # If all samples blanked for this stream, skip this stream's aux loss
                     else:
                         # No blanking - use all samples
-                        aux_loss = self.criterion(stream_outputs, targets)
+                        aux_loss = self.aux_criterion(stream_outputs, targets)
                         aux_losses.append(aux_loss)
                         # Track per-stream loss for decomposition
                         stream_train_loss[i] += aux_loss.item()
@@ -1705,6 +1796,10 @@ class LINet(BaseModel):
                     if grad_norm > 0:
                         postfix['grad'] = f'{grad_norm:.2e}'
 
+                # Add stream balance loss if active
+                if use_balance_loss and balance_loss_count > 0:
+                    postfix['bal'] = f'{balance_loss_accum / balance_loss_count:.2e}'
+
                 # Add dropout stats if active (after lr so lr appears first)
                 if dropout_stats is not None and dropout_stats['total_samples'] > 0:
                     pct_blanked = 100 * dropout_stats['total_blanked'] / dropout_stats['total_samples']
@@ -1759,6 +1854,15 @@ class LINet(BaseModel):
                 'blanked_per_stream': dropout_stats['blanked_per_stream'].copy(),
                 'pct_per_stream': stream_pcts
             })
+
+        # Stream balance loss: disable capture and record epoch average
+        if use_balance_loss:
+            self._disable_balance_capture(stream_balance_layer)
+            if balance_loss_count > 0:
+                avg_balance = balance_loss_accum / balance_loss_count
+                if 'stream_balance_loss' not in history:
+                    history['stream_balance_loss'] = []
+                history['stream_balance_loss'].append(avg_balance)
 
         # Optional: Clear CUDA cache at end of epoch (only if experiencing OOM issues)
         # if clear_cache_per_epoch and self.device.type == 'cuda':
@@ -1850,8 +1954,9 @@ class LINet(BaseModel):
                         # Classify with auxiliary classifier
                         stream_outputs = self.fc_streams[i](stream_features)
 
-                        # Calculate stream loss
-                        loss_i = self.criterion(stream_outputs, targets)
+                        # Calculate stream loss (no label smoothing for auxiliary classifiers)
+                        aux_crit = getattr(self, 'aux_criterion', self.criterion)
+                        loss_i = aux_crit(stream_outputs, targets)
                         stream_val_loss[i] += loss_i.item() * targets.size(0)
 
                         # Calculate stream accuracy
@@ -2115,7 +2220,8 @@ class LINet(BaseModel):
                     stream_features = self._forward_stream_pathway(i, stream_batches[i])
                     stream_feature_norms[i].append(torch.norm(stream_features, dim=1).cpu())
                     stream_outputs = self.fc_streams[i](stream_features)  # Auxiliary classifier!
-                    stream_loss = self.criterion(stream_outputs, targets_batch)
+                    aux_crit = getattr(self, 'aux_criterion', self.criterion)
+                    stream_loss = aux_crit(stream_outputs, targets_batch)
                     stream_only_losses[i] += stream_loss.item() * batch_size_actual
 
                     _, stream_predicted = torch.max(stream_outputs, 1)

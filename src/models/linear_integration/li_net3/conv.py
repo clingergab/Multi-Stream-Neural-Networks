@@ -233,6 +233,11 @@ class _LIConvNd(nn.Module):
         self._capture_contributions = False
         self._last_contributions = None
 
+        # Stream balance loss: keeps per-stream contribution L2 norms on-device with grad.
+        # Enabled during training when stream_balance_weight > 0.
+        self._capture_balance_norms = False
+        self._last_balance_norms = None
+
         self.reset_parameters()
     
     def reset_parameters(self) -> None:
@@ -434,6 +439,8 @@ class LIConv2d(_LIConvNd):
                 'stream_contributions': [],
             }
 
+        balance_norms = [] if self._capture_balance_norms else None
+
         for stream_out_raw, integration_weight in zip(stream_outputs_raw, integration_from_streams_weights):
             integrated_contrib = F.conv2d(
                 stream_out_raw, integration_weight, None,  # Integrate RAW dendritic signals
@@ -442,6 +449,8 @@ class LIConv2d(_LIConvNd):
             integrated_out = integrated_out + integrated_contrib
             if self._capture_contributions:
                 contributions['stream_contributions'].append(integrated_contrib.detach().cpu())
+            if balance_norms is not None:
+                balance_norms.append(integrated_contrib.norm())
 
         # Add integrated bias (soma's firing threshold)
         # This is the ONLY bias for integration, representing the membrane potential threshold
@@ -451,6 +460,9 @@ class LIConv2d(_LIConvNd):
         if self._capture_contributions:
             contributions['integrated_bias'] = integrated_bias.detach().cpu() if integrated_bias is not None else None
             self._last_contributions = contributions
+
+        if balance_norms is not None:
+            self._last_balance_norms = balance_norms
 
         return stream_outputs, integrated_out
     
