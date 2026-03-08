@@ -511,9 +511,12 @@ class GradientHealthTracker:
         # Pre-categorize parameters for fast iteration
         self._param_categories = self._build_param_index()
 
-        # Per-epoch accumulators
+        # Per-epoch accumulators (cleared each epoch via reset_epoch)
         self._epoch_norms = []  # List of per-step norm dicts
+
+        # Cross-epoch history (spans entire training, for health assessment)
         self._total_norm_history = deque(maxlen=window_size)  # For oscillation detection
+        self._epoch_mean_norms = deque(maxlen=window_size)  # Per-epoch mean norms (dicts)
 
         # Latest stats (for progress bar)
         self._latest_stats = None
@@ -594,25 +597,25 @@ class GradientHealthTracker:
             - 'details': Human-readable description
             - 'per_stream': Dict of per-stream status
         """
-        num_steps = len(self._epoch_norms)
+        num_epochs = len(self._epoch_mean_norms)
 
-        # Cold-start: not enough history for reliable assessment
-        if num_steps < self.window_size:
+        # Cold-start: not enough cross-epoch history for reliable assessment
+        if num_epochs < self.window_size:
             return {
                 'status': 'warming_up',
-                'details': f'Collecting data ({num_steps}/{self.window_size} steps)',
+                'details': f'Collecting data ({num_epochs}/{self.window_size} epochs)',
                 'per_stream': {}
             }
 
-        # Use the most recent window_size steps
-        recent = self._epoch_norms[-self.window_size:]
+        # Use the most recent window_size epoch means
+        recent = list(self._epoch_mean_norms)[-self.window_size:]
         issues = []
         per_stream = {}
 
         # Check each stream
         for i in range(self.num_streams):
             key = f'stream_{i}'
-            stream_norms = [step[key] for step in recent]
+            stream_norms = [step.get(key, 0) for step in recent]
             mean_norm = np.mean(stream_norms)
             max_norm = np.max(stream_norms)
 
@@ -626,7 +629,7 @@ class GradientHealthTracker:
                 per_stream[key] = 'healthy'
 
         # Check integrated
-        int_norms = [step['integrated'] for step in recent]
+        int_norms = [step.get('integrated', 0) for step in recent]
         int_mean = np.mean(int_norms)
         int_max = np.max(int_norms)
         if int_mean < self.vanishing_threshold:
@@ -700,6 +703,10 @@ class GradientHealthTracker:
                 'max': float(np.max(cat_values)),
                 'min': float(np.min(cat_values)),
             }
+
+        # Store epoch means in cross-epoch history (for health assessment)
+        epoch_means = {cat: summary_norms[cat]['mean'] for cat in summary_norms}
+        self._epoch_mean_norms.append(epoch_means)
 
         health = self._assess_health()
         total_norms = [step.get('total', 0.0) for step in self._epoch_norms]

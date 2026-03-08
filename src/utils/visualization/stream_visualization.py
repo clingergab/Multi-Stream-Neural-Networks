@@ -67,9 +67,7 @@ def _topk_channels(activation: torch.Tensor, k: int, mode: str = "l2") -> list[i
 def _save_or_show(fig: plt.Figure, save_path: Optional[str] = None) -> None:
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-    else:
-        plt.show()
+    plt.show()
 
 
 # ---------------------------------------------------------------------------
@@ -737,7 +735,9 @@ class StreamGradCAM:
 
         def bwd_hook(mod, grad_in, grad_out):
             if isinstance(grad_out, tuple):
-                gradients["val"] = grad_out[0].detach() if grad_out[0] is not None else None
+                # For LISequential returning (list[Tensor], Tensor),
+                # grad_out[1] is the gradient for the integrated output
+                gradients["val"] = grad_out[1].detach() if grad_out[1] is not None else None
             else:
                 gradients["val"] = grad_out.detach()
 

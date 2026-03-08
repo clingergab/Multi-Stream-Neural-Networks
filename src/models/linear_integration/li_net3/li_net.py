@@ -886,8 +886,12 @@ class LINet(BaseModel):
                     weight_decay=main_group.get('weight_decay', 0)
                 )
 
-        # Legacy best model saving (preserve existing functionality)
+        # Best model tracking
         best_val_acc = 0.0
+        # When no val set, track best train loss for save_path and restore_best_weights
+        best_train_loss = float('inf')
+        best_train_loss_weights = None
+        best_train_loss_epoch = 0
 
         # Initialize training history
         history = {
@@ -988,8 +992,8 @@ class LINet(BaseModel):
                 val_loss, val_acc, stream_val_accs, stream_val_losses = self._validate(
                     val_loader, pbar=pbar, stream_monitoring=stream_monitoring
                 )
-                
-                # Legacy save best model (preserve existing functionality)
+
+                # Save best model by val accuracy
                 if save_path and val_acc > best_val_acc:
                     best_val_acc = val_acc
                     save_checkpoint(
@@ -999,7 +1003,7 @@ class LINet(BaseModel):
                         path=save_path,
                         history=history
                     )
-                
+
                 # Check for early stopping
                 if early_stopping_state['enabled']:
 
@@ -1042,7 +1046,24 @@ class LINet(BaseModel):
                                 self._restore_checkpoint(early_stopping_state['best_weights'], verbose,
                                                         stream_early_stopping_state)
                             break
-            
+            else:
+                # No val set: track best train loss for checkpoint saving and weight restoration
+                if avg_train_loss < best_train_loss:
+                    best_train_loss = avg_train_loss
+                    best_train_loss_epoch = epoch
+
+                    if save_path:
+                        save_checkpoint(
+                            model_state_dict=self.state_dict(),
+                            optimizer_state_dict=self.optimizer.state_dict() if self.optimizer else None,
+                            scheduler_state_dict=self.scheduler.state_dict() if self.scheduler else None,
+                            path=save_path,
+                            history=history
+                        )
+
+                    if restore_best_weights:
+                        best_train_loss_weights = self._save_checkpoint()
+
             # Capture LRs that were used during this epoch BEFORE stepping the scheduler
             current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
             epoch_stream_lrs = [pg['lr'] for pg in self.optimizer.param_groups[:self.num_streams]]
@@ -1202,6 +1223,18 @@ class LINet(BaseModel):
                     'val_accuracy': val_acc
                 })
         
+        # Restore best weights (no val set: best train loss)
+        if restore_best_weights and val_loader is None and best_train_loss_weights is not None:
+            self._restore_checkpoint(best_train_loss_weights, verbose=False,
+                                     stream_early_stopping_state=stream_early_stopping_state)
+            if verbose:
+                print(f"Restored best weights from epoch {best_train_loss_epoch + 1} "
+                      f"(train_loss={best_train_loss:.4f})")
+            history['best_train_loss'] = {
+                'epoch': best_train_loss_epoch + 1,
+                'train_loss': best_train_loss
+            }
+
         # Final early stopping summary
         if early_stopping_state['enabled'] and val_loader is not None:
             stopped_early = early_stopping_state['patience_counter'] > early_stopping_state['patience']

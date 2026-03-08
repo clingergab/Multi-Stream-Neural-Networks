@@ -36,9 +36,7 @@ def _default_stream_labels(num_streams: int, stream_labels: Optional[dict[int, s
 def _save_or_show(fig: plt.Figure, save_path: Optional[str] = None) -> None:
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-    else:
-        plt.show()
+    plt.show()
 
 
 # ---------------------------------------------------------------------------
