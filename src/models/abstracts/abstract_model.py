@@ -132,15 +132,22 @@ class BaseModel(nn.Module, ABC):
                                      stream_lrs: Union[float, list[float]],
                                      stream_weight_decays: Union[float, list[float]] = 0.0,
                                      shared_lr: Optional[float] = None,
-                                     shared_weight_decay: float = 0.0):
+                                     shared_weight_decay: float = 0.0,
+                                     integration_weight_decay: Optional[float] = None):
         """
         Create parameter groups for stream-specific learning rates in N-stream models.
 
-        This method separates model parameters into N+1 groups:
+        This method separates model parameters into N+2 groups:
         - N stream-specific groups (one per stream): Contains ONLY stream_weights.i and stream_biases.i
           (the stream's own feature extraction parameters)
-        - 1 shared group: Contains integration_from_streams.*, integrated_weight, integrated_bias,
-          fc layers, and other shared parameters (everything that builds/uses the integrated stream)
+        - 1 integration group: Contains integration_from_streams.*, integrated_weight, integrated_bias
+          (the parameters that control how streams are combined into the integrated representation)
+        - 1 other group: Contains BN parameters, classifier heads (fc, fc_streams), and any other
+          shared parameters (these conventionally get low/zero weight decay)
+
+        When integration_weight_decay is None (default), the old behavior is preserved:
+        integration params and other params are merged into a single shared group with
+        shared_weight_decay applied to all.
 
         Args:
             stream_lrs: Learning rate(s) for stream-specific parameters.
@@ -151,7 +158,11 @@ class BaseModel(nn.Module, ABC):
                                  - list[float]: Per-stream weight decays (length must match number of streams)
             shared_lr: Learning rate for shared/integrated parameters.
                       If None, defaults to mean of stream_lrs.
-            shared_weight_decay: Weight decay for shared parameters. Default: 0.0.
+            shared_weight_decay: Weight decay for non-integration shared parameters
+                                (BN, classifier heads). Default: 0.0.
+            integration_weight_decay: Weight decay for integration parameters
+                                     (integration_from_streams.*, integrated_weight, integrated_bias).
+                                     If None, integration params use shared_weight_decay (legacy behavior).
 
         Returns:
             List of parameter group dicts that can be passed to PyTorch optimizers.
@@ -163,10 +174,11 @@ class BaseModel(nn.Module, ABC):
         Example:
             >>> # For a 3-stream model (RGB, Depth, HHA)
             >>> param_groups = model.get_stream_parameter_groups(
-            ...     stream_lrs=[2e-4, 7e-4, 5e-4],           # Different LR per stream
-            ...     stream_weight_decays=[1e-4, 2e-4, 1.5e-4],  # Different WD per stream
-            ...     shared_lr=5e-4,                          # Shared params LR
-            ...     shared_weight_decay=1e-4                 # Shared params WD
+            ...     stream_lrs=[2e-4, 7e-4, 5e-4],
+            ...     stream_weight_decays=[1e-4, 2e-4, 1.5e-4],
+            ...     shared_lr=5e-4,
+            ...     shared_weight_decay=0.0,              # BN + classifier heads
+            ...     integration_weight_decay=1e-3          # Crank up integration WD independently
             ... )
             >>> optimizer = torch.optim.AdamW(param_groups)
         """
@@ -195,23 +207,33 @@ class BaseModel(nn.Module, ABC):
         if shared_lr is None:
             shared_lr = sum(stream_lrs) / len(stream_lrs)
 
-        # Separate parameters
+        # Separate parameters into stream / integration / other
         stream_params = [[] for _ in range(num_streams)]
-        shared_params = []
+        integration_params = []
+        other_params = []
 
         for name, param in self.named_parameters():
-            # Match stream-specific parameters: ONLY stream_weights.i and stream_biases.i
-            # integration_from_streams.i goes to shared group (it builds the integrated stream)
+            # Stream-specific: stream_weights.i and stream_biases.i
             if '.stream_weights.' in name or '.stream_biases.' in name:
                 match = re.search(r'\.stream_(?:weights|biases)\.(\d+)(?:\.|$)', name)
                 if match:
                     stream_params[int(match.group(1))].append(param)
                     continue
-            # Everything else is shared:
-            # - integration_from_streams.* (builds integrated stream from all streams)
-            # - integrated_weight, integrated_bias (integrated stream's own processing)
-            # - fc (final classifier)
-            shared_params.append(param)
+            # Integration conv weights: integration_from_streams.* and
+            # integrated_weight/integrated_bias that are conv params (4D or 0D for first-layer).
+            # BN affine params (integrated_weight/integrated_bias with 1D shape) go to other_params
+            # since penalizing BN scale/shift toward zero hurts normalization.
+            if '.integration_from_streams.' in name:
+                integration_params.append(param)
+                continue
+            if '.integrated_weight' in name or '.integrated_bias' in name:
+                if param.dim() >= 2:
+                    integration_params.append(param)
+                else:
+                    other_params.append(param)
+                continue
+            # Everything else: BN params, fc, fc_streams, etc.
+            other_params.append(param)
 
         # Build groups
         param_groups = []
@@ -223,12 +245,29 @@ class BaseModel(nn.Module, ABC):
                     'weight_decay': stream_weight_decays[i]
                 })
 
-        if shared_params:
-            param_groups.append({
-                'params': shared_params,
-                'lr': shared_lr,
-                'weight_decay': shared_weight_decay
-            })
+        if integration_weight_decay is not None:
+            # Split mode: separate WD for integration vs other
+            if integration_params:
+                param_groups.append({
+                    'params': integration_params,
+                    'lr': shared_lr,
+                    'weight_decay': integration_weight_decay
+                })
+            if other_params:
+                param_groups.append({
+                    'params': other_params,
+                    'lr': shared_lr,
+                    'weight_decay': shared_weight_decay
+                })
+        else:
+            # Legacy mode: all non-stream params in one group
+            all_shared = integration_params + other_params
+            if all_shared:
+                param_groups.append({
+                    'params': all_shared,
+                    'lr': shared_lr,
+                    'weight_decay': shared_weight_decay
+                })
 
         return param_groups
 

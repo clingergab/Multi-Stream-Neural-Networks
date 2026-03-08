@@ -17,6 +17,7 @@ def create_stream_optimizer(
     stream_weight_decays=None,
     shared_lr=None,
     shared_weight_decay: float = 0.0,
+    integration_weight_decay=None,
     **optimizer_kwargs
 ):
     """
@@ -35,12 +36,16 @@ def create_stream_optimizer(
                    - dict[str, float]: Explicit mapping {'stream0': lr, 'stream1': lr, ...}
         stream_weight_decays: Weight decay for stream parameters (same format as stream_lrs, default: 1e-4)
         shared_lr: Learning rate for shared/fusion/integrated parameters (default: mean of stream_lrs)
-        shared_weight_decay: Weight decay for shared parameters (default: 0.0)
+        shared_weight_decay: Weight decay for non-integration shared parameters
+                            (BN, classifier heads). Default: 0.0.
+        integration_weight_decay: Weight decay for integration parameters
+                                 (integration_from_streams.*, integrated_weight, integrated_bias).
+                                 If None, integration params use shared_weight_decay (legacy behavior).
         **optimizer_kwargs: Additional optimizer-specific arguments
                            (e.g., betas, eps, momentum, nesterov)
 
     Returns:
-        torch.optim.Optimizer with N+1 parameter groups (N streams + shared)
+        torch.optim.Optimizer with parameter groups
 
     Example:
         >>> from src.models.linear_integration.li_net3 import li_net3_50
@@ -61,13 +66,14 @@ def create_stream_optimizer(
         ...     shared_lr=5e-4
         ... )
         >>>
-        >>> # Option 3: Dict (explicit mapping)
+        >>> # Option 3: Separate integration WD (crank up without affecting BN/heads)
         >>> optimizer = create_stream_optimizer(
         ...     model,
         ...     optimizer_type='adamw',
-        ...     stream_lrs={'stream0': 2e-4, 'stream1': 7e-4, 'stream2': 5e-4},
-        ...     stream_weight_decays={'stream0': 1e-4, 'stream1': 2e-4, 'stream2': 1.5e-4},
-        ...     shared_lr=5e-4
+        ...     stream_lrs=[2e-4, 7e-4],
+        ...     shared_lr=5e-4,
+        ...     shared_weight_decay=0.0,          # BN + classifier heads
+        ...     integration_weight_decay=1e-3      # 10x integration regularization
         ... )
         >>>
         >>> # Create scheduler
@@ -94,7 +100,8 @@ def create_stream_optimizer(
         stream_lrs=stream_lrs,
         stream_weight_decays=stream_weight_decays,
         shared_lr=shared_lr,
-        shared_weight_decay=shared_weight_decay
+        shared_weight_decay=shared_weight_decay,
+        integration_weight_decay=integration_weight_decay
     )
 
     # Create optimizer with parameter groups
