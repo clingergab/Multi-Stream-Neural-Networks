@@ -1941,6 +1941,10 @@ class LINet(BaseModel):
         Returns:
             The stream pathway output tensor (flattened features) [batch_size, feature_dim]
         """
+        # Convert input to channels_last to match main forward() path
+        if _conv_module.USE_CHANNELS_LAST:
+            stream_input = stream_input.contiguous(memory_format=torch.channels_last)
+
         # Use forward_stream() methods that process ONLY this stream
         # This avoids corrupting BN running stats for other streams
         stream_x = self.conv1.forward_stream(stream_idx, stream_input)
@@ -1975,6 +1979,10 @@ class LINet(BaseModel):
         Returns:
             The integrated pathway output tensor (flattened features).
         """
+        # Convert inputs to channels_last to match main forward() path
+        if _conv_module.USE_CHANNELS_LAST:
+            stream_inputs = [s.contiguous(memory_format=torch.channels_last) for s in stream_inputs]
+
         # Initial convolution (creates integrated stream from N streams)
         stream_outputs, integrated = self.conv1(stream_inputs, None)
         stream_outputs, integrated = self.bn1(stream_outputs, integrated, apply_relu=True)
@@ -2001,31 +2009,36 @@ class LINet(BaseModel):
         Analyze the contribution and performance of individual pathways.
 
         Uses auxiliary classifiers (fc_streams) for per-stream accuracy.
-        Uses main classifier (fc) for integrated pathway and full model accuracy.
+        Uses main classifier (fc) for the full model / integrated pathway.
+
+        Note: In LINet3, the full model prediction IS the integrated pathway
+        (forward() returns fc(integrated_features)). So full_model and
+        integrated_only metrics are identical. Both keys are kept for
+        backwards compatibility.
 
         Args:
             data_loader: DataLoader containing N-stream input data
 
         Returns:
             Dictionary containing pathway analysis results for all N streams + integrated:
-            - accuracy: stream{i}_only for i in 0..N-1, integrated_only, full_model
-            - loss: for each pathway
+            - accuracy: full_model, stream{i}_only, stream{i}_contribution,
+                        integrated_only (= full_model), integrated_contribution (= 1.0)
+            - loss: same structure as accuracy
             - feature_norms: mean/std for each pathway's feature activations
+            - samples_analyzed: total number of samples processed
         """
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before analyze_pathways().")
 
         self.eval()
 
-        # Initialize metrics for N streams + integrated + full model
+        # Initialize metrics for N streams + full model (integrated = full model in LINet3)
         full_model_correct = 0
         stream_only_correct = [0] * self.num_streams
-        integrated_only_correct = 0
         total_samples = 0
 
         full_model_loss = 0.0
         stream_only_losses = [0.0] * self.num_streams
-        integrated_only_loss = 0.0
 
         stream_feature_norms = [[] for _ in range(self.num_streams)]
         integrated_feature_norms = []
@@ -2043,8 +2056,15 @@ class LINet(BaseModel):
                 batch_size_actual = stream_batches[0].size(0)
                 total_samples += batch_size_actual
 
-                # Full model prediction (uses integrated stream)
-                full_outputs = self(stream_batches)
+                # Integrated pathway: extract features via _forward_integrated_pathway,
+                # then classify with self.fc. This is identical to self(stream_batches)
+                # since forward() just does _forward_integrated_pathway + dropout + fc,
+                # and dropout is a no-op in eval mode. We use this path to get both
+                # the features (for norm analysis) and the logits (for accuracy/loss)
+                # in a single forward pass.
+                integrated_features = self._forward_integrated_pathway(stream_batches)
+                integrated_feature_norms.append(torch.norm(integrated_features, dim=1).cpu())
+                full_outputs = self.fc(integrated_features)
                 full_loss = self.criterion(full_outputs, targets_batch)
                 full_model_loss += full_loss.item() * batch_size_actual
 
@@ -2062,24 +2082,12 @@ class LINet(BaseModel):
                     _, stream_predicted = torch.max(stream_outputs, 1)
                     stream_only_correct[i] += (stream_predicted == targets_batch).sum().item()
 
-                # Integrated pathway only (runs full forward but uses only integrated features)
-                integrated_features = self._forward_integrated_pathway(stream_batches)
-                integrated_feature_norms.append(torch.norm(integrated_features, dim=1).cpu())
-                integrated_outputs = self.fc(integrated_features)
-                integrated_loss = self.criterion(integrated_outputs, targets_batch)
-                integrated_only_loss += integrated_loss.item() * batch_size_actual
-
-                _, integrated_predicted = torch.max(integrated_outputs, 1)
-                integrated_only_correct += (integrated_predicted == targets_batch).sum().item()
-
         # Calculate metrics
         full_accuracy = full_model_correct / total_samples
         stream_accuracies = [correct / total_samples for correct in stream_only_correct]
-        integrated_accuracy = integrated_only_correct / total_samples
 
         avg_full_loss = full_model_loss / total_samples
         avg_stream_losses = [loss / total_samples for loss in stream_only_losses]
-        avg_integrated_loss = integrated_only_loss / total_samples
 
         # Feature analysis
         stream_norms = [torch.cat(norms, dim=0) for norms in stream_feature_norms]
@@ -2090,8 +2098,10 @@ class LINet(BaseModel):
         for i in range(self.num_streams):
             accuracy_dict[f'stream{i}_only'] = stream_accuracies[i]
             accuracy_dict[f'stream{i}_contribution'] = stream_accuracies[i] / full_accuracy if full_accuracy > 0 else 0
-        accuracy_dict['integrated_only'] = integrated_accuracy
-        accuracy_dict['integrated_contribution'] = integrated_accuracy / full_accuracy if full_accuracy > 0 else 0
+        # integrated_only is identical to full_model in LINet3 (the full model IS the
+        # integrated pathway). Kept for backwards compatibility.
+        accuracy_dict['integrated_only'] = full_accuracy
+        accuracy_dict['integrated_contribution'] = 1.0
 
         # Build loss dictionary
         loss_dict = {'full_model': avg_full_loss}
@@ -2099,8 +2109,8 @@ class LINet(BaseModel):
             loss_dict[f'stream{i}_only'] = avg_stream_losses[i]
             # Contribution = ratio of stream loss to full model loss (lower is better)
             loss_dict[f'stream{i}_contribution'] = avg_stream_losses[i] / avg_full_loss if avg_full_loss > 0 else 0
-        loss_dict['integrated_only'] = avg_integrated_loss
-        loss_dict['integrated_contribution'] = avg_integrated_loss / avg_full_loss if avg_full_loss > 0 else 0
+        loss_dict['integrated_only'] = avg_full_loss
+        loss_dict['integrated_contribution'] = 1.0
 
         # Build feature norms dictionary
         feature_norms_dict = {}

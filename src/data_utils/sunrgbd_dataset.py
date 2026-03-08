@@ -478,6 +478,9 @@ def get_sunrgbd_dataloaders(
     """
     Create train, validation, and test dataloaders for SUN RGB-D.
 
+    Automatically detects available splits: if val/ directory exists, creates a
+    val_loader; otherwise val_loader is None.
+
     Args:
         data_root: Root directory of preprocessed dataset
         batch_size: Batch size
@@ -499,6 +502,7 @@ def get_sunrgbd_dataloaders(
 
     Returns:
         train_loader, val_loader, test_loader, (optional) class_weights
+        val_loader is None if no val/ directory exists in data_root.
 
     Example:
         >>> # Reproducible dataloaders with stratified sampling
@@ -506,13 +510,8 @@ def get_sunrgbd_dataloaders(
         >>> set_seed(42)
         >>> train_loader, val_loader, test_loader = get_sunrgbd_dataloaders(seed=42, stratified=True)
         >>>
-        >>> # For GPU augmentation mode with custom augmentation scaling
-        >>> from src.training.augmentation_config import AugmentationConfig
-        >>> aug_config = AugmentationConfig(rgb_aug_prob=1.5, rgb_aug_mag=1.2)
-        >>> train_loader, val_loader, test_loader = get_sunrgbd_dataloaders(
-        ...     normalize=False,
-        ...     **aug_config.to_dict()
-        ... )
+        >>> # Train + test only (no val split)
+        >>> train_loader, _, test_loader = get_sunrgbd_dataloaders(data_root='data/sunrgbd_15_train_test')
     """
     # Create datasets
     # Note: Augmentation params only affect training set (split='train')
@@ -528,12 +527,16 @@ def get_sunrgbd_dataloaders(
         depth_aug_mag=depth_aug_mag,
     )
 
-    val_dataset = SUNRGBDDataset(
-        data_root=data_root,
-        split='val',
-        target_size=target_size,
-        normalize=normalize,
-    )
+    # Val split is optional — only create if val/ directory exists
+    has_val = os.path.isdir(os.path.join(data_root, 'val'))
+    val_dataset = None
+    if has_val:
+        val_dataset = SUNRGBDDataset(
+            data_root=data_root,
+            split='val',
+            target_size=target_size,
+            normalize=normalize,
+        )
 
     test_dataset = SUNRGBDDataset(
         data_root=data_root,
@@ -592,15 +595,17 @@ def get_sunrgbd_dataloaders(
         generator=generator if train_sampler is None else None  # Generator used by sampler
     )
 
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        prefetch_factor=2,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-    )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            prefetch_factor=2,
+            pin_memory=True,
+            worker_init_fn=worker_init_fn,
+        )
 
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
@@ -614,7 +619,7 @@ def get_sunrgbd_dataloaders(
 
     print(f"\nDataLoader Info:")
     print(f"  Train batches: {len(train_loader)}")
-    print(f"  Val batches: {len(val_loader)}")
+    print(f"  Val batches: {len(val_loader) if val_loader else 'N/A (no val split)'}")
     print(f"  Test batches: {len(test_loader)}")
     print(f"  Batch size: {batch_size}")
     print(f"  Stratified: {stratified}")
