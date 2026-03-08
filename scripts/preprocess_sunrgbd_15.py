@@ -158,6 +158,74 @@ def _create_tensor_files(split_name, num_samples, output_base=None):
         print(f"  orth_tensors.pt:  {orth_tensors.shape} → {orth_mb:.1f} MB")
 
 
+def _build_split_tensors(split_name, split_samples, output_base):
+    """
+    Build tensor files and labels directly from source images (no PNG intermediary).
+
+    Reads source RGB/depth images, resizes to TARGET_SIZE, and saves as:
+      - rgb_tensors.pt:   [N, 3, H, W] uint8
+      - depth_tensors.pt: [N, 1, H, W] uint8
+      - labels.txt
+
+    Args:
+        split_name: 'train' or 'test'
+        split_samples: List of sample tuples (sample_dir, raw_scene, mapped_scene, class_idx, rgb_path, depth_path)
+        output_base: Output directory path
+
+    Returns:
+        List of class labels for this split
+    """
+    split_dir = os.path.join(output_base, split_name)
+    os.makedirs(split_dir, exist_ok=True)
+
+    num_samples = len(split_samples)
+    H, W = TARGET_SIZE
+    print(f"\nBuilding tensor files for {split_name} ({num_samples} samples, {TARGET_SIZE})...")
+
+    rgb_tensors = torch.empty(num_samples, 3, H, W, dtype=torch.uint8)
+    depth_tensors = torch.empty(num_samples, 1, H, W, dtype=torch.uint8)
+    labels = []
+
+    for idx, (sample_dir, raw_scene, mapped_scene, class_idx, rgb_path, depth_path) in enumerate(tqdm(split_samples)):
+        # RGB
+        rgb = Image.open(rgb_path).convert('RGB')
+        rgb = transforms.functional.resize(rgb, TARGET_SIZE)
+        rgb_arr = np.array(rgb, dtype=np.uint8)
+        rgb_tensors[idx] = torch.from_numpy(rgb_arr).permute(2, 0, 1)
+
+        # Depth
+        depth = Image.open(depth_path)
+        if depth.mode in ('I', 'I;16', 'I;16B'):
+            depth_arr = np.array(depth, dtype=np.float32)
+            depth_arr = np.clip(depth_arr / 65535.0 * 255.0, 0, 255).astype(np.uint8)
+            depth = Image.fromarray(depth_arr, mode='L')
+        else:
+            depth = depth.convert('L')
+        depth = transforms.functional.resize(depth, TARGET_SIZE)
+        depth_arr = np.array(depth, dtype=np.uint8)
+        depth_tensors[idx] = torch.from_numpy(depth_arr).unsqueeze(0)
+
+        labels.append(class_idx)
+
+    # Save tensors
+    rgb_out = os.path.join(split_dir, 'rgb_tensors.pt')
+    depth_out = os.path.join(split_dir, 'depth_tensors.pt')
+    torch.save(rgb_tensors, rgb_out)
+    torch.save(depth_tensors, depth_out)
+
+    rgb_mb = os.path.getsize(rgb_out) / (1024 * 1024)
+    depth_mb = os.path.getsize(depth_out) / (1024 * 1024)
+    print(f"  rgb_tensors.pt:   {rgb_tensors.shape} → {rgb_mb:.1f} MB")
+    print(f"  depth_tensors.pt: {depth_tensors.shape} → {depth_mb:.1f} MB")
+
+    # Save labels
+    with open(os.path.join(split_dir, 'labels.txt'), 'w') as f:
+        for label in labels:
+            f.write(f"{label}\n")
+
+    return labels
+
+
 def load_official_split():
     """
     Load official train/test split from SUNRGBDtoolbox.
@@ -477,11 +545,9 @@ def create_trainval_dataset(samples, train_paths, test_paths, output_base):
     print(f"  Test:  {len(official_test_samples)} (official test set)")
     print(f"  Total: {len(official_train_samples) + len(official_test_samples)}")
 
-    # Process both splits (save PNGs + create pre-resized tensor files)
-    train_labels = _process_split('train', official_train_samples, output_base=output_base)
-    _create_tensor_files('train', len(official_train_samples), output_base=output_base)
-    test_labels = _process_split('test', official_test_samples, output_base=output_base)
-    _create_tensor_files('test', len(official_test_samples), output_base=output_base)
+    # Build tensor files + labels directly from source images (no PNG intermediary)
+    train_labels = _build_split_tensors('train', official_train_samples, output_base)
+    test_labels = _build_split_tensors('test', official_test_samples, output_base)
 
     # Write class names
     with open(os.path.join(output_base, 'class_names.txt'), 'w') as f:
