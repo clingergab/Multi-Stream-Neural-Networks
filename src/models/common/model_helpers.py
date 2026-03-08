@@ -546,11 +546,12 @@ def create_progress_bar(verbose: bool, epoch: int, epochs: int, total_steps: int
     )
 
 def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
-                        val_loader, val_loss: float, val_acc: float, 
-                        early_stopping_state: dict[str, Any], current_lr: float) -> None:
+                        val_loader, val_loss: float, val_acc: float,
+                        early_stopping_state: dict[str, Any], current_lr: float,
+                        extra_postfix: Optional[dict[str, str]] = None) -> None:
     """
     Update and close progress bar with final epoch metrics.
-    
+
     Args:
         pbar: Progress bar object
         avg_train_loss: Average training loss
@@ -560,6 +561,7 @@ def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
         val_acc: Validation accuracy
         early_stopping_state: Early stopping state dictionary
         current_lr: Current learning rate
+        extra_postfix: Optional extra key-value pairs to include (e.g., grad norm)
     """
     if pbar is None:
         return
@@ -584,6 +586,10 @@ def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
         else:
             final_postfix['best'] = f"{early_stopping_state['best_metric']:.4f}"
     
+    # Add extra postfix entries (e.g., gradient norm)
+    if extra_postfix:
+        final_postfix.update(extra_postfix)
+
     # Add lr at the end (scientific notation for small LRs)
     final_postfix['lr'] = f'{current_lr:.2e}'
 

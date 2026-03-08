@@ -10,7 +10,6 @@ import warnings
 import numpy as np
 import torch
 import torch.nn as nn
-from sched import scheduler
 from typing import Any, Callable, Optional, Union, TYPE_CHECKING
 from torch import Tensor
 from torch.amp import autocast
@@ -19,7 +18,6 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts
 
 from src.models.abstracts.abstract_model import BaseModel
-from src.training.schedulers import setup_scheduler
 from src.training.modality_dropout import get_modality_dropout_prob, generate_per_sample_blanked_mask
 from src.models.common import (
     save_checkpoint,
@@ -1071,9 +1069,17 @@ class LINet(BaseModel):
             
             # Update history and finalize progress bar
             update_history(history, avg_train_loss, train_accuracy, val_loss, val_acc, current_lr, bool(val_loader))
+            # Build extra postfix for gradient norm (persists in final bar display)
+            extra_postfix = None
+            if gradient_health_tracker is not None:
+                grad_norm = gradient_health_tracker.get_latest_total_norm()
+                if grad_norm > 0:
+                    extra_postfix = {'grad': f'{grad_norm:.2e}'}
+
             finalize_progress_bar(
                 pbar, avg_train_loss, train_accuracy, val_loader,
-                val_loss, val_acc, early_stopping_state, current_lr
+                val_loss, val_acc, early_stopping_state, current_lr,
+                extra_postfix=extra_postfix
             )
 
             # Stream-specific monitoring (print immediately after progress bar, on same line continuation)
