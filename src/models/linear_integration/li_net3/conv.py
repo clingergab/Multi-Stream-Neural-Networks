@@ -260,8 +260,17 @@ class _LIConvNd(nn.Module):
         # Initialize integrated pathway weights
         # Squeeze to 2D, apply orthogonal, unsqueeze back
         w = self.integrated_weight.squeeze(-1).squeeze(-1)  # [out_ch, in_ch]
-        init.orthogonal_(w)
-        self.integrated_weight.data = w.unsqueeze(-1).unsqueeze(-1)
+        if w.shape[0] == w.shape[1] and w.shape[1] > 0:
+            # Square and non-empty — orthogonal init
+            init.orthogonal_(w)
+            self.integrated_weight.data = w.unsqueeze(-1).unsqueeze(-1)
+        elif w.shape[1] == 0:
+            # First layer — no previous integrated stream, weight unused
+            # Leave as zeros (empty tensor, no-op)
+            pass
+        else:
+            # Non-square fallback — kaiming
+            init.kaiming_uniform_(self.integrated_weight, a=math.sqrt(5))
         if self.integrated_bias is not None:
             fan_in, _ = init._calculate_fan_in_and_fan_out(self.integrated_weight)
             if fan_in != 0:
