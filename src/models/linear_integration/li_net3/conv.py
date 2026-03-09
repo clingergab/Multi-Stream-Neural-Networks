@@ -267,7 +267,7 @@ class _LIConvNd(nn.Module):
 
         # Initialize integration weights (1x1 convolutions for stream mixing)
         for integration_weight in self.integration_from_streams:
-            init.kaiming_uniform_(integration_weight, a=math.sqrt(5))
+            init.constant_(integration_weight, 1.0 / self.num_streams)
     
     def extra_repr(self):
         """String representation exactly like _ConvNd."""
