@@ -270,6 +270,7 @@ class _LIConvNd(nn.Module):
         else:
             # Non-square (channel-doubling transition layers) — kaiming fallback
             init.kaiming_uniform_(self.integrated_weight, a=math.sqrt(5))
+            self.integrated_weight.data *= 0.1
         if self.integrated_bias is not None:
             fan_in, _ = init._calculate_fan_in_and_fan_out(self.integrated_weight)
             if fan_in != 0:
