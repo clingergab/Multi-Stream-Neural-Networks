@@ -65,35 +65,24 @@ class GPUAugmentation(nn.Module):
     they need to be synchronized between RGB and Depth. GPU augmentation only handles
     color transforms and erasing.
 
+    Normalization stats are required — load them from the dataset's norm_stats.json
+    via _load_norm_stats() or pass them explicitly.
+
     Args:
-        rgb_mean: RGB normalization mean (3 values). Defaults to SUN RGB-D stats.
-        rgb_std: RGB normalization std (3 values). Defaults to SUN RGB-D stats.
-        depth_mean: Depth normalization mean (1 value). Defaults to SUN RGB-D stats.
-        depth_std: Depth normalization std (1 value). Defaults to SUN RGB-D stats.
+        rgb_mean: RGB normalization mean (3 values). Required.
+        rgb_std: RGB normalization std (3 values). Required.
+        depth_mean: Depth normalization mean (1 value). Required.
+        depth_std: Depth normalization std (1 value). Required.
         rgb_aug_prob: Scales probability of RGB augmentations (default: 1.0 = baseline)
         rgb_aug_mag: Scales magnitude of RGB augmentations (default: 1.0 = baseline)
         depth_aug_prob: Scales probability of Depth augmentations (default: 1.0 = baseline)
         depth_aug_mag: Scales magnitude of Depth augmentations (default: 1.0 = baseline)
 
     Example:
-        >>> gpu_aug = GPUAugmentation().to('cuda')
-        >>> model.gpu_aug = gpu_aug
-        >>>
-        >>> # In training (model.train() sets gpu_aug.training = True)
-        >>> rgb_aug, depth_aug = gpu_aug(rgb_batch, depth_batch)
-        >>>
-        >>> # In validation (model.eval() sets gpu_aug.training = False)
-        >>> rgb_norm, depth_norm = gpu_aug(rgb_batch, depth_batch)
-        >>>
-        >>> # With custom augmentation scaling
-        >>> gpu_aug = GPUAugmentation(rgb_aug_prob=1.5, rgb_aug_mag=1.2).to('cuda')
+        >>> from src.data_utils.sunrgbd_dataset import _load_norm_stats
+        >>> stats = _load_norm_stats('data/sunrgbd_19')
+        >>> gpu_aug = GPUAugmentation(**stats).to('cuda')
     """
-
-    # SUN RGB-D training set statistics (official split 80:20, 4101 samples)
-    DEFAULT_RGB_MEAN = [0.49829878533942046, 0.4667760665084003, 0.44289694564460663]
-    DEFAULT_RGB_STD = [0.27731416732781294, 0.28601699847044426, 0.2899506179157605]
-    DEFAULT_DEPTH_MEAN = [0.2908]
-    DEFAULT_DEPTH_STD = [0.1504]
 
     def __init__(
         self,
@@ -114,17 +103,17 @@ class GPUAugmentation(nn.Module):
                 "Install with: pip install kornia"
             )
 
+        if rgb_mean is None or rgb_std is None or depth_mean is None or depth_std is None:
+            raise ValueError(
+                "Normalization stats (rgb_mean, rgb_std, depth_mean, depth_std) are required. "
+                "Load them from norm_stats.json via _load_norm_stats(data_root)."
+            )
+
         # Store augmentation scaling parameters for logging
         self.rgb_aug_prob = rgb_aug_prob
         self.rgb_aug_mag = rgb_aug_mag
         self.depth_aug_prob = depth_aug_prob
         self.depth_aug_mag = depth_aug_mag
-
-        # Use defaults if not specified
-        rgb_mean = rgb_mean or self.DEFAULT_RGB_MEAN
-        rgb_std = rgb_std or self.DEFAULT_RGB_STD
-        depth_mean = depth_mean or self.DEFAULT_DEPTH_MEAN
-        depth_std = depth_std or self.DEFAULT_DEPTH_STD
 
         # Register normalization tensors as buffers so they move with .to(device)
         self.register_buffer('rgb_mean', torch.tensor(rgb_mean, dtype=torch.float32))

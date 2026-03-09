@@ -341,6 +341,7 @@ class BaseModel(nn.Module, ABC):
                 scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
                 metrics: Optional[list[str]] = None,
                 gpu_augmentation: bool = False,
+                norm_stats: Optional[dict] = None,
                 rgb_aug_prob: float = 1.0,
                 rgb_aug_mag: float = 1.0,
                 depth_aug_prob: float = 1.0,
@@ -363,6 +364,9 @@ class BaseModel(nn.Module, ABC):
             gpu_augmentation: Whether to use GPU-based augmentation. When True, expects
                              input data in [0, 1] range (not normalized). GPU will apply
                              augmentation and normalization. Requires dataset with normalize=False.
+            norm_stats: Normalization statistics dict with keys 'rgb_mean', 'rgb_std',
+                       'depth_mean', 'depth_std'. Required when gpu_augmentation=True.
+                       Load via dataset.get_norm_stats() or _load_norm_stats(data_root).
             rgb_aug_prob: Scales probability of RGB augmentations (default: 1.0 = baseline)
             rgb_aug_mag: Scales magnitude of RGB augmentations (default: 1.0 = baseline)
             depth_aug_prob: Scales probability of Depth augmentations (default: 1.0 = baseline)
@@ -452,8 +456,17 @@ class BaseModel(nn.Module, ABC):
         self.gpu_augmentation = gpu_augmentation
         self.gpu_aug = None
         if gpu_augmentation:
+            if norm_stats is None:
+                raise ValueError(
+                    "norm_stats dict is required when gpu_augmentation=True. "
+                    "Load via _load_norm_stats(data_root) or dataset.get_norm_stats()."
+                )
             from src.training.gpu_augmentation import GPUAugmentation
             self.gpu_aug = GPUAugmentation(
+                rgb_mean=norm_stats['rgb_mean'],
+                rgb_std=norm_stats['rgb_std'],
+                depth_mean=norm_stats['depth_mean'],
+                depth_std=norm_stats['depth_std'],
                 rgb_aug_prob=rgb_aug_prob,
                 rgb_aug_mag=rgb_aug_mag,
                 depth_aug_prob=depth_aug_prob,

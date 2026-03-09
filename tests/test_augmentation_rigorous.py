@@ -26,7 +26,6 @@ def test_crop_probability():
     train_dataset = SUNRGBDDataset(
         data_root='data/sunrgbd_15',
         split='train',
-        target_size=(416, 544)
     )
 
     # Test with enough samples to get reliable statistics
@@ -254,7 +253,6 @@ def test_validation_deterministic():
     val_dataset = SUNRGBDDataset(
         data_root='data/sunrgbd_15',
         split='val',
-        target_size=(416, 544)
     )
 
     # Load same sample multiple times

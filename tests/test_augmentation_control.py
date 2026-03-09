@@ -567,6 +567,17 @@ class TestSUNRGBDDatasetAugParams:
     @pytest.fixture
     def mock_dataset(self, tmp_path):
         """Create a minimal mock dataset structure."""
+        import json
+
+        # Create class_names.txt and norm_stats.json at data root
+        (tmp_path / "class_names.txt").write_text("0: test_class\n")
+        (tmp_path / "norm_stats.json").write_text(json.dumps({
+            "rgb_mean": [0.5, 0.5, 0.5],
+            "rgb_std": [0.25, 0.25, 0.25],
+            "depth_mean": [0.3],
+            "depth_std": [0.15],
+        }))
+
         # Create train directory structure
         train_dir = tmp_path / "train"
         train_dir.mkdir()
@@ -1630,7 +1641,7 @@ class TestIntegration:
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
             split='train',
-            target_size=(64, 64),  # Small for speed
+            crop_size=64,  # Small for speed
             **config.to_dict(),
         )
 
@@ -1650,7 +1661,7 @@ class TestIntegration:
         dataset_high = SUNRGBDDataset(
             data_root=mock_dataset,
             split='train',
-            target_size=(64, 64),
+            crop_size=64,
             rgb_aug_prob=3.0,
             rgb_aug_mag=3.0,
             depth_aug_prob=3.0,
@@ -1661,7 +1672,7 @@ class TestIntegration:
         dataset_low = SUNRGBDDataset(
             data_root=mock_dataset,
             split='train',
-            target_size=(64, 64),
+            crop_size=64,
             rgb_aug_prob=0.1,
             rgb_aug_mag=0.1,
             depth_aug_prob=0.1,
@@ -1692,7 +1703,7 @@ class TestIntegration:
         dataset = SUNRGBDDataset(
             data_root=mock_dataset,
             split='train',
-            target_size=(64, 64),
+            crop_size=64,
             normalize=True,  # CPU mode
             **config.to_dict(),
         )

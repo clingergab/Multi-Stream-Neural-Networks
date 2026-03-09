@@ -1,9 +1,15 @@
 """
-SUN RGB-D 3-Stream Dataset Loader for 15-category scene classification.
+SUN RGB-D 3-Stream Dataset Loader for scene classification.
 
 Loads preprocessed SUN RGB-D dataset with RGB, Depth, and Orthogonal images.
+Class names and normalization stats are loaded dynamically from the data root.
+
+Tensors are stored at 256x256. At load time:
+  - Train: RandomCrop(crop_size) + horizontal flip + augmentations
+  - Val/Test: CenterCrop(crop_size)
 """
 
+import json
 import os
 from collections import Counter
 
@@ -14,56 +20,54 @@ from torch.utils.data import Dataset
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as F2
 
+from src.data_utils.sunrgbd_dataset import _load_class_names, _load_norm_stats
+
 
 class SUNRGBD3StreamDataset(Dataset):
     """
-    SUN RGB-D 3-Stream dataset for scene classification (15 categories).
+    SUN RGB-D 3-Stream dataset for scene classification.
+
+    Class names are loaded dynamically from class_names.txt in data_root.
+    Normalization stats are loaded from norm_stats.json in data_root.
 
     Directory structure:
         data_root/
+            class_names.txt
+            norm_stats.json
             train/ or val/ or test/
-                rgb/
-                    00000.png
-                    ...
-                depth/
-                    00000.png
-                    ...
-                orth/
-                    00000.png
-                    ...
+                rgb_tensors.pt
+                depth_tensors.pt
+                orth_tensors.pt
                 labels.txt
     """
 
     VALID_SPLITS = ('train', 'val', 'test')
 
-    # 15 scene categories
-    CLASS_NAMES = [
-        'bathroom', 'bedroom', 'classroom', 'computer_room', 'corridor',
-        'dining_area', 'dining_room', 'discussion_area', 'furniture_store',
-        'kitchen', 'lab', 'library', 'office', 'rest_space', 'study_space'
-    ]
-
     def __init__(
         self,
-        data_root='data/sunrgbd_15',
+        data_root='data/sunrgbd_19',
         split='train',
-        target_size=(416, 544),
+        crop_size: int = 224,
     ):
         """
         Args:
             data_root: Root directory of preprocessed dataset
             split: One of 'train', 'val', or 'test'
-            target_size: Target image size (H, W)
-
-        Note: All augmentation is performed in __getitem__() to enable synchronized
-        transforms between RGB, Depth, and Orthogonal modalities.
+            crop_size: Output crop size. Train uses RandomCrop, val/test use CenterCrop.
         """
         if split not in self.VALID_SPLITS:
             raise ValueError(f"split must be one of {self.VALID_SPLITS}, got '{split}'")
 
         self.data_root = data_root
         self.split = split
-        self.target_size = target_size
+        self.crop_size = crop_size
+
+        # Load class names dynamically from data root
+        self.CLASS_NAMES = _load_class_names(data_root)
+        self.num_classes = len(self.CLASS_NAMES)
+
+        # Load normalization statistics from data root
+        self._norm_stats = _load_norm_stats(data_root)
 
         # Set split directory
         self.split_dir = os.path.join(data_root, split)
@@ -86,7 +90,8 @@ class SUNRGBD3StreamDataset(Dataset):
             self.depth_tensors = torch.load(depth_tensor_path, weights_only=True, mmap=True)
             self.orth_tensors = torch.load(orth_tensor_path, weights_only=True, mmap=True)
             self.use_tensors = True
-            print(f"Loaded SUN RGB-D 3-Stream {self.split} set: {self.num_samples} samples, 15 classes (pre-resized tensors, mmap)")
+            print(f"Loaded SUN RGB-D 3-Stream {self.split}: {self.num_samples} samples, "
+                  f"{self.num_classes} classes (tensors, mmap)")
         else:
             self.rgb_tensors = None
             self.depth_tensors = None
@@ -99,7 +104,8 @@ class SUNRGBD3StreamDataset(Dataset):
             assert os.path.exists(self.rgb_dir), f"RGB directory not found: {self.rgb_dir}"
             assert os.path.exists(self.depth_dir), f"Depth directory not found: {self.depth_dir}"
             assert os.path.exists(self.orth_dir), f"Orthogonal directory not found: {self.orth_dir}"
-            print(f"Loaded SUN RGB-D 3-Stream {self.split} set: {self.num_samples} samples, 15 classes (PNG fallback)")
+            print(f"Loaded SUN RGB-D 3-Stream {self.split}: {self.num_samples} samples, "
+                  f"{self.num_classes} classes (PNG fallback)")
 
         # Pre-create reusable transform instances (avoids per-__getitem__ construction)
         self._color_jitter_transform = v2.ColorJitter(
@@ -142,10 +148,6 @@ class SUNRGBD3StreamDataset(Dataset):
             depth_arr = np.array(depth_pil.convert('L'), dtype=np.float32)
             if depth_arr.max() > 1.0:
                 depth_arr = depth_arr / 255.0
-        # Convert to uint8 tensor to match tensor fast path format.
-        # Note: for mode 'L' with values 0-255, this divides by 255 then multiplies
-        # by 255 (a no-op with rounding). Intentional — normalizes all depth formats
-        # to the same uint8 output regardless of input mode.
         depth = torch.from_numpy(
             (depth_arr * 255).clip(0, 255).astype(np.uint8)
         ).unsqueeze(0)  # [1, H, W] uint8
@@ -169,18 +171,16 @@ class SUNRGBD3StreamDataset(Dataset):
     def __getitem__(self, idx):
         """
         Returns:
-            rgb: RGB image tensor [3, H, W] float32
-            depth: Depth image tensor [1, H, W] float32
-            orth: Orthogonal image tensor [1, H, W] float32
-            label: Class label (0-14)
+            rgb: RGB image tensor [3, crop_size, crop_size] float32
+            depth: Depth image tensor [1, crop_size, crop_size] float32
+            orth: Orthogonal image tensor [1, crop_size, crop_size] float32
+            label: Class label (0 to num_classes-1)
         """
         # Load images as uint8 tensors (no PIL conversion)
         if self.use_tensors:
             rgb, depth, orth = self._load_images_tensor(idx)
-            images_already_resized = True
         else:
             rgb, depth, orth = self._load_images_png(idx)
-            images_already_resized = False
 
         # At this point: rgb [3, H, W] uint8, depth [1, H, W] uint8, orth [1, H, W] uint8
 
@@ -192,18 +192,13 @@ class SUNRGBD3StreamDataset(Dataset):
                 depth = F2.horizontal_flip(depth)
                 orth = F2.horizontal_flip(orth)
 
-            # 2. Synchronized Random Resized Crop (50% probability)
-            if np.random.random() < 0.5:
-                i, j, h, w = v2.RandomResizedCrop.get_params(
-                    rgb, scale=(0.9, 1.0), ratio=(0.95, 1.05)
-                )
-                rgb = F2.resized_crop(rgb, i, j, h, w, self.target_size)
-                depth = F2.resized_crop(depth, i, j, h, w, self.target_size)
-                orth = F2.resized_crop(orth, i, j, h, w, self.target_size)
-            elif not images_already_resized:
-                rgb = F2.resize(rgb, self.target_size)
-                depth = F2.resize(depth, self.target_size)
-                orth = F2.resize(orth, self.target_size)
+            # 2. Synchronized RandomCrop (256 -> crop_size)
+            i, j, h, w = v2.RandomCrop.get_params(
+                rgb, output_size=(self.crop_size, self.crop_size)
+            )
+            rgb = F2.crop(rgb, i, j, h, w)
+            depth = F2.crop(depth, i, j, h, w)
+            orth = F2.crop(orth, i, j, h, w)
 
             # 3. RGB-Only: Color Jitter (43% probability, pre-created instance)
             if np.random.random() < 0.43:
@@ -220,37 +215,31 @@ class SUNRGBD3StreamDataset(Dataset):
                 rgb = F2.rgb_to_grayscale(rgb, num_output_channels=3)
 
             # 6. Depth & Orth: Appearance Augmentation (50% probability each)
-            # Uses torch ops instead of numpy/PIL
             if np.random.random() < 0.5:
-                depth = depth.float() / 255.0  # uint8 → float32 [0, 1]
+                depth = depth.float() / 255.0
                 brightness_factor = np.random.uniform(0.75, 1.25)
                 contrast_factor = np.random.uniform(0.75, 1.25)
                 depth = (depth - 0.5) * contrast_factor + 0.5
                 depth = depth * brightness_factor
                 depth = depth + torch.randn_like(depth) * 0.06
                 depth = depth.clamp(0.0, 1.0)
-                # depth is now float32 [0, 1] — skips later uint8→float conversion
 
             if np.random.random() < 0.5:
-                orth = orth.float() / 255.0  # uint8 → float32 [0, 1]
+                orth = orth.float() / 255.0
                 brightness_factor = np.random.uniform(0.75, 1.25)
                 contrast_factor = np.random.uniform(0.75, 1.25)
                 orth = (orth - 0.5) * contrast_factor + 0.5
                 orth = orth * brightness_factor
                 orth = orth + torch.randn_like(orth) * 0.06
                 orth = orth.clamp(0.0, 1.0)
-                # orth is now float32 [0, 1] — skips later uint8→float conversion
 
-        elif not images_already_resized:
-            # Validation: just resize (no augmentation) — only needed for PNG path
-            rgb = F2.resize(rgb, self.target_size)
-            depth = F2.resize(depth, self.target_size)
-            orth = F2.resize(orth, self.target_size)
+        else:
+            # Val/Test: CenterCrop (256 -> crop_size)
+            rgb = F2.center_crop(rgb, (self.crop_size, self.crop_size))
+            depth = F2.center_crop(depth, (self.crop_size, self.crop_size))
+            orth = F2.center_crop(orth, (self.crop_size, self.crop_size))
 
         # ==================== TO FLOAT32 ====================
-        # Convert uint8 → float32 [0, 1] (replaces to_tensor() which did CHW permute + /255;
-        # our tensors are already CHW, so just need dtype conversion).
-        # Dtype guard: if depth/orth aug triggered, they are already float32 — no double-division.
         if rgb.dtype == torch.uint8:
             rgb = rgb.float() / 255.0
         if depth.dtype == torch.uint8:
@@ -261,13 +250,19 @@ class SUNRGBD3StreamDataset(Dataset):
         # ==================== NORMALIZATION ====================
         rgb = F2.normalize(
             rgb,
-            mean=[0.49829878533942046, 0.4667760665084003, 0.44289694564460663],
-            std=[0.27731416732781294, 0.28601699847044426, 0.2899506179157605],
+            mean=self._norm_stats['rgb_mean'],
+            std=self._norm_stats['rgb_std'],
+        )
+        depth = F2.normalize(
+            depth,
+            mean=self._norm_stats['depth_mean'],
+            std=self._norm_stats['depth_std'],
         )
 
-        depth = F2.normalize(depth, mean=[0.2908], std=[0.1504])
-
-        orth = F2.normalize(orth, mean=[0.4944], std=[0.2065])
+        # Orth stats: use if available, otherwise fall back to depth stats
+        orth_mean = self._norm_stats.get('orth_mean', self._norm_stats['depth_mean'])
+        orth_std = self._norm_stats.get('orth_std', self._norm_stats['depth_std'])
+        orth = F2.normalize(orth, mean=orth_mean, std=orth_std)
 
         # 7. Post-normalization Random Erasing (pre-created instances)
         if self.split == 'train':
@@ -293,13 +288,13 @@ class SUNRGBD3StreamDataset(Dataset):
         """
         label_counts = Counter(self.labels)
 
-        weights = torch.zeros(len(self.CLASS_NAMES))
+        weights = torch.zeros(self.num_classes)
         total = len(self.labels)
 
-        for class_idx in range(len(self.CLASS_NAMES)):
+        for class_idx in range(self.num_classes):
             count = label_counts.get(class_idx, 0)
             if count > 0:
-                weights[class_idx] = total / (len(self.CLASS_NAMES) * count)
+                weights[class_idx] = total / (self.num_classes * count)
             else:
                 weights[class_idx] = 0.0
 
@@ -315,7 +310,7 @@ class SUNRGBD3StreamDataset(Dataset):
         label_counts = Counter(self.labels)
 
         distribution = {}
-        for class_idx in range(len(self.CLASS_NAMES)):
+        for class_idx in range(self.num_classes):
             count = label_counts.get(class_idx, 0)
             percentage = (count / self.num_samples) * 100
             distribution[self.CLASS_NAMES[class_idx]] = {
@@ -325,12 +320,16 @@ class SUNRGBD3StreamDataset(Dataset):
 
         return distribution
 
+    def get_norm_stats(self):
+        """Return the normalization statistics dict loaded from norm_stats.json."""
+        return self._norm_stats
+
 
 def get_sunrgbd_3stream_dataloaders(
-    data_root='data/sunrgbd_15',
+    data_root='data/sunrgbd_19',
     batch_size=32,
     num_workers=4,
-    target_size=(416, 544),
+    crop_size: int = 224,
     use_class_weights=False,
 ):
     """
@@ -340,29 +339,32 @@ def get_sunrgbd_3stream_dataloaders(
         data_root: Root directory of preprocessed dataset
         batch_size: Batch size
         num_workers: Number of dataloader workers
-        target_size: Target image size (H, W)
+        crop_size: Output crop size (RandomCrop for train, CenterCrop for val/test)
         use_class_weights: If True, return class weights for loss
 
     Returns:
         train_loader, val_loader, test_loader, (optional) class_weights
     """
-    # Create datasets
     train_dataset = SUNRGBD3StreamDataset(
         data_root=data_root,
         split='train',
-        target_size=target_size,
+        crop_size=crop_size,
     )
 
-    val_dataset = SUNRGBD3StreamDataset(
-        data_root=data_root,
-        split='val',
-        target_size=target_size,
-    )
+    # Val split is optional
+    has_val = os.path.isdir(os.path.join(data_root, 'val'))
+    val_dataset = None
+    if has_val:
+        val_dataset = SUNRGBD3StreamDataset(
+            data_root=data_root,
+            split='val',
+            crop_size=crop_size,
+        )
 
     test_dataset = SUNRGBD3StreamDataset(
         data_root=data_root,
         split='test',
-        target_size=target_size,
+        crop_size=crop_size,
     )
 
     # Create dataloaders
@@ -375,14 +377,16 @@ def get_sunrgbd_3stream_dataloaders(
         persistent_workers=(num_workers > 0)
     )
 
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=(num_workers > 0)
-    )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=(num_workers > 0)
+        )
 
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
@@ -395,7 +399,7 @@ def get_sunrgbd_3stream_dataloaders(
 
     print(f"\nDataLoader Info:")
     print(f"  Train batches: {len(train_loader)}")
-    print(f"  Val batches: {len(val_loader)}")
+    print(f"  Val batches: {len(val_loader) if val_loader else 'N/A (no val split)'}")
     print(f"  Test batches: {len(test_loader)}")
     print(f"  Batch size: {batch_size}")
 
@@ -410,20 +414,15 @@ def get_sunrgbd_3stream_dataloaders(
 if __name__ == "__main__":
     """Test the dataset loader."""
 
-    # Test dataset loading
     print("Testing SUN RGB-D 3-Stream Dataset Loader")
     print("=" * 80)
 
     try:
         train_dataset = SUNRGBD3StreamDataset(split='train')
-        val_dataset = SUNRGBD3StreamDataset(split='val')
-        test_dataset = SUNRGBD3StreamDataset(split='test')
 
-        print(f"\nTrain set: {len(train_dataset)} samples")
-        print(f"Val set: {len(val_dataset)} samples")
-        print(f"Test set: {len(test_dataset)} samples")
+        print(f"\nTrain set: {len(train_dataset)} samples, {train_dataset.num_classes} classes")
+        print(f"Classes: {train_dataset.CLASS_NAMES}")
 
-        # Test getting a sample
         rgb, depth, orth, label = train_dataset[0]
         print(f"\nSample 0:")
         print(f"  RGB shape: {rgb.shape}")
@@ -431,18 +430,15 @@ if __name__ == "__main__":
         print(f"  Orth shape: {orth.shape}")
         print(f"  Label: {label} ({train_dataset.CLASS_NAMES[label]})")
 
-        # Test class distribution
         print("\nTrain class distribution:")
         train_dist = train_dataset.get_class_distribution()
         for class_name in train_dataset.CLASS_NAMES:
             info = train_dist[class_name]
             print(f"  {class_name:20s}: {info['count']:5d} ({info['percentage']:5.2f}%)")
 
-        # Test dataloader
         print("\nTesting dataloaders...")
         train_loader, val_loader, test_loader = get_sunrgbd_3stream_dataloaders(batch_size=16, num_workers=0)
 
-        # Get one batch
         rgb_batch, depth_batch, orth_batch, labels_batch = next(iter(train_loader))
         print(f"\nBatch shapes:")
         print(f"  RGB: {rgb_batch.shape}")
@@ -450,8 +446,8 @@ if __name__ == "__main__":
         print(f"  Orth: {orth_batch.shape}")
         print(f"  Labels: {labels_batch.shape}")
 
-        print("\n✓ Dataset loader working correctly!")
+        print("\nDataset loader working correctly!")
 
     except Exception as e:
         print(f"\nError testing dataset: {e}")
-        print("Make sure the 'orth' directory exists in data/sunrgbd_15/train/, val/, and test/")
+        print("Make sure the 'orth' directory exists in the dataset splits")

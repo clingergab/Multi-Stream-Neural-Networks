@@ -87,6 +87,7 @@ class LINet(BaseModel):
         # LINet-specific parameters come AFTER all ResNet parameters
         stream_input_channels: list[int] = [3, 1],  # Default: [RGB=3, Depth=1] for backward compatibility
         dropout_p: float = 0.0,  # Dropout probability (0.0 = no dropout, 0.5 = 50% dropout)
+        width_multiplier: float = 1.0,  # Scale channel widths (0.5 = half, 0.75 = 3/4)
         **kwargs
     ) -> None:
         # Store LINet-specific parameters BEFORE calling super().__init__
@@ -94,6 +95,7 @@ class LINet(BaseModel):
         self.stream_input_channels = stream_input_channels
         self.num_streams = len(stream_input_channels)
         self.dropout_p = dropout_p
+        self.width_multiplier = width_multiplier
 
         # Set LINet default norm layer if not specified
         if norm_layer is None:
@@ -130,18 +132,21 @@ class LINet(BaseModel):
         replace_stride_with_dilation: list[bool]
     ):
         """Build the Linear Integration ResNet network architecture."""
+        # Compute scaled channel progression
+        w = self.width_multiplier
+        base = [int(c * w) for c in [64, 128, 256, 512]]
+
         # Initialize stream inplanes tracking for N streams
-        # All streams start at 64 channels (standard ResNet convention)
-        self.stream_inplanes = [64] * self.num_streams
-        self.integrated_inplanes = 64
+        self.stream_inplanes = [base[0]] * self.num_streams
+        self.integrated_inplanes = base[0]
 
         # Network architecture - exactly like ResNet but with N-stream LI components
         # First conv: no integrated input yet (integrated starts after first block)
         self.conv1 = LIConv2d(
             self.stream_input_channels,  # list[int] of input channels for each stream
-            self.stream_inplanes,  # list[int] of output channels for each stream (all 64)
+            self.stream_inplanes,  # list[int] of output channels for each stream
             0,  # integrated_in_channels (doesn't exist yet)
-            self.integrated_inplanes,  # integrated_out_channels (64)
+            self.integrated_inplanes,  # integrated_out_channels
             kernel_size=7, stride=2, padding=3, bias=False
         )
         self.bn1 = self._norm_layer(self.stream_inplanes, self.integrated_inplanes)
@@ -149,11 +154,10 @@ class LINet(BaseModel):
         self.maxpool = LIMaxPool2d(kernel_size=3, stride=2, padding=1)
 
         # ResNet layers - equal scaling for all N streams
-        # Integrated pathway follows standard ResNet channel progression: 64, 128, 256, 512
-        self.layer1 = self._make_layer(block, [64] * self.num_streams, 64, layers[0])
-        self.layer2 = self._make_layer(block, [128] * self.num_streams, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, [256] * self.num_streams, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
-        self.layer4 = self._make_layer(block, [512] * self.num_streams, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+        self.layer1 = self._make_layer(block, [base[0]] * self.num_streams, base[0], layers[0])
+        self.layer2 = self._make_layer(block, [base[1]] * self.num_streams, base[1], layers[1], stride=2, dilate=replace_stride_with_dilation[0])
+        self.layer3 = self._make_layer(block, [base[2]] * self.num_streams, base[2], layers[2], stride=2, dilate=replace_stride_with_dilation[1])
+        self.layer4 = self._make_layer(block, [base[3]] * self.num_streams, base[3], layers[3], stride=2, dilate=replace_stride_with_dilation[2])
 
         # Adaptive average pooling for integrated stream only
         # (Stream pooling happens in LIMaxPool2d layers)
@@ -163,8 +167,8 @@ class LINet(BaseModel):
         self.dropout = nn.Dropout(p=self.dropout_p) if self.dropout_p > 0.0 else nn.Identity()
 
         # Single classifier for integrated stream features
-        feature_dim = 512 * block.expansion
-        self.fc = nn.Linear(512 * block.expansion, self.num_classes)
+        feature_dim = base[3] * block.expansion
+        self.fc = nn.Linear(feature_dim, self.num_classes)
 
         # Auxiliary classifiers for stream monitoring (gradient-isolated)
         # These learn to classify from stream features but DON'T affect stream training via .detach()
@@ -2658,7 +2662,7 @@ class LINet(BaseModel):
         return result 
 
 # Factory functions for common LINet architectures
-def li_resnet18(num_classes: int = 1000, stream_input_channels: list[int] = None, **kwargs) -> LINet:
+def li_resnet18(num_classes: int = 19, stream_input_channels: list[int] = None, width_multiplier: float = 1.0, **kwargs) -> LINet:
     """
     Create a Linear Integration ResNet-18 model.
 
@@ -2667,6 +2671,8 @@ def li_resnet18(num_classes: int = 1000, stream_input_channels: list[int] = None
         stream_input_channels: List of input channels for each stream.
                               Default: [3, 1] for RGB + Depth (backward compatible)
                               For 3 streams: [3, 1, 1] for RGB + Depth + Orthogonal
+        width_multiplier: Scale channel widths. 1.0 = standard ResNet-18 [64,128,256,512].
+            0.75 → [48,96,192,384] (~56% params), 0.5 → [32,64,128,256] (~25% params).
         **kwargs: Additional arguments passed to LINet constructor
 
     Returns:
@@ -2674,10 +2680,13 @@ def li_resnet18(num_classes: int = 1000, stream_input_channels: list[int] = None
 
     Examples:
         # 2-stream (backward compatible - default)
-        model = li_resnet18(num_classes=15)
+        model = li_resnet18(num_classes=19)
 
         # 3-stream (RGB + Depth + Orthogonal)
-        model = li_resnet18(num_classes=15, stream_input_channels=[3, 1, 1])
+        model = li_resnet18(num_classes=19, stream_input_channels=[3, 1, 1])
+
+        # Smaller model for limited data
+        model = li_resnet18(num_classes=19, width_multiplier=0.5)
     """
     # Default to 2-stream for backward compatibility with existing code
     if stream_input_channels is None:
@@ -2688,6 +2697,7 @@ def li_resnet18(num_classes: int = 1000, stream_input_channels: list[int] = None
         [2, 2, 2, 2],
         num_classes=num_classes,
         stream_input_channels=stream_input_channels,
+        width_multiplier=width_multiplier,
         **kwargs
     )
 

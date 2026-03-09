@@ -24,7 +24,6 @@ def test_augmentation_balance():
     train_dataset = SUNRGBDDataset(
         data_root='data/sunrgbd_15',
         split='train',
-        target_size=(224, 224)
     )
 
     # Load the same sample multiple times to measure augmentation variance
@@ -154,7 +153,6 @@ def visualize_sample_augmentations():
     train_dataset = SUNRGBDDataset(
         data_root='data/sunrgbd_15',
         split='train',
-        target_size=(224, 224)
     )
 
     # Load same sample 8 times

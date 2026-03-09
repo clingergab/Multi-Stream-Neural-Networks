@@ -82,6 +82,7 @@ class LINet(BaseModel):
         stream1_input_channels: int = 3,
         stream2_input_channels: int = 1,
         dropout_p: float = 0.0,  # Dropout probability (0.0 = no dropout, 0.5 = 50% dropout)
+        width_multiplier: float = 1.0,  # Scale channel widths (0.5 = half, 0.75 = 3/4)
         **kwargs
     ) -> None:
         # Store LINet-specific parameters BEFORE calling super().__init__
@@ -89,10 +90,14 @@ class LINet(BaseModel):
         self.stream1_input_channels = stream1_input_channels
         self.stream2_input_channels = stream2_input_channels
         self.dropout_p = dropout_p
+        self.width_multiplier = width_multiplier
+
+        # Compute scaled base channel width
+        base_width_ch = int(64 * width_multiplier)
 
         # Initialize inplanes for 2-stream architecture (used by _build_network)
-        self.stream1_inplanes = 64
-        self.stream2_inplanes = 64
+        self.stream1_inplanes = base_width_ch
+        self.stream2_inplanes = base_width_ch
 
         # Set LINet default norm layer if not specified
         if norm_layer is None:
@@ -120,9 +125,13 @@ class LINet(BaseModel):
         replace_stride_with_dilation: list[bool]
     ):
         """Build the Linear Integration ResNet network architecture."""
+        # Compute scaled channel progression
+        w = self.width_multiplier
+        base = [int(c * w) for c in [64, 128, 256, 512]]
+
         # stream1_inplanes and stream2_inplanes are initialized in __init__ before super().__init__
         # Now add integrated_inplanes tracking for 3rd stream
-        self.integrated_inplanes = 64
+        self.integrated_inplanes = base[0]
 
         # Network architecture - exactly like ResNet but with 3-stream LI components
         # First conv: no integrated input yet (integrated starts after first block)
@@ -136,10 +145,10 @@ class LINet(BaseModel):
         self.maxpool = LIMaxPool2d(kernel_size=3, stride=2, padding=1)
 
         # ResNet layers - equal scaling for all 3 streams
-        self.layer1 = self._make_layer(block, 64, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, 256, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
-        self.layer4 = self._make_layer(block, 512, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+        self.layer1 = self._make_layer(block, base[0], base[0], layers[0])
+        self.layer2 = self._make_layer(block, base[1], base[1], layers[1], stride=2, dilate=replace_stride_with_dilation[0])
+        self.layer3 = self._make_layer(block, base[2], base[2], layers[2], stride=2, dilate=replace_stride_with_dilation[1])
+        self.layer4 = self._make_layer(block, base[3], base[3], layers[3], stride=2, dilate=replace_stride_with_dilation[2])
 
         # Adaptive average pooling for integrated stream only
         # (Stream1/Stream2 pooling happens in LIMaxPool2d layers)
@@ -150,7 +159,7 @@ class LINet(BaseModel):
 
         # Single classifier for integrated stream features
         # No fusion needed - integrated stream is the final representation!
-        feature_dim = 512 * block.expansion
+        feature_dim = base[3] * block.expansion
         self.fc = nn.Linear(feature_dim, self.num_classes)
 
         # Auxiliary classifiers for stream monitoring (gradient-isolated)
@@ -2136,12 +2145,24 @@ class LINet(BaseModel):
         } 
 
 # Factory functions for common LINet architectures
-def li_resnet18(num_classes: int = 1000, **kwargs) -> LINet:
-    """Create a Linear Integration ResNet-18 model."""
+def li_resnet18(num_classes: int = 19, stream_input_channels: Optional[list[int]] = None, width_multiplier: float = 1.0, **kwargs) -> LINet:
+    """Create a Linear Integration ResNet-18 model.
+
+    Args:
+        num_classes: Number of output classes.
+        stream_input_channels: Input channels per stream, e.g. [3, 1] for RGB+Depth.
+        width_multiplier: Scale channel widths. 1.0 = standard ResNet-18 [64,128,256,512].
+            0.75 → [48,96,192,384] (~56% params), 0.5 → [32,64,128,256] (~25% params).
+    """
+    if stream_input_channels is None:
+        stream_input_channels = [3, 1]
     return LINet(
         LIBasicBlock,
         [2, 2, 2, 2],
         num_classes=num_classes,
+        stream1_input_channels=stream_input_channels[0],
+        stream2_input_channels=stream_input_channels[1],
+        width_multiplier=width_multiplier,
         **kwargs
     )
 
