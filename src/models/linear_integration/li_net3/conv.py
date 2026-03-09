@@ -258,7 +258,7 @@ class _LIConvNd(nn.Module):
                     init.uniform_(stream_bias, -bound, bound)
 
         # Initialize integrated pathway weights
-        init.kaiming_uniform_(self.integrated_weight, a=math.sqrt(5))
+        nn.init.eye_(self.integrated_weight.squeeze(-1).squeeze(-1))
         if self.integrated_bias is not None:
             fan_in, _ = init._calculate_fan_in_and_fan_out(self.integrated_weight)
             if fan_in != 0:
