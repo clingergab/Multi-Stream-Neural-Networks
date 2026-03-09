@@ -258,7 +258,10 @@ class _LIConvNd(nn.Module):
                     init.uniform_(stream_bias, -bound, bound)
 
         # Initialize integrated pathway weights
-        nn.init.eye_(self.integrated_weight.squeeze(-1).squeeze(-1))
+        # Squeeze to 2D, apply orthogonal, unsqueeze back
+        w = self.integrated_weight.squeeze(-1).squeeze(-1)  # [out_ch, in_ch]
+        init.orthogonal_(w)
+        self.integrated_weight.data = w.unsqueeze(-1).unsqueeze(-1)
         if self.integrated_bias is not None:
             fan_in, _ = init._calculate_fan_in_and_fan_out(self.integrated_weight)
             if fan_in != 0:
