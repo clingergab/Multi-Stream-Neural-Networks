@@ -170,13 +170,6 @@ class LINet(BaseModel):
         feature_dim = base[3] * block.expansion
         self.fc = nn.Linear(feature_dim, self.num_classes)
 
-        # Auxiliary classifiers for stream monitoring (gradient-isolated)
-        # These learn to classify from stream features but DON'T affect stream training via .detach()
-        # Only used when stream_monitoring=True
-        self.fc_streams = nn.ModuleList([
-            nn.Linear(feature_dim, self.num_classes)
-            for _ in range(self.num_streams)
-        ])
     
     def _initialize_weights(self, zero_init_residual: bool):
         """Initialize network weights for N-stream architecture."""
@@ -2017,7 +2010,10 @@ class LINet(BaseModel):
         """
         Analyze the contribution and performance of individual pathways.
 
-        Uses auxiliary classifiers (fc_streams) for per-stream accuracy.
+        Uses blanked-stream evaluation for per-stream accuracy: blanking stream i
+        measures how well the model performs without that stream (i.e. using only
+        the remaining streams). Stream contribution = baseline_acc - blanked_acc.
+
         Uses main classifier (fc) for the full model / integrated pathway.
 
         Note: In LINet3, the full model prediction IS the integrated pathway
@@ -2030,7 +2026,8 @@ class LINet(BaseModel):
 
         Returns:
             Dictionary containing pathway analysis results for all N streams + integrated:
-            - accuracy: full_model, stream{i}_only, stream{i}_contribution,
+            - accuracy: full_model, stream{i}_only (acc with stream i blanked),
+                        stream{i}_contribution (baseline - blanked),
                         integrated_only (= full_model), integrated_contribution (= 1.0)
             - loss: same structure as accuracy
             - feature_norms: mean/std for each pathway's feature activations
@@ -2041,63 +2038,30 @@ class LINet(BaseModel):
 
         self.eval()
 
-        # Initialize metrics for N streams + full model (integrated = full model in LINet3)
-        full_model_correct = 0
-        stream_only_correct = [0] * self.num_streams
+        # Get stream accuracy/loss via blanked-stream evaluation
+        stream_contrib = self._evaluate_stream_contributions(data_loader)
+        full_accuracy = stream_contrib['baseline_acc']
+        full_loss = stream_contrib['baseline_loss']
+
+        # Collect feature norms (requires per-batch forward passes)
         total_samples = 0
-
-        full_model_loss = 0.0
-        stream_only_losses = [0.0] * self.num_streams
-
         stream_feature_norms = [[] for _ in range(self.num_streams)]
         integrated_feature_norms = []
 
         with torch.no_grad():
             for batch_data in data_loader:
-                # Unpack N streams + targets from tuple format
-                # DataLoader returns: (stream1, stream2, ..., streamN, labels)
                 *stream_batches, targets_batch = batch_data
-
-                # Move to device
                 stream_batches = [stream.to(self.device, non_blocking=True) for stream in stream_batches]
-                targets_batch = targets_batch.to(self.device, non_blocking=True)
 
                 batch_size_actual = stream_batches[0].size(0)
                 total_samples += batch_size_actual
 
-                # Integrated pathway: extract features via _forward_integrated_pathway,
-                # then classify with self.fc. This is identical to self(stream_batches)
-                # since forward() just does _forward_integrated_pathway + dropout + fc,
-                # and dropout is a no-op in eval mode. We use this path to get both
-                # the features (for norm analysis) and the logits (for accuracy/loss)
-                # in a single forward pass.
                 integrated_features = self._forward_integrated_pathway(stream_batches)
                 integrated_feature_norms.append(torch.norm(integrated_features, dim=1).cpu())
-                full_outputs = self.fc(integrated_features)
-                full_loss = self.criterion(full_outputs, targets_batch)
-                full_model_loss += full_loss.item() * batch_size_actual
 
-                _, full_predicted = torch.max(full_outputs, 1)
-                full_model_correct += (full_predicted == targets_batch).sum().item()
-
-                # Stream pathway analysis - USE AUXILIARY CLASSIFIERS
                 for i in range(self.num_streams):
                     stream_features = self._forward_stream_pathway(i, stream_batches[i])
                     stream_feature_norms[i].append(torch.norm(stream_features, dim=1).cpu())
-                    stream_outputs = self.fc_streams[i](stream_features)  # Auxiliary classifier!
-                    aux_crit = getattr(self, 'aux_criterion', self.criterion)
-                    stream_loss = aux_crit(stream_outputs, targets_batch)
-                    stream_only_losses[i] += stream_loss.item() * batch_size_actual
-
-                    _, stream_predicted = torch.max(stream_outputs, 1)
-                    stream_only_correct[i] += (stream_predicted == targets_batch).sum().item()
-
-        # Calculate metrics
-        full_accuracy = full_model_correct / total_samples
-        stream_accuracies = [correct / total_samples for correct in stream_only_correct]
-
-        avg_full_loss = full_model_loss / total_samples
-        avg_stream_losses = [loss / total_samples for loss in stream_only_losses]
 
         # Feature analysis
         stream_norms = [torch.cat(norms, dim=0) for norms in stream_feature_norms]
@@ -2106,20 +2070,19 @@ class LINet(BaseModel):
         # Build accuracy dictionary
         accuracy_dict = {'full_model': full_accuracy}
         for i in range(self.num_streams):
-            accuracy_dict[f'stream{i}_only'] = stream_accuracies[i]
-            accuracy_dict[f'stream{i}_contribution'] = stream_accuracies[i] / full_accuracy if full_accuracy > 0 else 0
-        # integrated_only is identical to full_model in LINet3 (the full model IS the
-        # integrated pathway). Kept for backwards compatibility.
+            blanked_acc = stream_contrib[f'stream_{i}_blanked_acc']
+            accuracy_dict[f'stream{i}_only'] = blanked_acc
+            accuracy_dict[f'stream{i}_contribution'] = stream_contrib[f'stream_{i}_contribution']
         accuracy_dict['integrated_only'] = full_accuracy
         accuracy_dict['integrated_contribution'] = 1.0
 
         # Build loss dictionary
-        loss_dict = {'full_model': avg_full_loss}
+        loss_dict = {'full_model': full_loss}
         for i in range(self.num_streams):
-            loss_dict[f'stream{i}_only'] = avg_stream_losses[i]
-            # Contribution = ratio of stream loss to full model loss (lower is better)
-            loss_dict[f'stream{i}_contribution'] = avg_stream_losses[i] / avg_full_loss if avg_full_loss > 0 else 0
-        loss_dict['integrated_only'] = avg_full_loss
+            blanked_loss = stream_contrib[f'stream_{i}_blanked_loss']
+            loss_dict[f'stream{i}_only'] = blanked_loss
+            loss_dict[f'stream{i}_contribution'] = blanked_loss / full_loss if full_loss > 0 else 0
+        loss_dict['integrated_only'] = full_loss
         loss_dict['integrated_contribution'] = 1.0
 
         # Build feature norms dictionary
