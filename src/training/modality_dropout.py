@@ -12,37 +12,56 @@ def get_modality_dropout_prob(
     epoch: int,
     start_epoch: int = 0,
     ramp_epochs: int = 20,
-    final_rate: float = 0.2
+    final_rate: float = 0.2,
+    schedule: str = 'ramp_up'
 ) -> float:
     """
     Compute modality dropout probability based on current epoch.
 
-    Schedule:
-    - Before start_epoch: 0% dropout
-    - During ramp (start_epoch to start_epoch + ramp_epochs - 1): Linear ramp
-      from (final_rate / ramp_epochs) to final_rate
-    - At and after (start_epoch + ramp_epochs - 1): final_rate
+    Schedules:
+    - 'ramp_up': Ramp from 0% to final_rate over ramp_epochs.
+      Before start_epoch: 0%. After ramp: final_rate.
+    - 'ramp_down': Ramp from 100% to final_rate over ramp_epochs.
+      Before start_epoch: 100%. After ramp: final_rate.
 
-    Example with start_epoch=0, ramp_epochs=10, final_rate=0.2:
+    If ramp_epochs <= 0, final_rate is applied immediately from start_epoch
+    (no gradual ramp).
+
+    Example (ramp_up) with start_epoch=0, ramp_epochs=10, final_rate=0.2:
       epoch 0: 2%, epoch 1: 4%, ... epoch 9: 20%, epoch 10+: 20%
+
+    Example (ramp_down) with start_epoch=0, ramp_epochs=10, final_rate=0.2:
+      epoch 0: 92%, epoch 1: 84%, ... epoch 9: 20%, epoch 10+: 20%
 
     Args:
         epoch: Current training epoch (0-indexed)
         start_epoch: Epoch to start dropout (default: 0)
-        ramp_epochs: Number of epochs to ramp to final_rate (default: 20)
+        ramp_epochs: Number of epochs to ramp to final_rate (default: 20).
+                    Set to 0 for no ramp (apply final_rate immediately).
         final_rate: Final dropout probability (default: 0.2 = 20%)
+        schedule: 'ramp_up' (0→final_rate) or 'ramp_down' (100%→final_rate)
 
     Returns:
         Dropout probability for this epoch
     """
+    if schedule not in ('ramp_up', 'ramp_down'):
+        raise ValueError(f"Unknown schedule '{schedule}', expected 'ramp_up' or 'ramp_down'")
+
     if epoch < start_epoch:
-        return 0.0
+        return 1.0 if schedule == 'ramp_down' else 0.0
+
+    if ramp_epochs <= 0:
+        return final_rate
+
     epochs_since_start = epoch - start_epoch
-    ramp_epochs = max(1, ramp_epochs)  # Prevent division by zero
-    if epochs_since_start < ramp_epochs:
-        # Linear ramp: epoch 0 gets 1/ramp_epochs, epoch ramp_epochs-1 gets full rate
-        return final_rate * ((epochs_since_start + 1) / ramp_epochs)
-    return final_rate
+    if epochs_since_start >= ramp_epochs:
+        return final_rate
+
+    progress = (epochs_since_start + 1) / ramp_epochs
+    if schedule == 'ramp_down':
+        return 1.0 - (1.0 - final_rate) * progress
+    else:
+        return final_rate * progress
 
 
 def generate_per_sample_blanked_mask(

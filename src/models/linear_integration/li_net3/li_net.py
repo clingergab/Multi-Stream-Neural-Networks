@@ -795,6 +795,7 @@ class LINet(BaseModel):
         modality_dropout_start: int = 0,  # Epoch to start modality dropout
         modality_dropout_ramp: int = 20,  # Epochs to ramp dropout from 0 to final rate
         modality_dropout_rate: float = 0.2,  # Final dropout rate (prob of blanking ANY stream per sample)
+        modality_dropout_schedule: str = 'ramp_up',  # 'ramp_up' (0→rate) or 'ramp_down' (100%→rate)
         # Stream balance loss parameters
         stream_balance_weight: float = 0.0,  # Weight for stream balance penalty (0 = disabled)
         stream_balance_layer: str = 'layer4',  # Layer to compute balance at
@@ -844,6 +845,9 @@ class LINet(BaseModel):
             modality_dropout_start: Epoch to start modality dropout (default: 0)
             modality_dropout_ramp: Number of epochs to ramp dropout from 0% to final rate (default: 20)
             modality_dropout_rate: Final dropout probability (per-sample probability of blanking ANY stream)
+            modality_dropout_schedule: Schedule direction. 'ramp_up' (default) ramps from 0% to rate.
+                                     'ramp_down' ramps from 100% to rate (forces single-stream learning early).
+                                     With ramp=0, rate is applied immediately regardless of schedule.
             gradient_monitoring: Enable gradient health tracking. Records pre-clip gradient norms
                                per stream and detects vanishing/exploding/oscillating gradients.
             gradient_log_freq: How often to log gradients. 0 = last batch only per epoch (minimal overhead),
@@ -1009,7 +1013,8 @@ class LINet(BaseModel):
                     epoch=epoch,
                     start_epoch=modality_dropout_start,
                     ramp_epochs=modality_dropout_ramp,
-                    final_rate=modality_dropout_rate
+                    final_rate=modality_dropout_rate,
+                    schedule=modality_dropout_schedule
                 )
                 history['modality_dropout_prob'].append(modality_dropout_prob)
 
@@ -1018,7 +1023,12 @@ class LINet(BaseModel):
                     modality_dropout_started = True
                     if verbose:
                         print(f"\n🎲 Modality dropout activated at epoch {epoch + 1} (prob={modality_dropout_prob:.1%})")
-                        print(f"   Schedule: ramp over {modality_dropout_ramp} epochs to {modality_dropout_rate:.0%}")
+                        if modality_dropout_ramp <= 0:
+                            print(f"   Schedule: constant at {modality_dropout_rate:.0%}")
+                        elif modality_dropout_schedule == 'ramp_down':
+                            print(f"   Schedule: ramp down from 100% to {modality_dropout_rate:.0%} over {modality_dropout_ramp} epochs")
+                        else:
+                            print(f"   Schedule: ramp up over {modality_dropout_ramp} epochs to {modality_dropout_rate:.0%}")
 
                 # Log dropout probability periodically (every 10 epochs during ramp)
                 elif modality_dropout_prob > 0 and epoch % 10 == 0 and verbose:

@@ -132,6 +132,98 @@ def test_dropout_prob_schedule():
     print("  ✅ PASSED: Dropout probability schedule works correctly")
 
 
+def test_dropout_prob_ramp_down_schedule():
+    """Test get_modality_dropout_prob with schedule='ramp_down'.
+
+    Ramp-down schedule: starts at 100% and decays to final_rate over ramp_epochs.
+    Before start_epoch: 100%.
+
+    Example with start=0, ramp=10, final=0.2:
+      - Epoch 0: 1.0 - (1.0 - 0.2) * (1/10) = 1.0 - 0.08 = 0.92
+      - Epoch 4: 1.0 - 0.8 * (5/10) = 0.6
+      - Epoch 9: 1.0 - 0.8 * (10/10) = 0.2
+      - Epoch 10+: 0.2
+    """
+    print("\n" + "=" * 60)
+    print("TEST: Dropout Probability Ramp-Down Schedule")
+    print("=" * 60)
+
+    start, ramp, final = 10, 20, 0.2
+
+    # Before start - should be 1.0 (full dropout)
+    prob = get_modality_dropout_prob(5, start, ramp, final, schedule='ramp_down')
+    assert prob == 1.0, f"Expected 1.0 before start, got {prob}"
+    print(f"  Epoch 5 (before start): {prob:.4f} ✓")
+
+    # At start - first step of decay
+    prob = get_modality_dropout_prob(10, start, ramp, final, schedule='ramp_down')
+    expected = 1.0 - (1.0 - final) * (1 / ramp)  # 1.0 - 0.8 * 0.05 = 0.96
+    assert abs(prob - expected) < 1e-6, f"Expected {expected}, got {prob}"
+    print(f"  Epoch 10 (at start): {prob:.4f} ✓")
+
+    # Midway through ramp
+    prob = get_modality_dropout_prob(19, start, ramp, final, schedule='ramp_down')
+    expected = 1.0 - (1.0 - final) * (10 / 20)  # 1.0 - 0.8 * 0.5 = 0.6
+    assert abs(prob - expected) < 1e-6, f"Expected {expected}, got {prob}"
+    print(f"  Epoch 19 (mid-ramp): {prob:.4f} ✓")
+
+    # End of ramp
+    prob = get_modality_dropout_prob(29, start, ramp, final, schedule='ramp_down')
+    assert abs(prob - final) < 1e-6, f"Expected {final}, got {prob}"
+    print(f"  Epoch 29 (end of ramp): {prob:.4f} ✓")
+
+    # After ramp - should be final
+    prob = get_modality_dropout_prob(50, start, ramp, final, schedule='ramp_down')
+    assert prob == final, f"Expected {final}, got {prob}"
+    print(f"  Epoch 50 (after ramp): {prob:.4f} ✓")
+
+    print("  ✅ PASSED: Ramp-down schedule works correctly")
+
+
+def test_dropout_prob_no_ramp():
+    """Test get_modality_dropout_prob with ramp_epochs=0 (immediate application)."""
+    print("\n" + "=" * 60)
+    print("TEST: Dropout Probability No Ramp (ramp_epochs=0)")
+    print("=" * 60)
+
+    start, final = 5, 0.5
+
+    # ramp_up with ramp=0: before start returns 0, at/after start returns final_rate
+    prob = get_modality_dropout_prob(3, start, 0, final, schedule='ramp_up')
+    assert prob == 0.0, f"Expected 0.0 before start (ramp_up), got {prob}"
+    print(f"  ramp_up epoch 3 (before start): {prob:.4f} ✓")
+
+    prob = get_modality_dropout_prob(5, start, 0, final, schedule='ramp_up')
+    assert prob == final, f"Expected {final} at start (ramp_up), got {prob}"
+    print(f"  ramp_up epoch 5 (at start): {prob:.4f} ✓")
+
+    prob = get_modality_dropout_prob(100, start, 0, final, schedule='ramp_up')
+    assert prob == final, f"Expected {final} after start (ramp_up), got {prob}"
+    print(f"  ramp_up epoch 100 (after start): {prob:.4f} ✓")
+
+    # ramp_down with ramp=0: before start returns 1.0, at/after start returns final_rate
+    prob = get_modality_dropout_prob(3, start, 0, final, schedule='ramp_down')
+    assert prob == 1.0, f"Expected 1.0 before start (ramp_down), got {prob}"
+    print(f"  ramp_down epoch 3 (before start): {prob:.4f} ✓")
+
+    prob = get_modality_dropout_prob(5, start, 0, final, schedule='ramp_down')
+    assert prob == final, f"Expected {final} at start (ramp_down), got {prob}"
+    print(f"  ramp_down epoch 5 (at start): {prob:.4f} ✓")
+
+    prob = get_modality_dropout_prob(100, start, 0, final, schedule='ramp_down')
+    assert prob == final, f"Expected {final} after start (ramp_down), got {prob}"
+    print(f"  ramp_down epoch 100 (after start): {prob:.4f} ✓")
+
+    # Invalid schedule should raise
+    try:
+        get_modality_dropout_prob(0, 0, 10, 0.2, schedule='invalid')
+        assert False, "Should have raised ValueError"
+    except ValueError:
+        print(f"  Invalid schedule raises ValueError ✓")
+
+    print("  ✅ PASSED: No-ramp (ramp_epochs=0) works correctly")
+
+
 def test_conv_masking():
     """Test 2: Verify blanked samples have zero output after conv."""
     print("\n" + "=" * 60)
