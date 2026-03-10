@@ -829,6 +829,8 @@ class LINet(BaseModel):
                                Always used for training accuracy. Also evaluates on val_loader if present.
             stream_eval_freq: Evaluate stream contributions every N epochs. 0 = disabled.
                             Always evaluates on the last epoch regardless. Default: 1.
+                            Note: stream early stopping patience only advances on evaluated epochs,
+                            so effective patience = patience × stream_eval_freq wall-clock epochs.
             stream_early_stopping: Enable stream-specific early stopping. When a stream plateaus, its
                                  parameters (.stream_weights.{i}.) are frozen while integration
                                  weights remain trainable, allowing the model to continue learning from
@@ -1136,34 +1138,38 @@ class LINet(BaseModel):
             if stream_monitoring:
                 train_contrib = {}
                 val_contrib = {}
-                if stream_eval_freq > 0 and (epoch % stream_eval_freq == 0 or epoch == epochs - 1):
+                evaluated = stream_eval_freq > 0 and (epoch % stream_eval_freq == 0 or epoch == epochs - 1)
+                if evaluated:
+                    if verbose and pbar is not None:
+                        pbar.set_postfix_str("evaluating streams...")
                     train_contrib = self._evaluate_stream_contributions(stream_train_eval_loader)
                     if stream_val_eval_loader is not None:
                         val_contrib = self._evaluate_stream_contributions(stream_val_eval_loader)
                     self.train()  # Restore training mode after evaluation
 
                 # Save per-stream accuracy to history
-                # When stream j is blanked, the result is the other stream(s)' accuracy
+                # On skipped epochs, append NaN so plots can distinguish "not evaluated" from "0%"
                 for i in range(self.num_streams):
-                    # Stream i's accuracy = model accuracy when all OTHER streams are blanked
-                    # For 2 streams: stream 0 acc = blanked stream 1, stream 1 acc = blanked stream 0
+                    # For N=2: stream i's solo acc = model acc when the OTHER stream is blanked
+                    # For N>2: stream_{i}_blanked_acc = acc WITHOUT stream i (contribution of other streams)
                     other_stream = (i + 1) % self.num_streams if self.num_streams == 2 else i
                     history[f'stream_{i}_train_acc'].append(
-                        train_contrib.get(f'stream_{other_stream}_blanked_acc', 0.0))
+                        train_contrib.get(f'stream_{other_stream}_blanked_acc', float('nan')))
                     history[f'stream_{i}_val_acc'].append(
-                        val_contrib.get(f'stream_{other_stream}_blanked_acc', 0.0))
+                        val_contrib.get(f'stream_{other_stream}_blanked_acc', float('nan')))
 
                 # Print and build stream_stats
                 stream_stats = self._print_stream_monitoring(
                     train_contrib=train_contrib,
                     val_contrib=val_contrib,
-                    stream_lrs=epoch_stream_lrs
+                    stream_lrs=epoch_stream_lrs,
+                    verbose=verbose
                 )
-                # Save learning rates if available
-                if stream_stats:
-                    for i in range(self.num_streams):
-                        if f'stream_{i}_lr' in stream_stats:
-                            history[f'stream_{i}_lr'].append(stream_stats[f'stream_{i}_lr'])
+
+                # Always append LR (independent of whether eval ran this epoch)
+                for i in range(self.num_streams):
+                    history[f'stream_{i}_lr'].append(epoch_stream_lrs[i] if i < len(epoch_stream_lrs) else
+                                                     self.optimizer.param_groups[0]['lr'])
 
             # Gradient monitoring epoch summary
             if gradient_health_tracker is not None:
@@ -1281,8 +1287,8 @@ class LINet(BaseModel):
                 'min_delta': min_delta  # Use parameter instead of state
             }
 
-        # Stream early stopping summary
-        if stream_early_stopping_state['enabled']:
+        # Stream early stopping summary (requires stream_monitoring for history keys)
+        if stream_early_stopping_state['enabled'] and stream_monitoring:
             # Use monitor parameter (monitor is shared between main and stream early stopping)
             history['stream_early_stopping'] = {
                 'monitor': monitor,
@@ -1339,19 +1345,23 @@ class LINet(BaseModel):
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before evaluate().")
 
-        loss, accuracy = self._validate(
-            data_loader, blanked_streams=blanked_streams
-        )
-
-        result = {
-            'loss': loss,
-            'accuracy': accuracy,
-        }
-
-        # Run blanked-stream evaluation for stream contribution analysis
-        if stream_monitoring:
+        # When stream_monitoring=True, _evaluate_stream_contributions already runs
+        # a baseline _validate pass, so use its results to avoid a redundant full pass
+        if stream_monitoring and blanked_streams is None:
             stream_contrib = self._evaluate_stream_contributions(data_loader)
+            result = {
+                'loss': stream_contrib['baseline_loss'],
+                'accuracy': stream_contrib['baseline_acc'],
+            }
             result.update(stream_contrib)
+        else:
+            loss, accuracy = self._validate(
+                data_loader, blanked_streams=blanked_streams
+            )
+            result = {
+                'loss': loss,
+                'accuracy': accuracy,
+            }
 
         return result
     def predict(self, data_loader: DataLoader) -> np.ndarray:
@@ -1859,20 +1869,25 @@ class LINet(BaseModel):
         return result
 
     def _print_stream_monitoring(self, train_contrib: dict, val_contrib: dict = None,
-                                 stream_lrs: list[float] = None) -> dict:
+                                 stream_lrs: list[float] = None,
+                                 verbose: bool = True) -> dict:
         """
-        Print per-stream accuracy from blanked-stream evaluation.
+        Print per-stream accuracy from blanked-stream evaluation and build stream_stats.
 
-        Shows each stream's accuracy by blanking the OTHER stream(s) and measuring
-        model performance. For 2 streams: stream_0 acc = accuracy when stream_1 is blanked.
+        For N=2: shows each stream's solo accuracy (model acc when the other stream is blanked).
+        For N>2: shows model accuracy without each stream (blanking stream i).
 
         Args:
             train_contrib: Dict from _evaluate_stream_contributions() on training subset
             val_contrib: Optional dict from _evaluate_stream_contributions() on validation data
             stream_lrs: Optional list of LRs used during this epoch
+            verbose: Whether to print output (default: True)
 
         Returns:
-            Dictionary containing stream-specific metrics for history/early stopping
+            Dictionary containing stream-specific metrics for early stopping:
+            - stream_{i}_val_acc: accuracy used for early stopping (val if available, else train)
+            - stream_{i}_val_loss: loss used for early stopping
+            - stream_{i}_lr: learning rate for stream i
         """
         if not train_contrib:
             return {}
@@ -1882,8 +1897,8 @@ class LINet(BaseModel):
         stream_stats = {}
 
         for i in range(self.num_streams):
-            # Stream i's accuracy = model accuracy when the OTHER stream is blanked
-            # For 2 streams: stream 0 acc = blanked stream 1 acc, and vice versa
+            # For N=2: stream i's solo acc = model acc when the OTHER stream is blanked
+            # For N>2: stream_{i}_blanked_acc = acc WITHOUT stream i
             other_stream = (i + 1) % self.num_streams if self.num_streams == 2 else i
             train_acc = train_contrib.get(f'stream_{other_stream}_blanked_acc', 0.0)
 
@@ -1913,7 +1928,8 @@ class LINet(BaseModel):
             stream_stats[f'stream_{i}_val_loss'] = es_source.get(f'stream_{other_stream}_blanked_loss', 0.0)
             stream_stats[f'stream_{i}_lr'] = stream_lr
 
-        print("  " + " | ".join(stream_strs))
+        if verbose:
+            print("  " + " | ".join(stream_strs))
 
         return stream_stats
 
@@ -2036,6 +2052,7 @@ class LINet(BaseModel):
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before analyze_pathways().")
 
+        was_training = self.training
         self.eval()
 
         # Get stream accuracy/loss via blanked-stream evaluation
@@ -2092,6 +2109,8 @@ class LINet(BaseModel):
             feature_norms_dict[f'stream{i}_std'] = stream_norms[i].std().item()
         feature_norms_dict['integrated_mean'] = integrated_norms.mean().item()
         feature_norms_dict['integrated_std'] = integrated_norms.std().item()
+
+        self.train(was_training)
 
         return {
             'accuracy': accuracy_dict,
@@ -2247,41 +2266,43 @@ class LINet(BaseModel):
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before calculating importance.")
 
-        # Save current training state
+        # Save current training state and use eval mode to avoid corrupting BN running stats.
+        # Use torch.enable_grad() to allow gradient computation in eval mode.
         was_training = self.training
-        self.train()  # Enable gradients
+        self.eval()
 
         stream_gradients = [[] for _ in range(self.num_streams)]
 
-        for batch_data in data_loader:
-            # Unpack N streams + targets from tuple format
-            # DataLoader returns: (stream1, stream2, ..., streamN, labels)
-            *stream_batches, targets_batch = batch_data
+        with torch.enable_grad():
+            for batch_data in data_loader:
+                # Unpack N streams + targets from tuple format
+                # DataLoader returns: (stream1, stream2, ..., streamN, labels)
+                *stream_batches, targets_batch = batch_data
 
-            # Move to device
-            stream_batches = [stream.to(self.device, non_blocking=True) for stream in stream_batches]
-            targets_batch = targets_batch.to(self.device, non_blocking=True)
+                # Move to device
+                stream_batches = [stream.to(self.device, non_blocking=True) for stream in stream_batches]
+                targets_batch = targets_batch.to(self.device, non_blocking=True)
 
-            # Require gradients for all inputs
-            for stream_batch in stream_batches:
-                stream_batch.requires_grad_(True)
+                # Require gradients for all inputs
+                for stream_batch in stream_batches:
+                    stream_batch.requires_grad_(True)
 
-            # Forward pass (creates integrated stream internally)
-            outputs = self(stream_batches)
-            loss = self.criterion(outputs, targets_batch)
+                # Forward pass (creates integrated stream internally)
+                outputs = self(stream_batches)
+                loss = self.criterion(outputs, targets_batch)
 
-            # Backward pass
-            loss.backward()
+                # Backward pass
+                loss.backward()
 
-            # Calculate gradient norms for each stream - flatten and then compute norm
-            for i in range(self.num_streams):
-                grad_norm = torch.norm(stream_batches[i].grad.flatten(1), dim=1).mean().item()
-                stream_gradients[i].append(grad_norm)
+                # Calculate gradient norms for each stream - flatten and then compute norm
+                for i in range(self.num_streams):
+                    grad_norm = torch.norm(stream_batches[i].grad.flatten(1), dim=1).mean().item()
+                    stream_gradients[i].append(grad_norm)
 
-            # Clear gradients
-            self.zero_grad()
-            for stream_batch in stream_batches:
-                stream_batch.grad = None
+                # Clear gradients
+                self.zero_grad()
+                for stream_batch in stream_batches:
+                    stream_batch.grad = None
 
         # Restore original training state
         self.train(was_training)

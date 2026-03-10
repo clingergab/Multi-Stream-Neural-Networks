@@ -340,13 +340,18 @@ def test_eval_freq_zero():
         stream_eval_freq=0,
     )
 
+    import math
     for i in range(2):
         train_accs = history[f'stream_{i}_train_acc']
         assert len(train_accs) == 3, f"Should have 3 entries, got {len(train_accs)}"
-        assert all(a == 0.0 for a in train_accs), \
-            f"With freq=0, all should be 0.0, got {train_accs}"
+        assert all(math.isnan(a) for a in train_accs), \
+            f"With freq=0, all should be NaN (not evaluated), got {train_accs}"
+        # LR should still be tracked every epoch
+        lrs = history[f'stream_{i}_lr']
+        assert len(lrs) == 3, f"LR should have 3 entries, got {len(lrs)}"
+        assert all(lr > 0 for lr in lrs), f"LR should be positive, got {lrs}"
 
-    print("  OK: History has correct length with all zeros")
+    print("  OK: History has correct length with NaN for skipped epochs, LR always tracked")
 
 
 def test_eval_freq_skipping():
@@ -368,16 +373,22 @@ def test_eval_freq_skipping():
         stream_eval_samples=50,
     )
 
+    import math
     train_accs = history['stream_0_train_acc']
     assert len(train_accs) == 5, f"Should have 5 entries, got {len(train_accs)}"
     # Epochs 0, 2, 4 should be evaluated (freq=2, and epoch 4 is last)
-    # Epochs 1, 3 should be 0.0
+    # Epochs 1, 3 should be NaN (skipped)
     print(f"  stream_0_train_acc per epoch: {train_accs}")
-    assert train_accs[1] == 0.0, f"Epoch 1 should be 0.0 (skipped), got {train_accs[1]}"
-    assert train_accs[3] == 0.0, f"Epoch 3 should be 0.0 (skipped), got {train_accs[3]}"
-    # Epochs 0, 2, 4 could be 0.0 if random chance, but at least one should be non-zero
-    # after some training. Not guaranteed with random init, so just check structure.
-    print("  OK: Skipped epochs have 0.0, evaluated epochs have values")
+    assert math.isnan(train_accs[1]), f"Epoch 1 should be NaN (skipped), got {train_accs[1]}"
+    assert math.isnan(train_accs[3]), f"Epoch 3 should be NaN (skipped), got {train_accs[3]}"
+    # Evaluated epochs should have real values (not NaN)
+    assert not math.isnan(train_accs[0]), f"Epoch 0 should be evaluated, got NaN"
+    assert not math.isnan(train_accs[2]), f"Epoch 2 should be evaluated, got NaN"
+    assert not math.isnan(train_accs[4]), f"Epoch 4 should be evaluated, got NaN"
+    # LR list should have same length as acc list
+    lrs = history['stream_0_lr']
+    assert len(lrs) == 5, f"LR should have 5 entries (every epoch), got {len(lrs)}"
+    print("  OK: Skipped epochs have NaN, evaluated epochs have values, LR always tracked")
 
 
 def test_evaluate_method():

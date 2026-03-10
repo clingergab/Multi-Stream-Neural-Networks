@@ -686,8 +686,8 @@ class StreamGradCAM:
         self.labels = _default_stream_labels(self.num_streams, stream_labels)
         self._contrib_viz = StreamContributionVisualizer(model, stream_labels)
 
-    def _check_aux_classifier(self, stream_idx: int, dataloader: DataLoader) -> float:
-        """Quick accuracy check on first batch for auxiliary classifier guard."""
+    def _check_stream_quality(self, stream_idx: int, dataloader: DataLoader) -> float:
+        """Quick accuracy check on first batch using main classifier on stream features."""
         self.model.eval()
         with torch.no_grad():
             for batch_data in dataloader:
@@ -696,7 +696,7 @@ class StreamGradCAM:
                 targets = targets.to(self.device)
 
                 features = self.model._forward_stream_pathway(stream_idx, stream_batches[stream_idx])
-                logits = self.model.fc_streams[stream_idx](features)
+                logits = self.model.fc(features)
                 preds = logits.argmax(dim=1)
                 acc = (preds == targets).float().mean().item()
                 return acc
@@ -721,7 +721,7 @@ class StreamGradCAM:
             mode: 'integrated', 'stream', or 'decomposed'.
             target_class: class to compute Grad-CAM for (None = predicted class).
             stream_idx: required for mode='stream'.
-            dataloader: optional, for auxiliary classifier accuracy check.
+            dataloader: optional, for stream feature quality check.
             overlay_input: optional [H, W, 3] image for overlay.
             save_path: optional save path.
 
@@ -735,11 +735,11 @@ class StreamGradCAM:
         elif mode == "stream":
             assert stream_idx is not None, "stream_idx required for mode='stream'"
             if dataloader is not None:
-                acc = self._check_aux_classifier(stream_idx, dataloader)
+                acc = self._check_stream_quality(stream_idx, dataloader)
                 num_classes = self.model.num_classes
                 if acc < 2.0 / num_classes:
-                    print(f"WARNING: Auxiliary classifier for {self.labels[stream_idx]} appears "
-                          f"untrained (acc={acc:.1%}). Per-stream Grad-CAM results may not be meaningful.")
+                    print(f"WARNING: Stream {self.labels[stream_idx]} features through main classifier "
+                          f"have low accuracy (acc={acc:.1%}). Per-stream Grad-CAM may not be meaningful.")
             return self._gradcam_stream(stream_inputs, stream_idx, layer, target_class, overlay_input, save_path)
         elif mode == "decomposed":
             return self._gradcam_decomposed(stream_inputs, layer, target_class, overlay_input, save_path)
@@ -792,7 +792,7 @@ class StreamGradCAM:
         return heatmap
 
     def _gradcam_stream(self, stream_inputs, stream_idx, layer, target_class, overlay_input, save_path):
-        """Per-stream isolated Grad-CAM via auxiliary classifier."""
+        """Per-stream Grad-CAM: stream features through main classifier."""
         stream_input = stream_inputs[stream_idx].to(self.device)
 
         # Forward through stream pathway, capturing activations at the target layer
@@ -820,7 +820,7 @@ class StreamGradCAM:
 
             pooled = self.model.avgpool(stream_x)
             features = torch.flatten(pooled, 1)
-            logits = self.model.fc_streams[stream_idx](features)
+            logits = self.model.fc(features)
 
             if target_class is None:
                 target_class = logits.argmax(dim=1).item()
