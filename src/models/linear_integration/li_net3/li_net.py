@@ -786,7 +786,9 @@ class LINet(BaseModel):
         gradient_accumulation_steps: int = 1,  # Gradient accumulation for larger effective batch size
         grad_clip_norm: Optional[float] = None,  # Gradient clipping max norm (None = disabled)
         clear_cache_per_epoch: bool = False,  # Clear CUDA cache after each epoch (only if experiencing OOM)
-        stream_monitoring: bool = False,  # Enable stream-specific monitoring (LR, WD, acc per stream)
+        stream_monitoring: bool = False,  # Enable stream contribution monitoring via blanked-stream evaluation
+        stream_eval_samples: int = 500,  # Number of training samples for stream eval (used when no val_loader)
+        stream_eval_freq: int = 1,  # Evaluate stream contributions every N epochs (0 = disabled)
         stream_early_stopping: bool = False,  # Enable stream-specific early stopping (freezes streams when they plateau)
         stream_patience: Union[int, list[int]] = 10,  # Patience per stream (int for all, or list[int] per stream)
         stream_min_delta: float = 0.001,  # Minimum improvement for stream early stopping
@@ -827,10 +829,13 @@ class LINet(BaseModel):
                                        Useful for simulating larger batch sizes (e.g., 4 steps = 4x effective batch size)
             grad_clip_norm: Maximum gradient norm for clipping (None to disable). Standard values: 1.0 or 5.0
             clear_cache_per_epoch: Whether to clear CUDA cache after each epoch (only enable if OOM issues)
-            stream_monitoring: Enable stream-specific monitoring. Shows per-stream LR, WD, train/val acc.
-                            Auxiliary classifiers (fc_streams[i] for i in 0..N-1) learn to classify stream features
-                            but are gradient-isolated (use .detach()) so they DON'T affect stream weight training.
-                            This provides accurate stream accuracy metrics without changing main training dynamics.
+            stream_monitoring: Enable stream contribution monitoring via blanked-stream evaluation.
+                            Runs the model with each stream blanked to measure per-stream contribution.
+                            Uses validation data if available, otherwise a random training subset.
+            stream_eval_samples: Number of training samples for stream evaluation subset. Default: 500.
+                               Always used for training accuracy. Also evaluates on val_loader if present.
+            stream_eval_freq: Evaluate stream contributions every N epochs. 0 = disabled.
+                            Always evaluates on the last epoch regardless. Default: 1.
             stream_early_stopping: Enable stream-specific early stopping. When a stream plateaus, its
                                  parameters (.stream_weights.{i}.) are frozen while integration
                                  weights remain trainable, allowing the model to continue learning from
@@ -884,72 +889,26 @@ class LINet(BaseModel):
             print("⚠️  Warning: stream_early_stopping=True requires stream_monitoring=True to work")
             print("   Stream early stopping will be disabled until stream_monitoring is enabled")
 
-        # Create separate optimizer for auxiliary classifiers (if stream monitoring enabled)
-        # This ensures auxiliary training doesn't affect main model's optimizer state
-        aux_optimizer = None
+        # Create stream evaluation loaders for blanked-stream monitoring
+        stream_train_eval_loader = None
+        stream_val_eval_loader = None
         if stream_monitoring:
-            # Collect all auxiliary classifier parameters from fc_streams ModuleList
-            aux_params = []
-            for fc_stream in self.fc_streams:
-                aux_params.extend([fc_stream.weight, fc_stream.bias])
-
-            # Use same optimizer type and ALL hyperparameters as main optimizer
-            # This ensures auxiliary classifiers train identically to main model
-            main_group = self.optimizer.param_groups[0]
-
-            if isinstance(self.optimizer, torch.optim.Adam):
-                # Copy all Adam hyperparameters from main optimizer
-                aux_optimizer = torch.optim.Adam(
-                    aux_params,
-                    lr=main_group['lr'],
-                    betas=main_group.get('betas', (0.9, 0.999)),
-                    eps=main_group.get('eps', 1e-8),
-                    weight_decay=main_group.get('weight_decay', 0),
-                    amsgrad=main_group.get('amsgrad', False)
-                )
-            elif isinstance(self.optimizer, torch.optim.AdamW):
-                # Copy all AdamW hyperparameters from main optimizer
-                aux_optimizer = torch.optim.AdamW(
-                    aux_params,
-                    lr=main_group['lr'],
-                    betas=main_group.get('betas', (0.9, 0.999)),
-                    eps=main_group.get('eps', 1e-8),
-                    weight_decay=main_group.get('weight_decay', 0),
-                    amsgrad=main_group.get('amsgrad', False)
-                )
-            elif isinstance(self.optimizer, torch.optim.SGD):
-                # Copy all SGD hyperparameters from main optimizer
-                aux_optimizer = torch.optim.SGD(
-                    aux_params,
-                    lr=main_group['lr'],
-                    momentum=main_group.get('momentum', 0),
-                    dampening=main_group.get('dampening', 0),
-                    weight_decay=main_group.get('weight_decay', 0),
-                    nesterov=main_group.get('nesterov', False)
-                )
-            elif isinstance(self.optimizer, torch.optim.RMSprop):
-                # Copy all RMSprop hyperparameters from main optimizer
-                aux_optimizer = torch.optim.RMSprop(
-                    aux_params,
-                    lr=main_group['lr'],
-                    alpha=main_group.get('alpha', 0.99),
-                    eps=main_group.get('eps', 1e-8),
-                    weight_decay=main_group.get('weight_decay', 0),
-                    momentum=main_group.get('momentum', 0)
-                )
-            else:
-                # Fallback: use Adam with main optimizer's learning rate and weight_decay
-                aux_optimizer = torch.optim.Adam(
-                    aux_params,
-                    lr=main_group['lr'],
-                    weight_decay=main_group.get('weight_decay', 0)
-                )
-
-        # Auxiliary criterion: CrossEntropyLoss WITHOUT label smoothing.
-        # Auxiliary classifiers are monitoring tools — hard targets give accurate
-        # stream discriminability measurements. Label smoothing would systematically
-        # understate each stream's capability.
-        self.aux_criterion = nn.CrossEntropyLoss()
+            # Always create a training subset for stream evaluation
+            dataset = train_loader.dataset
+            n_samples = min(stream_eval_samples, len(dataset))
+            generator = torch.Generator().manual_seed(42)
+            indices = torch.randperm(len(dataset), generator=generator)[:n_samples].tolist()
+            subset = torch.utils.data.Subset(dataset, indices)
+            stream_train_eval_loader = DataLoader(
+                subset,
+                batch_size=train_loader.batch_size,
+                shuffle=False,
+                num_workers=getattr(train_loader, 'num_workers', 0),
+                pin_memory=getattr(train_loader, 'pin_memory', False),
+            )
+            # Also evaluate on validation data if available
+            if val_loader:
+                stream_val_eval_loader = val_loader
 
         # Best model tracking
         best_val_acc = 0.0
@@ -969,7 +928,7 @@ class LINet(BaseModel):
             'streams_frozen': []  # List of (epoch, stream_index) tuples
         }
 
-        # Add stream-specific metrics dynamically (if stream_monitoring=True)
+        # Add stream contribution metrics (if stream_monitoring=True)
         if stream_monitoring:
             for i in range(self.num_streams):
                 history[f'stream_{i}_train_acc'] = []
@@ -1051,9 +1010,8 @@ class LINet(BaseModel):
                 gradient_health_tracker.reset_epoch()
 
             # Training phase - use helper method
-            avg_train_loss, train_accuracy, stream_train_accs = self._train_epoch(
+            avg_train_loss, train_accuracy = self._train_epoch(
                 train_loader, history, pbar, gradient_accumulation_steps, grad_clip_norm, clear_cache_per_epoch,
-                stream_monitoring=stream_monitoring, aux_optimizer=aux_optimizer,
                 modality_dropout_prob=modality_dropout_prob,
                 gradient_health_tracker=gradient_health_tracker,
                 gradient_log_freq=gradient_log_freq,
@@ -1064,12 +1022,10 @@ class LINet(BaseModel):
             # Validation phase
             val_loss = 0.0
             val_acc = 0.0
-            stream_val_accs = [0.0] * self.num_streams
-            stream_val_losses = [0.0] * self.num_streams
 
             if val_loader:
-                val_loss, val_acc, stream_val_accs, stream_val_losses = self._validate(
-                    val_loader, pbar=pbar, stream_monitoring=stream_monitoring
+                val_loss, val_acc = self._validate(
+                    val_loader, pbar=pbar
                 )
 
                 # Save best model by val accuracy
@@ -1182,33 +1138,39 @@ class LINet(BaseModel):
                 extra_postfix=extra_postfix
             )
 
-            # Stream-specific monitoring (print immediately after progress bar, on same line continuation)
+            # Stream contribution monitoring via blanked-stream evaluation
             stream_stats = {}
             if stream_monitoring:
-                # Always save stream accuracies to history (computed during training/validation) - N streams
-                for i in range(self.num_streams):
-                    history[f'stream_{i}_train_acc'].append(stream_train_accs[i])
-                    history[f'stream_{i}_val_acc'].append(stream_val_accs[i])
+                train_contrib = {}
+                val_contrib = {}
+                if stream_eval_freq > 0 and (epoch % stream_eval_freq == 0 or epoch == epochs - 1):
+                    train_contrib = self._evaluate_stream_contributions(stream_train_eval_loader)
+                    if stream_val_eval_loader is not None:
+                        val_contrib = self._evaluate_stream_contributions(stream_val_eval_loader)
+                    self.train()  # Restore training mode after evaluation
 
-                # Print detailed metrics only if using stream-specific parameter groups
-                if len(self.optimizer.param_groups) >= self.num_streams + 1:
-                    stream_stats = self._print_stream_monitoring(
-                        stream_train_accs=stream_train_accs,
-                        stream_val_accs=stream_val_accs,
-                        stream_val_losses=stream_val_losses,
-                        stream_lrs=epoch_stream_lrs
-                    )
-                    # Save learning rates (only available with stream-specific param groups)
-                    if stream_stats:
-                        for i in range(self.num_streams):
-                            history[f'stream_{i}_lr'].append(stream_stats[f'stream_{i}_lr'])
-                else:
-                    # Create minimal stream_stats for compatibility
-                    stream_stats = {}
+                # Save per-stream accuracy to history
+                # When stream j is blanked, the result is the other stream(s)' accuracy
+                for i in range(self.num_streams):
+                    # Stream i's accuracy = model accuracy when all OTHER streams are blanked
+                    # For 2 streams: stream 0 acc = blanked stream 1, stream 1 acc = blanked stream 0
+                    other_stream = (i + 1) % self.num_streams if self.num_streams == 2 else i
+                    history[f'stream_{i}_train_acc'].append(
+                        train_contrib.get(f'stream_{other_stream}_blanked_acc', 0.0))
+                    history[f'stream_{i}_val_acc'].append(
+                        val_contrib.get(f'stream_{other_stream}_blanked_acc', 0.0))
+
+                # Print and build stream_stats
+                stream_stats = self._print_stream_monitoring(
+                    train_contrib=train_contrib,
+                    val_contrib=val_contrib,
+                    stream_lrs=epoch_stream_lrs
+                )
+                # Save learning rates if available
+                if stream_stats:
                     for i in range(self.num_streams):
-                        stream_stats[f'stream_{i}_train_acc'] = stream_train_accs[i]
-                        stream_stats[f'stream_{i}_val_acc'] = stream_val_accs[i]
-                        stream_stats[f'stream_{i}_val_loss'] = stream_val_losses[i]
+                        if f'stream_{i}_lr' in stream_stats:
+                            history[f'stream_{i}_lr'].append(stream_stats[f'stream_{i}_lr'])
 
             # Gradient monitoring epoch summary
             if gradient_health_tracker is not None:
@@ -1368,32 +1330,35 @@ class LINet(BaseModel):
 
         Args:
             data_loader: DataLoader containing N-stream input data and targets
-            stream_monitoring: Whether to calculate stream-specific metrics (default: True)
+            stream_monitoring: Whether to run blanked-stream evaluation for stream
+                             contribution analysis (default: True)
             blanked_streams: Optional set of stream indices to blank for ALL samples.
                            Use this to test single-stream robustness:
                            - {0}: blank stream 0 (e.g., RGB), test with stream 1 only
                            - {1}: blank stream 1 (e.g., Depth), test with stream 0 only
 
         Returns:
-            Dictionary containing evaluation metrics (e.g., accuracy, loss, stream accuracies)
+            Dictionary containing evaluation metrics:
+                - loss, accuracy: overall model metrics
+                - If stream_monitoring=True: stream{i}_contribution, stream{i}_blanked_acc,
+                  stream{i}_blanked_loss, baseline_acc, baseline_loss
         """
         if self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before evaluate().")
 
-        loss, accuracy, stream_val_accs, stream_val_losses = self._validate(
-            data_loader, stream_monitoring=stream_monitoring, blanked_streams=blanked_streams
+        loss, accuracy = self._validate(
+            data_loader, blanked_streams=blanked_streams
         )
 
-        # Build result dictionary with N streams
         result = {
             'loss': loss,
             'accuracy': accuracy,
         }
 
-        # Add stream-specific metrics
-        for i in range(self.num_streams):
-            result[f'stream{i}_accuracy'] = stream_val_accs[i]
-            result[f'stream{i}_loss'] = stream_val_losses[i]
+        # Run blanked-stream evaluation for stream contribution analysis
+        if stream_monitoring:
+            stream_contrib = self._evaluate_stream_contributions(data_loader)
+            result.update(stream_contrib)
 
         return result
     def predict(self, data_loader: DataLoader) -> np.ndarray:
@@ -1482,8 +1447,7 @@ class LINet(BaseModel):
     
     def _train_epoch(self, train_loader: DataLoader, history: dict, pbar: Optional['TqdmType'] = None,
                      gradient_accumulation_steps: int = 1, grad_clip_norm: Optional[float] = None,
-                     clear_cache_per_epoch: bool = False, stream_monitoring: bool = False,
-                     aux_optimizer: Optional[torch.optim.Optimizer] = None,
+                     clear_cache_per_epoch: bool = False,
                      modality_dropout_prob: float = 0.0,
                      gradient_health_tracker: Optional[GradientHealthTracker] = None,
                      gradient_log_freq: int = 0,
@@ -1499,28 +1463,16 @@ class LINet(BaseModel):
             gradient_accumulation_steps: Number of steps to accumulate gradients before updating
             grad_clip_norm: Maximum gradient norm for clipping (None to disable)
             clear_cache_per_epoch: Whether to clear CUDA cache after epoch
-            stream_monitoring: Whether to track stream-specific metrics during training.
-                            Auxiliary classifiers are trained with full gradients (gradient-isolated)
-                            to provide accurate monitoring without affecting main model.
             modality_dropout_prob: Per-sample probability of blanking a stream (0.0 = disabled)
 
         Returns:
-            Tuple of (average_train_loss, train_accuracy, stream_accs: list[float])
-            If stream_monitoring=False, stream_accs will be list of 0.0 values
+            Tuple of (average_train_loss, train_accuracy)
         """
         self.train()
         train_loss = 0.0
         train_batches = 0
         train_correct = 0
         train_total = 0
-
-        # Stream-specific tracking (if monitoring enabled) - N streams
-        # Per-stream active sample counters (accounts for modality dropout)
-        stream_train_correct = [0] * self.num_streams
-        stream_train_active = [0] * self.num_streams
-        # Per-stream auxiliary loss tracking (for loss decomposition)
-        stream_train_loss = [0.0] * self.num_streams
-        stream_train_loss_count = [0] * self.num_streams
 
         # Stream balance loss tracking
         balance_loss_accum = 0.0
@@ -1682,99 +1634,6 @@ class LINet(BaseModel):
             train_loss += original_loss
             train_batches += 1
 
-            # Stream-specific monitoring with auxiliary classifiers (gradient-isolated)
-            # This happens AFTER main optimizer.step() so auxiliary classifiers can learn independently
-            # Note: Full gradients used (no scaling) for accurate monitoring
-            if stream_monitoring:
-                # === STREAM MONITORING: Pure observation without side effects ===
-                # CRITICAL: Use eval mode during stream pathway forwards to prevent
-                # any modification to BN running stats. Monitoring should be pure
-                # observation - it must not affect the main model's training dynamics.
-                was_training = self.training
-                self.eval()  # Prevent BN stats updates during monitoring
-
-                # Forward through stream pathways and compute auxiliary losses
-                # Note: When modality dropout is active, we skip blanked samples for each stream
-                aux_losses = []
-                for i in range(self.num_streams):
-                    # Get mask for this stream (if dropout active)
-                    stream_blanked = blanked_mask.get(i) if blanked_mask else None
-
-                    # Forward through this stream's pathway (no BN stats updates in eval mode)
-                    stream_features = self._forward_stream_pathway(i, stream_batches[i])
-
-                    # DETACH features - stops gradient flow to stream weights!
-                    stream_features_detached = stream_features.detach()
-
-                    # Classify with auxiliary classifier (only it gets gradients)
-                    stream_outputs = self.fc_streams[i](stream_features_detached)
-
-                    # Compute auxiliary loss ONLY for non-blanked samples
-                    # Uses aux_criterion (no label smoothing) for accurate stream monitoring
-                    if stream_blanked is not None and stream_blanked.any():
-                        # Get indices of active (non-blanked) samples
-                        active_idx = (~stream_blanked).nonzero(as_tuple=True)[0]
-                        if len(active_idx) > 0:
-                            aux_loss = self.aux_criterion(stream_outputs[active_idx], targets[active_idx])
-                            aux_losses.append(aux_loss)
-                            # Track per-stream loss for decomposition
-                            stream_train_loss[i] += aux_loss.item()
-                            stream_train_loss_count[i] += 1
-                        # If all samples blanked for this stream, skip this stream's aux loss
-                    else:
-                        # No blanking - use all samples
-                        aux_loss = self.aux_criterion(stream_outputs, targets)
-                        aux_losses.append(aux_loss)
-                        # Track per-stream loss for decomposition
-                        stream_train_loss[i] += aux_loss.item()
-                        stream_train_loss_count[i] += 1
-
-                # Restore training mode for auxiliary classifier backward pass
-                # (fc_streams don't have BN, so this is safe)
-                self.train(was_training)
-
-                # Backward pass for auxiliary classifiers only (detached features ensure no gradient to streams)
-                # Each stream's classifier learns independently with full gradients
-                # CRITICAL: Use separate aux_optimizer to avoid affecting main optimizer's internal state
-                if aux_losses:  # Only if we have any losses to backprop
-                    if self.use_amp:
-                        for aux_loss in aux_losses:
-                            self.scaler.scale(aux_loss).backward()
-                        # Update auxiliary classifiers using separate optimizer
-                        self.scaler.step(aux_optimizer)
-                        self.scaler.update()
-                    else:
-                        for aux_loss in aux_losses:
-                            aux_loss.backward()
-                        # Update auxiliary classifiers using separate optimizer
-                        aux_optimizer.step()
-
-                    # Zero gradients for auxiliary optimizer
-                    aux_optimizer.zero_grad()
-
-                # === ACCURACY MEASUREMENT PHASE: Calculate stream accuracies ===
-                # Only count non-blanked samples for each stream's accuracy
-                with torch.no_grad():
-                    self.eval()  # Disable dropout, use BN running stats
-
-                    for i in range(self.num_streams):
-                        stream_features = self._forward_stream_pathway(i, stream_batches[i])
-                        stream_outputs = self.fc_streams[i](stream_features)
-                        stream_pred = stream_outputs.argmax(1)
-
-                        # Only count non-blanked samples for accuracy
-                        stream_blanked = blanked_mask.get(i) if blanked_mask else None
-                        if stream_blanked is not None and stream_blanked.any():
-                            active_idx = (~stream_blanked).nonzero(as_tuple=True)[0]
-                            if len(active_idx) > 0:
-                                stream_train_correct[i] += (stream_pred[active_idx] == targets[active_idx]).sum().item()
-                                stream_train_active[i] += len(active_idx)
-                        else:
-                            stream_train_correct[i] += (stream_pred == targets).sum().item()
-                            stream_train_active[i] += targets.size(0)
-
-                    self.train(was_training)  # Restore training mode
-
             # Calculate training accuracy
             with torch.no_grad():
                 _, predicted = torch.max(outputs, 1)
@@ -1833,22 +1692,6 @@ class LINet(BaseModel):
         avg_train_loss = train_loss / train_batches
         train_accuracy = train_correct / train_total
 
-        # Calculate stream-specific accuracies (N streams)
-        # Use per-stream active sample counts (accounts for modality dropout)
-        stream_accs = [
-            stream_train_correct[i] / max(stream_train_active[i], 1) if stream_monitoring else 0.0
-            for i in range(self.num_streams)
-        ]
-
-        # Store per-stream training losses in history (loss decomposition)
-        if stream_monitoring:
-            for i in range(self.num_streams):
-                key = f'stream_{i}_train_loss'
-                if key not in history:
-                    history[key] = []
-                avg_stream_loss = stream_train_loss[i] / max(stream_train_loss_count[i], 1)
-                history[key].append(avg_stream_loss)
-
         # End-of-epoch modality dropout summary - store in history for analysis
         # Note: Printing is done by fit() after the progress bar closes to avoid output interference
         if dropout_stats is not None and dropout_stats['total_samples'] > 0:
@@ -1882,10 +1725,10 @@ class LINet(BaseModel):
         # if clear_cache_per_epoch and self.device.type == 'cuda':
         #     torch.cuda.empty_cache()
 
-        return avg_train_loss, train_accuracy, stream_accs
+        return avg_train_loss, train_accuracy
     
     def _validate(self, data_loader: DataLoader,
-                  pbar: Optional['TqdmType'] = None, stream_monitoring: bool = True,
+                  pbar: Optional['TqdmType'] = None,
                   blanked_streams: Optional[set[int]] = None) -> tuple:
         """
         Validate the model on the given data with GPU optimizations and reduced progress updates.
@@ -1893,24 +1736,17 @@ class LINet(BaseModel):
         Args:
             data_loader: DataLoader containing N-stream input data and targets
             pbar: Optional progress bar to update during validation
-            stream_monitoring: Whether to track stream-specific metrics during validation
             blanked_streams: Optional set of stream indices to blank for ALL samples.
                            Used for single-stream robustness evaluation.
 
         Returns:
-            Tuple of (loss, accuracy, stream_val_accs: list[float], stream_val_losses: list[float])
-            If stream_monitoring=False, stream accuracies and losses will be lists of 0.0
+            Tuple of (loss, accuracy)
         """
 
         self.eval()
         total_loss = 0.0
         correct = 0
         total = 0
-
-        # Stream-specific tracking (if monitoring enabled) - N streams
-        stream_val_correct = [0] * self.num_streams
-        stream_val_loss = [0.0] * self.num_streams
-        stream_val_total = 0
 
         # OPTIMIZATION 1: Progress bar update frequency for validation - major performance improvement
         update_frequency = max(1, len(data_loader) // 25)  # Update only 25 times during validation
@@ -1952,32 +1788,11 @@ class LINet(BaseModel):
                 else:
                     outputs = self(stream_batches, blanked_mask=blanked_mask)
                     loss = self.criterion(outputs, targets)
-                
+
                 total_loss += loss.item()
                 _, predicted = torch.max(outputs, 1)
                 total += targets.size(0)
                 correct += (predicted == targets).sum().item()
-
-                # Stream-specific monitoring with auxiliary classifiers
-                # Model is already in eval() mode, so dropout is disabled
-                if stream_monitoring:
-                    # Forward through stream pathways and compute metrics for all streams
-                    for i in range(self.num_streams):
-                        stream_features = self._forward_stream_pathway(i, stream_batches[i])
-
-                        # Classify with auxiliary classifier
-                        stream_outputs = self.fc_streams[i](stream_features)
-
-                        # Calculate stream loss (no label smoothing for auxiliary classifiers)
-                        aux_crit = getattr(self, 'aux_criterion', self.criterion)
-                        loss_i = aux_crit(stream_outputs, targets)
-                        stream_val_loss[i] += loss_i.item() * targets.size(0)
-
-                        # Calculate stream accuracy
-                        stream_pred = stream_outputs.argmax(1)
-                        stream_val_correct[i] += (stream_pred == targets).sum().item()
-
-                    stream_val_total += targets.size(0)
 
                 # OPTIMIZATION 1: Update progress bar much less frequently during validation
                 if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(data_loader) - 1):
@@ -1985,20 +1800,20 @@ class LINet(BaseModel):
                     current_val_acc = correct / total
                     # Get base LR (last param group if using stream-specific, otherwise first)
                     current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
-                    
+
                     # Get existing postfix and update with validation metrics
                     current_postfix = getattr(pbar, 'postfix', {})
                     if isinstance(current_postfix, dict):
                         postfix = current_postfix.copy()
                     else:
                         postfix = {}
-                    
+
                     # Update validation metrics while preserving training metrics
                     postfix.update({
                         'val_loss': f'{current_val_loss:.4f}',
                         'val_acc': f'{current_val_acc:.4f}'
                     })
-                    
+
                     # Add lr at the end (scientific notation for small LRs)
                     postfix['lr'] = f'{current_lr:.2e}'
 
@@ -2009,69 +1824,105 @@ class LINet(BaseModel):
                     actual_progress = batch_idx + 1
                     if actual_progress > pbar.n:
                         pbar.update(actual_progress - pbar.n)
-        
+
         avg_loss = total_loss / len(data_loader)
         accuracy = correct / total
 
-        # Calculate stream-specific accuracies and losses (N streams)
-        stream_val_accs = [
-            stream_val_correct[i] / max(stream_val_total, 1) if stream_monitoring else 0.0
-            for i in range(self.num_streams)
-        ]
-        avg_stream_val_losses = [
-            stream_val_loss[i] / max(stream_val_total, 1) if stream_monitoring else 0.0
-            for i in range(self.num_streams)
-        ]
+        return avg_loss, accuracy
 
-        return avg_loss, accuracy, stream_val_accs, avg_stream_val_losses
-
-    def _print_stream_monitoring(self, stream_train_accs: list[float], stream_val_accs: list[float],
-                                 stream_val_losses: list[float], stream_lrs: list[float] = None) -> dict:
+    def _evaluate_stream_contributions(self, eval_loader: DataLoader) -> dict:
         """
-        Print stream-specific monitoring metrics (computed during main training loop).
+        Evaluate each stream's contribution by running the model with one stream blanked at a time.
+
+        Runs (num_streams + 1) forward passes over eval_loader:
+        - 1 baseline pass (no blanking)
+        - N passes with each stream blanked
+
+        Stream contribution = baseline_acc - blanked_acc (positive = stream is important).
 
         Args:
-            stream_train_accs: List of training accuracies for each stream
-            stream_val_accs: List of validation accuracies for each stream
-            stream_val_losses: List of validation losses for each stream
-            stream_lrs: Optional list of LRs used during this epoch (if None, reads from optimizer)
+            eval_loader: DataLoader to evaluate on (validation or training subset)
 
         Returns:
-            Dictionary containing stream-specific metrics for history tracking
+            Dictionary with keys:
+                baseline_acc, baseline_loss,
+                stream_{i}_blanked_acc, stream_{i}_blanked_loss, stream_{i}_contribution
         """
-        # Get parameter groups info
+        # Baseline: all streams active
+        baseline_loss, baseline_acc = self._validate(eval_loader)
+
+        result = {
+            'baseline_acc': baseline_acc,
+            'baseline_loss': baseline_loss,
+        }
+
+        # Evaluate with each stream blanked
+        for i in range(self.num_streams):
+            blanked_loss, blanked_acc = self._validate(eval_loader, blanked_streams={i})
+            result[f'stream_{i}_blanked_acc'] = blanked_acc
+            result[f'stream_{i}_blanked_loss'] = blanked_loss
+            result[f'stream_{i}_contribution'] = baseline_acc - blanked_acc
+
+        return result
+
+    def _print_stream_monitoring(self, train_contrib: dict, val_contrib: dict = None,
+                                 stream_lrs: list[float] = None) -> dict:
+        """
+        Print per-stream accuracy from blanked-stream evaluation.
+
+        Shows each stream's accuracy by blanking the OTHER stream(s) and measuring
+        model performance. For 2 streams: stream_0 acc = accuracy when stream_1 is blanked.
+
+        Args:
+            train_contrib: Dict from _evaluate_stream_contributions() on training subset
+            val_contrib: Optional dict from _evaluate_stream_contributions() on validation data
+            stream_lrs: Optional list of LRs used during this epoch
+
+        Returns:
+            Dictionary containing stream-specific metrics for history/early stopping
+        """
+        if not train_contrib:
+            return {}
+
         param_groups = self.optimizer.param_groups
+        stream_strs = []
+        stream_stats = {}
 
-        # Build monitoring output for N input streams
-        # If using stream-specific parameter groups, we have N stream groups + 1 shared group
-        if len(param_groups) >= self.num_streams + 1:
-            # Build output strings for each stream
-            stream_strs = []
-            stream_stats = {}
+        for i in range(self.num_streams):
+            # Stream i's accuracy = model accuracy when the OTHER stream is blanked
+            # For 2 streams: stream 0 acc = blanked stream 1 acc, and vice versa
+            other_stream = (i + 1) % self.num_streams if self.num_streams == 2 else i
+            train_acc = train_contrib.get(f'stream_{other_stream}_blanked_acc', 0.0)
 
-            for i in range(self.num_streams):
-                # Use pre-captured LRs if provided, otherwise read from optimizer
-                stream_lr = stream_lrs[i] if stream_lrs is not None else param_groups[i]['lr']
-                stream_wd = param_groups[i]['weight_decay']
+            # Get LR from pre-captured values or optimizer
+            if stream_lrs is not None and i < len(stream_lrs):
+                stream_lr = stream_lrs[i]
+            elif len(param_groups) >= self.num_streams + 1:
+                stream_lr = param_groups[i]['lr']
+            else:
+                stream_lr = param_groups[0]['lr']
 
+            if val_contrib:
+                val_acc = val_contrib.get(f'stream_{other_stream}_blanked_acc', 0.0)
                 stream_str = (f"Stream_{i}: "
-                             f"T_acc:{stream_train_accs[i]:.4f}, V_acc:{stream_val_accs[i]:.4f}, "
+                             f"T_acc:{train_acc:.4f}, V_acc:{val_acc:.4f}, "
                              f"LR:{stream_lr:.2e}")
-                stream_strs.append(stream_str)
+            else:
+                stream_str = (f"Stream_{i}: "
+                             f"T_acc:{train_acc:.4f}, "
+                             f"LR:{stream_lr:.2e}")
+            stream_strs.append(stream_str)
 
-                # Add to stats dict
-                stream_stats[f'stream_{i}_train_acc'] = stream_train_accs[i]
-                stream_stats[f'stream_{i}_val_acc'] = stream_val_accs[i]
-                stream_stats[f'stream_{i}_val_loss'] = stream_val_losses[i]
-                stream_stats[f'stream_{i}_lr'] = stream_lr
-                stream_stats[f'stream_{i}_wd'] = stream_wd
+            # Populate stream_stats for early stopping compatibility
+            # Use val metrics if available, otherwise train metrics
+            es_source = val_contrib if val_contrib else train_contrib
+            stream_stats[f'stream_{i}_val_acc'] = es_source.get(f'stream_{other_stream}_blanked_acc', 0.0)
+            stream_stats[f'stream_{i}_val_loss'] = es_source.get(f'stream_{other_stream}_blanked_loss', 0.0)
+            stream_stats[f'stream_{i}_lr'] = stream_lr
 
-            # Print all streams on one line, separated by " | "
-            print("  " + " | ".join(stream_strs))
+        print("  " + " | ".join(stream_strs))
 
-            return stream_stats
-
-        return {}
+        return stream_stats
 
     @property
     def fusion_strategy(self) -> str:
