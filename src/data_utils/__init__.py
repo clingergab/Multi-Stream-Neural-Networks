@@ -38,9 +38,15 @@ from .dataset_utils import (
 
 # Transform utilities and dataset processing
 from .rgb_to_rgbl import (
-    RGBtoRGBL, 
+    RGBtoRGBL,
     create_rgbl_transform,
     process_dataset_to_streams
+)
+
+# OmniPretrain dataset for LINet pretraining
+from .omnipretrain_dataset import (
+    OmniPretrainDataset,
+    get_omnipretrain_dataloaders,
 )
 
 # Export all imports
@@ -72,5 +78,9 @@ __all__ = [
     # Transform utilities and dataset processing
     'process_dataset_to_streams',
     'RGBtoRGBL',
-    'create_rgbl_transform'
+    'create_rgbl_transform',
+
+    # OmniPretrain dataset
+    'OmniPretrainDataset',
+    'get_omnipretrain_dataloaders',
 ]

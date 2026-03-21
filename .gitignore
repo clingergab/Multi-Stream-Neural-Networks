@@ -65,3 +65,4 @@ coverage_reports/
 .coverage.*
 
 CLAUDE.md
+.claude/

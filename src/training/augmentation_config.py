@@ -36,6 +36,7 @@ BASE_RGB_ERASING_P = 0.17
 # Depth-only augmentations
 BASE_DEPTH_AUG_P = 0.50  # Combined brightness/contrast/noise block
 BASE_DEPTH_ERASING_P = 0.10
+BASE_DEPTH_SCALE_JITTER_P = 0.50
 
 
 # =============================================================================
@@ -68,6 +69,17 @@ BASE_ERASING_RATIO_MAX = 2.0
 BASE_DEPTH_BRIGHTNESS = 0.25  # ±25% brightness factor
 BASE_DEPTH_CONTRAST = 0.25    # ±25% contrast factor
 BASE_DEPTH_NOISE_STD = 0.059  # Gaussian noise std (≈15/255)
+
+# Depth scale jitter (value multiply, not spatial resize)
+BASE_DEPTH_SCALE_MIN = 0.9
+BASE_DEPTH_SCALE_MAX = 1.1
+
+# Depth random hole dropout (simulates sensor missing data)
+BASE_HOLE_DROPOUT_P = 0.30
+BASE_HOLE_DROPOUT_NUM_MIN = 3
+BASE_HOLE_DROPOUT_NUM_MAX = 8
+BASE_HOLE_DROPOUT_SIZE_MIN = 5    # pixels
+BASE_HOLE_DROPOUT_SIZE_MAX = 20   # pixels
 
 
 # =============================================================================
