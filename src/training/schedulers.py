@@ -137,11 +137,18 @@ class PerGroupSchedulerWrapper:
         self.last_epoch = -1
         self._last_lr = None
 
-    def step(self, epoch=None):
+    @property
+    def is_plateau(self):
+        """Whether this wrapper contains ReduceLROnPlateau schedulers."""
+        return self.scheduler_class == ReduceLROnPlateau
+
+    def step(self, metrics=None, epoch=None):
         """
         Step all per-group schedulers and update optimizer LRs.
 
         Args:
+            metrics: Metric value (e.g. val_loss) required for ReduceLROnPlateau.
+                     Ignored for other scheduler types.
             epoch: Optional epoch number. When epoch=0 is passed (by SequentialLR during
                    transition), we reset all sub-schedulers to their base LRs.
 
@@ -175,18 +182,28 @@ class PerGroupSchedulerWrapper:
             self.last_epoch = 0
             self._last_lr = base_lrs
         else:
-            # Normal step - no epoch argument to avoid deprecation issues
-            for scheduler in self.schedulers:
-                scheduler.step()
+            # Normal step
+            if self.is_plateau:
+                # ReduceLROnPlateau requires metrics argument
+                for scheduler in self.schedulers:
+                    scheduler.step(metrics)
+            else:
+                # All other schedulers: no arguments
+                for scheduler in self.schedulers:
+                    scheduler.step()
 
             # Update main optimizer LRs explicitly
             # This ensures correctness regardless of whether param_groups are truly shared
             for param_group, scheduler in zip(self.optimizer.param_groups, self.schedulers):
-                param_group['lr'] = scheduler.get_last_lr()[0]
+                param_group['lr'] = scheduler.optimizer.param_groups[0]['lr']
 
             # Update tracking
-            self.last_epoch = self.schedulers[0].last_epoch
-            self._last_lr = [scheduler.get_last_lr()[0] for scheduler in self.schedulers]
+            if self.is_plateau:
+                # ReduceLROnPlateau doesn't have get_last_lr(), read from optimizer
+                self._last_lr = [s.optimizer.param_groups[0]['lr'] for s in self.schedulers]
+            else:
+                self._last_lr = [scheduler.get_last_lr()[0] for scheduler in self.schedulers]
+                self.last_epoch = self.schedulers[0].last_epoch
 
     def _update_lr(self, epoch=None):
         """
@@ -591,7 +608,10 @@ def setup_scheduler(optimizer, scheduler_type: str, epochs: int = None, train_lo
             total_iters=warmup_epochs
         )
 
-        if isinstance(main_scheduler, ReduceLROnPlateau):
+        is_plateau = isinstance(main_scheduler, ReduceLROnPlateau) or (
+            isinstance(main_scheduler, PerGroupSchedulerWrapper) and main_scheduler.is_plateau
+        )
+        if is_plateau:
             # Special case: ReduceLROnPlateau cannot be used with SequentialLR
             # Wrap warmup + plateau in WarmupReduceLROnPlateau
             scheduler = WarmupReduceLROnPlateau(optimizer, warmup_scheduler, main_scheduler, warmup_epochs)
