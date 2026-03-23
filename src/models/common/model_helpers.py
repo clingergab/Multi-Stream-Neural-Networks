@@ -13,10 +13,80 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
-from typing import Optional, Union, Any, Callable
+from typing import Optional, Any
 
 
-def print_epoch_progress(epoch: int, epochs: int, epoch_time: float, 
+def load_pretrained_backbone(
+    model: nn.Module,
+    checkpoint_path: str,
+    verbose: bool = True,
+) -> dict[str, list[str]]:
+    """Load pretrained weights into a model, skipping mismatched layers.
+
+    Handles the common case where the classification head (``fc``) differs
+    between the pretrained checkpoint and the target model (different
+    ``num_classes``).  All compatible backbone weights are loaded; layers
+    with shape mismatches (e.g. ``fc.weight``, ``fc.bias``) are skipped.
+
+    Args:
+        model: Target model to load weights into.
+        checkpoint_path: Path to a ``.pt`` checkpoint file.  Accepts both
+            raw ``state_dict`` files and checkpoint dicts that contain a
+            ``'model_state_dict'`` key.
+        verbose: Print a summary of loaded / skipped keys.
+
+    Returns:
+        Dict with two lists:
+        - ``'loaded'``: keys that were successfully loaded.
+        - ``'skipped'``: keys that were skipped due to shape mismatch.
+
+    Example::
+
+        info = load_pretrained_backbone(model, 'checkpoints/omni_best.pt')
+        # info['skipped'] == ['fc.weight', 'fc.bias']
+    """
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    # Accept both raw state_dicts and checkpoint dicts
+    if 'model_state_dict' in checkpoint:
+        src_state = checkpoint['model_state_dict']
+    elif 'state_dict' in checkpoint:
+        src_state = checkpoint['state_dict']
+    else:
+        # Assume the file IS a state_dict
+        src_state = checkpoint
+
+    dst_state = model.state_dict()
+
+    loaded_keys: list[str] = []
+    skipped_keys: list[str] = []
+
+    filtered_state = {}
+    for key, src_param in src_state.items():
+        if key not in dst_state:
+            skipped_keys.append(key)
+            continue
+        if src_param.shape != dst_state[key].shape:
+            skipped_keys.append(key)
+            continue
+        filtered_state[key] = src_param
+        loaded_keys.append(key)
+
+    missing = model.load_state_dict(filtered_state, strict=False)
+
+    if verbose:
+        print(f"Loaded pretrained backbone from: {checkpoint_path}")
+        print(f"  Loaded:  {len(loaded_keys)} keys")
+        print(f"  Skipped: {len(skipped_keys)} keys (shape mismatch or absent)")
+        if skipped_keys:
+            print(f"  Skipped keys: {skipped_keys}")
+        if missing.unexpected_keys:
+            print(f"  Unexpected keys: {missing.unexpected_keys}")
+
+    return {'loaded': loaded_keys, 'skipped': skipped_keys}
+
+
+def print_epoch_progress(epoch: int, epochs: int, epoch_time: float,
                        avg_train_loss: float, train_accuracy: float,
                        val_loss: float, val_acc: float, val_loader: bool) -> None:
     """
