@@ -16,6 +16,7 @@ from torch.amp import autocast
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts
+from src.training.schedulers import WarmupReduceLROnPlateau, PerGroupSchedulerWrapper
 
 from src.models.abstracts.abstract_model import BaseModel
 from src.training.modality_dropout import get_modality_dropout_prob, generate_per_sample_blanked_mask
@@ -1104,18 +1105,29 @@ class LINet(BaseModel):
                 is_batch_scheduler = (isinstance(self.scheduler, OneCycleLR) or
                                      getattr(self.scheduler, '_step_per_batch', False))
                 if not is_batch_scheduler:
-                    if isinstance(self.scheduler, ReduceLROnPlateau):
-                        # ReduceLROnPlateau needs a metric to step
-                        if self.scheduler.mode == 'max':
-                            # Mode 'max': monitor accuracy (higher is better)
+                    # Detect if this is a Plateau-type scheduler (needs metric)
+                    is_plateau = isinstance(self.scheduler, (ReduceLROnPlateau, WarmupReduceLROnPlateau))
+                    if not is_plateau and isinstance(self.scheduler, PerGroupSchedulerWrapper):
+                        is_plateau = self.scheduler.is_plateau
+
+                    if is_plateau:
+                        # Plateau schedulers need a metric to decide when to step LR
+                        # Determine the metric based on mode (read from the inner scheduler)
+                        sched = self.scheduler
+                        if isinstance(sched, WarmupReduceLROnPlateau):
+                            sched = sched.plateau_scheduler
+                        if isinstance(sched, PerGroupSchedulerWrapper):
+                            mode = sched.schedulers[0].mode if sched.schedulers else 'min'
+                        else:
+                            mode = getattr(sched, 'mode', 'min')
+
+                        if mode == 'max':
                             metric = val_acc if val_loader else train_accuracy
                         else:
-                            # Mode 'min': monitor loss (lower is better)
                             metric = val_loss if val_loader else avg_train_loss
                         self.scheduler.step(metric)
                     else:
-                        # All other epoch-based schedulers (CosineAnnealingLR, CosineAnnealingWarmRestarts, StepLR, etc.)
-                        # step per epoch without arguments
+                        # All other epoch-based schedulers
                         self.scheduler.step()
             
             # Update history and finalize progress bar
