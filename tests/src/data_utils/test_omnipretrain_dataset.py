@@ -2,7 +2,6 @@
 
 import json
 import os
-import warnings
 
 import numpy as np
 import pytest
@@ -17,10 +16,28 @@ from src.data_utils.omnipretrain_dataset import (
 )
 
 
+def _create_split_samples(root, class_names, split, objs_per_class, frames_per_obj,
+                           depth_low=0, depth_high=10000, zero_sentinel=True):
+    """Helper to create .pt sample files in root/<split>/<class>/."""
+    split_dir = root / split
+    for cls_idx, cls_name in enumerate(class_names):
+        cls_dir = split_dir / cls_name
+        cls_dir.mkdir(parents=True, exist_ok=True)
+        for obj_idx in range(objs_per_class):
+            for frame_idx in range(frames_per_obj):
+                rgb = torch.randint(0, 256, (3, 256, 256), dtype=torch.uint8)
+                depth = torch.randint(depth_low, depth_high, (1, 256, 256), dtype=torch.uint16)
+                if zero_sentinel:
+                    depth[0, :5, :5] = 0
+                torch.save(rgb, cls_dir / f'obj_{cls_idx:03d}_{obj_idx:03d}_f{frame_idx:03d}_rgb.pt')
+                torch.save(depth, cls_dir / f'obj_{cls_idx:03d}_{obj_idx:03d}_f{frame_idx:03d}_depth.pt')
+
+
 def _make_dataset(fake_dataset, split='train', **kwargs):
     """Module-level helper to construct dataset from fake_dataset fixture."""
     data_root, class_names, norm_stats = fake_dataset
-    samples = _discover_samples(str(data_root), class_names)
+    split_dir = os.path.join(str(data_root), split)
+    samples = _discover_samples(split_dir, class_names)
     return OmniPretrainDataset(
         data_root=str(data_root),
         split=split,
@@ -33,19 +50,21 @@ def _make_dataset(fake_dataset, split='train', **kwargs):
 
 @pytest.fixture
 def fake_dataset(tmp_path):
-    """Create a minimal fake OmniPretrain dataset on disk.
+    """Create a minimal fake OmniPretrain dataset with train/val split.
 
-    Creates 3 classes with 10 samples each (30 total).
+    Creates 3 classes:
+      - train: 4 objects x 2 frames = 8 samples per class (24 total)
+      - val:   1 object  x 2 frames = 2 samples per class (6 total)
     Includes some depth pixels set to 0 (missing data sentinel).
     """
     class_names = ['chair', 'sofa', 'table']
 
-    # class_names.txt
+    # class_names.txt at root
     with open(tmp_path / 'class_names.txt', 'w') as f:
         for name in class_names:
             f.write(f"{name}\n")
 
-    # norm_stats.json
+    # norm_stats.json at root
     norm_stats = {
         'rgb_mean': [0.485, 0.456, 0.406],
         'rgb_std': [0.229, 0.224, 0.225],
@@ -55,17 +74,12 @@ def fake_dataset(tmp_path):
     with open(tmp_path / 'norm_stats.json', 'w') as f:
         json.dump(norm_stats, f)
 
-    # Create class folders with paired .pt files
-    for cls_idx, cls_name in enumerate(class_names):
-        cls_dir = tmp_path / cls_name
-        cls_dir.mkdir()
-        for i in range(10):
-            rgb = torch.randint(0, 256, (3, 256, 256), dtype=torch.uint8)
-            depth = torch.randint(0, 10000, (1, 256, 256), dtype=torch.uint16)
-            # Set some pixels to 0 (missing data)
-            depth[0, :5, :5] = 0
-            torch.save(rgb, cls_dir / f'obj_{cls_idx:03d}_f{i:03d}_rgb.pt')
-            torch.save(depth, cls_dir / f'obj_{cls_idx:03d}_f{i:03d}_depth.pt')
+    # Create train split: 4 objects x 2 frames per class
+    _create_split_samples(tmp_path, class_names, 'train',
+                           objs_per_class=4, frames_per_obj=2)
+    # Create val split: 1 object x 2 frames per class
+    _create_split_samples(tmp_path, class_names, 'val',
+                           objs_per_class=1, frames_per_obj=2)
 
     return tmp_path, class_names, norm_stats
 
@@ -87,14 +101,12 @@ def fake_dataset_indexed_classnames(tmp_path):
     with open(tmp_path / 'norm_stats.json', 'w') as f:
         json.dump(norm_stats, f)
 
-    for cls_idx, cls_name in enumerate(class_names):
-        cls_dir = tmp_path / cls_name
-        cls_dir.mkdir()
-        for i in range(4):
-            rgb = torch.randint(0, 256, (3, 256, 256), dtype=torch.uint8)
-            depth = torch.randint(100, 5000, (1, 256, 256), dtype=torch.uint16)
-            torch.save(rgb, cls_dir / f'obj_{cls_idx:03d}_f{i:03d}_rgb.pt')
-            torch.save(depth, cls_dir / f'obj_{cls_idx:03d}_f{i:03d}_depth.pt')
+    _create_split_samples(tmp_path, class_names, 'train',
+                           objs_per_class=2, frames_per_obj=2,
+                           depth_low=100, depth_high=5000, zero_sentinel=False)
+    _create_split_samples(tmp_path, class_names, 'val',
+                           objs_per_class=1, frames_per_obj=2,
+                           depth_low=100, depth_high=5000, zero_sentinel=False)
 
     return tmp_path, class_names
 
@@ -157,19 +169,27 @@ class TestDiscoverSamples:
     """Tests for _discover_samples helper."""
 
     def test_discovers_all_paired_samples(self, fake_dataset):
-        """All 30 samples (3 classes x 10) discovered with correct labels."""
+        """All 24 train samples (3 classes x 4 objs x 2 frames) discovered."""
         data_root, class_names, _ = fake_dataset
-        samples = _discover_samples(str(data_root), class_names)
-        assert len(samples) == 30
+        train_dir = str(data_root / 'train')
+        samples = _discover_samples(train_dir, class_names)
+        assert len(samples) == 24
         labels = [s[2] for s in samples]
-        assert labels.count(0) == 10  # chair
-        assert labels.count(1) == 10  # sofa
-        assert labels.count(2) == 10  # table
+        assert labels.count(0) == 8  # chair
+        assert labels.count(1) == 8  # sofa
+        assert labels.count(2) == 8  # table
+
+    def test_val_split_discovered_separately(self, fake_dataset):
+        """Val samples discovered from val/ subdirectory."""
+        data_root, class_names, _ = fake_dataset
+        val_dir = str(data_root / 'val')
+        samples = _discover_samples(val_dir, class_names)
+        assert len(samples) == 6  # 3 classes x 1 obj x 2 frames
 
     def test_each_sample_has_valid_paths(self, fake_dataset):
         """Each (rgb_path, depth_path, label) has existing files."""
         data_root, class_names, _ = fake_dataset
-        samples = _discover_samples(str(data_root), class_names)
+        samples = _discover_samples(str(data_root / 'train'), class_names)
         for rgb_path, depth_path, label in samples:
             assert os.path.exists(rgb_path)
             assert os.path.exists(depth_path)
@@ -178,35 +198,35 @@ class TestDiscoverSamples:
     def test_unpaired_rgb_raises(self, fake_dataset):
         """ValueError raised when RGB file has no matching depth."""
         data_root, class_names, _ = fake_dataset
-        # Add orphan RGB file
-        orphan = data_root / 'chair' / 'orphan_f000_rgb.pt'
+        orphan = data_root / 'train' / 'chair' / 'orphan_f000_rgb.pt'
         torch.save(torch.zeros(3, 256, 256, dtype=torch.uint8), orphan)
         with pytest.raises(ValueError, match="Unpaired files"):
-            _discover_samples(str(data_root), class_names)
+            _discover_samples(str(data_root / 'train'), class_names)
 
     def test_unpaired_depth_raises(self, fake_dataset):
         """ValueError raised when depth file has no matching RGB."""
         data_root, class_names, _ = fake_dataset
-        orphan = data_root / 'chair' / 'orphan_f000_depth.pt'
+        orphan = data_root / 'train' / 'chair' / 'orphan_f000_depth.pt'
         torch.save(torch.zeros(1, 256, 256, dtype=torch.uint16), orphan)
         with pytest.raises(ValueError, match="Unpaired files"):
-            _discover_samples(str(data_root), class_names)
+            _discover_samples(str(data_root / 'train'), class_names)
 
     def test_unknown_folder_skipped(self, fake_dataset):
         """Folders not in class_names.txt are skipped silently."""
         data_root, class_names, _ = fake_dataset
-        extra = data_root / 'unknown_class'
+        extra = data_root / 'train' / 'unknown_class'
         extra.mkdir()
         torch.save(torch.zeros(3, 256, 256, dtype=torch.uint8), extra / 'x_f000_rgb.pt')
         torch.save(torch.zeros(1, 256, 256, dtype=torch.uint16), extra / 'x_f000_depth.pt')
-        samples = _discover_samples(str(data_root), class_names)
-        assert len(samples) == 30  # unchanged
+        samples = _discover_samples(str(data_root / 'train'), class_names)
+        assert len(samples) == 24  # unchanged
 
     def test_deterministic_ordering(self, fake_dataset):
         """Two calls return identical ordering."""
         data_root, class_names, _ = fake_dataset
-        s1 = _discover_samples(str(data_root), class_names)
-        s2 = _discover_samples(str(data_root), class_names)
+        train_dir = str(data_root / 'train')
+        s1 = _discover_samples(train_dir, class_names)
+        s2 = _discover_samples(train_dir, class_names)
         assert s1 == s2
 
 
@@ -216,7 +236,7 @@ class TestOmniPretrainDataset:
     def test_init_train(self, fake_dataset):
         """Train dataset initializes with correct counts."""
         ds = _make_dataset(fake_dataset, split='train')
-        assert len(ds) == 30
+        assert len(ds) == 24
         assert ds.num_classes == 3
         assert ds.split == 'train'
 
@@ -224,11 +244,20 @@ class TestOmniPretrainDataset:
         """Val dataset initializes correctly."""
         ds = _make_dataset(fake_dataset, split='val')
         assert ds.split == 'val'
+        assert len(ds) == 6
 
     def test_invalid_split_raises(self, fake_dataset):
         """ValueError on invalid split name."""
+        data_root, class_names, norm_stats = fake_dataset
+        samples = _discover_samples(str(data_root / 'train'), class_names)
         with pytest.raises(ValueError, match="split must be one of"):
-            _make_dataset(fake_dataset, split='test')
+            OmniPretrainDataset(
+                data_root=str(data_root),
+                split='test',
+                samples=samples,
+                class_names=class_names,
+                norm_stats=norm_stats,
+            )
 
     def test_getitem_shapes_train(self, fake_dataset):
         """__getitem__ returns correct shapes and types for train."""
@@ -278,15 +307,15 @@ class TestOmniPretrainDataset:
         with open(tmp_path / 'norm_stats.json', 'w') as f:
             json.dump(norm_stats, f)
 
-        cls_dir = tmp_path / 'chair'
-        cls_dir.mkdir()
+        cls_dir = tmp_path / 'train' / 'chair'
+        cls_dir.mkdir(parents=True)
         rgb = torch.randint(0, 256, (3, 256, 256), dtype=torch.uint8)
         # All pixels set to 3000mm
         depth = torch.full((1, 256, 256), 3000, dtype=torch.uint16)
         torch.save(rgb, cls_dir / 'obj_000_f000_rgb.pt')
         torch.save(depth, cls_dir / 'obj_000_f000_depth.pt')
 
-        samples = _discover_samples(str(tmp_path), class_names)
+        samples = _discover_samples(str(tmp_path / 'train'), class_names)
         ds = OmniPretrainDataset(
             data_root=str(tmp_path),
             split='val',
@@ -323,8 +352,8 @@ class TestOmniPretrainDataset:
         with open(tmp_path / 'norm_stats.json', 'w') as f:
             json.dump(norm_stats, f)
 
-        cls_dir = tmp_path / 'chair'
-        cls_dir.mkdir()
+        cls_dir = tmp_path / 'train' / 'chair'
+        cls_dir.mkdir(parents=True)
         rgb = torch.randint(0, 256, (3, 256, 256), dtype=torch.uint8)
         # All non-zero depth except at center
         depth = torch.full((1, 256, 256), 5000, dtype=torch.uint16)
@@ -332,7 +361,7 @@ class TestOmniPretrainDataset:
         torch.save(rgb, cls_dir / 'obj_000_f000_rgb.pt')
         torch.save(depth, cls_dir / 'obj_000_f000_depth.pt')
 
-        samples = _discover_samples(str(tmp_path), class_names)
+        samples = _discover_samples(str(tmp_path / 'train'), class_names)
         ds = OmniPretrainDataset(
             data_root=str(tmp_path),
             split='val',
@@ -379,7 +408,7 @@ class TestOmniPretrainDataset:
         """get_sample_weights returns [num_samples] float64 tensor."""
         ds = _make_dataset(fake_dataset, split='train')
         weights = ds.get_sample_weights()
-        assert weights.shape == (30,)
+        assert weights.shape == (24,)
         assert weights.dtype == torch.float64
         assert (weights > 0).all()
 
@@ -389,7 +418,7 @@ class TestOmniPretrainDataset:
         dist = ds.get_class_distribution()
         assert set(dist.keys()) == {'chair', 'sofa', 'table'}
         for name in ['chair', 'sofa', 'table']:
-            assert dist[name]['count'] == 10
+            assert dist[name]['count'] == 8
             assert abs(dist[name]['percentage'] - 100.0 / 3) < 0.1
 
     def test_get_norm_stats(self, fake_dataset):
@@ -405,7 +434,7 @@ class TestOmniPretrainDataset:
         at known positions survive into the output.
         """
         data_root, class_names, norm_stats = fake_dataset
-        samples = _discover_samples(str(data_root), class_names)
+        samples = _discover_samples(str(data_root / 'train'), class_names)
         ds = OmniPretrainDataset(
             data_root=str(data_root),
             split='train',
@@ -528,7 +557,7 @@ class TestGetOmnipretrainDataloaders:
         assert torch.equal(batch1[0], batch2[0])  # rgb identical
         assert torch.equal(batch1[1], batch2[1])  # depth identical
 
-    def test_stratified_split(self, fake_dataset):
+    def test_both_splits_have_all_classes(self, fake_dataset):
         """Train and val both contain samples from all classes."""
         data_root, _, _ = fake_dataset
         train_loader, val_loader, _ = get_omnipretrain_dataloaders(
@@ -537,7 +566,6 @@ class TestGetOmnipretrainDataloaders:
             num_workers=0,
             seed=42,
         )
-        # Collect all train labels
         train_labels = set()
         for _, _, labels in train_loader:
             train_labels.update(labels.tolist())
@@ -561,22 +589,22 @@ class TestGetOmnipretrainDataloaders:
         next(iter(train_loader))
         next(iter(val_loader))
 
-    def test_reproducible_split(self, fake_dataset):
-        """Same seed produces same split."""
+    def test_reproducible_loading(self, fake_dataset):
+        """Same seed produces same val outputs."""
         data_root, _, _ = fake_dataset
         _, val1, _ = get_omnipretrain_dataloaders(
-            data_root=str(data_root), batch_size=30, num_workers=0, seed=42
+            data_root=str(data_root), batch_size=6, num_workers=0, seed=42
         )
         _, val2, _ = get_omnipretrain_dataloaders(
-            data_root=str(data_root), batch_size=30, num_workers=0, seed=42
+            data_root=str(data_root), batch_size=6, num_workers=0, seed=42
         )
         b1 = next(iter(val1))
         b2 = next(iter(val2))
         assert torch.equal(b1[0], b2[0])
         assert torch.equal(b1[2], b2[2])
 
-    def test_empty_dataset_raises(self, tmp_path):
-        """ValueError raised when no samples found."""
+    def test_missing_split_dirs_raises(self, tmp_path):
+        """FileNotFoundError raised when train/val dirs missing."""
         with open(tmp_path / 'class_names.txt', 'w') as f:
             f.write("chair\n")
         with open(tmp_path / 'norm_stats.json', 'w') as f:
@@ -584,70 +612,37 @@ class TestGetOmnipretrainDataloaders:
                 'rgb_mean': [0.5, 0.5, 0.5], 'rgb_std': [0.2, 0.2, 0.2],
                 'depth_mean': [2.0], 'depth_std': [1.0],
             }, f)
-        with pytest.raises(ValueError, match="No samples found"):
+        with pytest.raises(FileNotFoundError, match="train/ and val/"):
             get_omnipretrain_dataloaders(data_root=str(tmp_path), num_workers=0)
 
-    def test_single_sample_class_does_not_crash(self, tmp_path):
-        """Class with 1 sample falls back to non-stratified split."""
-        class_names = ['chair', 'sofa', 'table']
-        norm_stats = {
-            'rgb_mean': [0.5, 0.5, 0.5],
-            'rgb_std': [0.2, 0.2, 0.2],
-            'depth_mean': [2.5],
-            'depth_std': [1.0],
-        }
-
+    def test_empty_train_raises(self, tmp_path):
+        """ValueError raised when train dir has no samples."""
         with open(tmp_path / 'class_names.txt', 'w') as f:
-            for name in class_names:
-                f.write(f"{name}\n")
+            f.write("chair\n")
         with open(tmp_path / 'norm_stats.json', 'w') as f:
-            json.dump(norm_stats, f)
+            json.dump({
+                'rgb_mean': [0.5, 0.5, 0.5], 'rgb_std': [0.2, 0.2, 0.2],
+                'depth_mean': [2.0], 'depth_std': [1.0],
+            }, f)
+        (tmp_path / 'train').mkdir()
+        (tmp_path / 'val').mkdir()
+        with pytest.raises(ValueError, match="No training samples"):
+            get_omnipretrain_dataloaders(data_root=str(tmp_path), num_workers=0)
 
-        # chair: 1 sample, sofa: 10 samples, table: 10 samples
-        for cls_idx, cls_name in enumerate(class_names):
-            cls_dir = tmp_path / cls_name
-            cls_dir.mkdir()
-            count = 1 if cls_name == 'chair' else 10
-            for i in range(count):
-                rgb = torch.randint(0, 256, (3, 256, 256), dtype=torch.uint8)
-                depth = torch.randint(100, 5000, (1, 256, 256), dtype=torch.uint16)
-                torch.save(rgb, cls_dir / f'obj_{cls_idx:03d}_f{i:03d}_rgb.pt')
-                torch.save(depth, cls_dir / f'obj_{cls_idx:03d}_f{i:03d}_depth.pt')
-
-        # Should succeed with a warning about fallback to non-stratified split
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            result = get_omnipretrain_dataloaders(
-                data_root=str(tmp_path),
-                batch_size=4,
-                num_workers=0,
-                seed=42,
-            )
-            # Check that we got a warning about the fallback
-            stratified_warnings = [
-                x for x in w
-                if "Stratified split failed" in str(x.message)
-            ]
-            assert len(stratified_warnings) == 1
-
-        assert len(result) == 3
-        train_loader, val_loader, num_classes = result
-        assert num_classes == 3
-
-    def test_factory_stratified_false(self, fake_dataset):
-        """stratified=False uses shuffle instead of WeightedRandomSampler."""
+    def test_balanced_sampling_false(self, fake_dataset):
+        """balanced_sampling=False uses shuffle instead of WeightedRandomSampler."""
         data_root, _, _ = fake_dataset
         result = get_omnipretrain_dataloaders(
             data_root=str(data_root),
             batch_size=4,
             num_workers=0,
             seed=42,
-            stratified=False,
+            balanced_sampling=False,
         )
         assert len(result) == 3
         train_loader, val_loader, num_classes = result
         assert num_classes == 3
-        # Verify train_loader does NOT have a sampler (uses shuffle instead)
+        # Verify train_loader does NOT have a weighted sampler
         assert train_loader.sampler.__class__.__name__ != 'WeightedRandomSampler'
         # Should still produce valid batches
         rgb, depth, labels = next(iter(train_loader))

@@ -1,8 +1,10 @@
 """
 OmniPretrain Dataset Loader for LINet pretraining.
 
-Loads per-sample tensor files from an ImageNet-style folder layout with
-paired RGB and depth data. Class folders contain individual .pt files.
+Loads per-sample tensor files from a pre-split directory layout with
+paired RGB and depth data.  The dataset root must contain ``train/``
+and ``val/`` subdirectories (each with class folders) plus metadata
+files ``class_names.txt`` and ``norm_stats.json`` at the root.
 
 Tensors are stored at 256x256. At load time:
   - Train: RandomCrop(crop_size) + horizontal flip + augmentations
@@ -12,12 +14,10 @@ Tensors are stored at 256x256. At load time:
 import json
 import os
 import random
-import warnings
 from collections import Counter
 
 import numpy as np
 import torch
-from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as F2
@@ -203,11 +203,11 @@ class OmniPretrainDataset(Dataset):
     """
     OmniPretrain dataset for LINet pretraining.
 
-    Loads per-sample .pt tensor files from an ImageNet-style class folder layout.
+    Loads per-sample .pt tensor files from a pre-split class folder layout.
     Each sample has paired *_rgb.pt and *_depth.pt files.
 
-    Class names are loaded from class_names.txt in data_root.
-    Normalization stats are loaded from norm_stats.json in data_root.
+    Class names and normalization stats are loaded from the dataset root
+    (parent of the split directory).
 
     Tensors are stored at 256x256. crop_size controls the output:
       - Train: RandomCrop(crop_size) from 256x256
@@ -217,12 +217,16 @@ class OmniPretrainDataset(Dataset):
         data_root/
             class_names.txt
             norm_stats.json
-            chair/
-                obj_000001_f000_rgb.pt
-                obj_000001_f000_depth.pt
-                ...
-            sofa/
-                ...
+            train/
+                chair/
+                    obj_000001_f000_rgb.pt
+                    obj_000001_f000_depth.pt
+                    ...
+                sofa/
+                    ...
+            val/
+                chair/
+                    ...
     """
 
     VALID_SPLITS = ('train', 'val')
@@ -658,9 +662,8 @@ def get_omnipretrain_dataloaders(
     crop_size: int = 224,
     use_class_weights: bool = False,
     seed: int = 42,
-    val_fraction: float = 0.1,
     normalize: bool = True,
-    stratified: bool = True,
+    balanced_sampling: bool = True,
     rgb_aug_prob: float = 1.0,
     rgb_aug_mag: float = 1.0,
     depth_aug_prob: float = 1.0,
@@ -668,20 +671,22 @@ def get_omnipretrain_dataloaders(
 ) -> tuple:
     """Create train and val dataloaders for OmniPretrain dataset.
 
-    Performs a stratified 90/10 train/val split seeded for reproducibility.
-    Uses WeightedRandomSampler for balanced training when stratified=True.
+    Loads from pre-split ``train/`` and ``val/`` subdirectories under
+    *data_root*.  The split is performed at preprocessing time at the
+    object level (all frames of a 3D object in the same split) to
+    prevent data leakage.
 
     Args:
-        data_root: Root directory of the dataset.
+        data_root: Root directory containing ``train/``, ``val/``,
+            ``class_names.txt``, and ``norm_stats.json``.
         batch_size: Batch size.
         num_workers: Number of dataloader workers.
         crop_size: Output crop size.
         use_class_weights: If True, return class_weights as fourth element.
-        seed: Random seed for split and reproducible loading.
-        val_fraction: Fraction of data for validation (default 0.1).
+        seed: Random seed for reproducible loading.
         normalize: If True, normalize in __getitem__.
-        stratified: If True, use stratified split and WeightedRandomSampler.
-            If False, use non-stratified split and shuffle=True for training.
+        balanced_sampling: If True, use WeightedRandomSampler to balance
+            classes during training.  If False, use simple shuffle.
         rgb_aug_prob: Probability scaling for RGB augmentations.
         rgb_aug_mag: Magnitude scaling for RGB augmentations.
         depth_aug_prob: Probability scaling for depth augmentations.
@@ -691,47 +696,27 @@ def get_omnipretrain_dataloaders(
         (train_loader, val_loader, num_classes) if use_class_weights is False.
         (train_loader, val_loader, num_classes, class_weights) if True.
     """
-    # Load metadata
+    # Load metadata from root
     class_names = _load_class_names(data_root)
     norm_stats = _load_norm_stats(data_root)
 
-    # Discover all samples
-    all_samples = _discover_samples(data_root, class_names)
-    if len(all_samples) == 0:
-        raise ValueError(f"No samples found in {data_root}")
+    # Discover samples from pre-split directories
+    train_dir = os.path.join(data_root, 'train')
+    val_dir = os.path.join(data_root, 'val')
 
-    all_labels = [s[2] for s in all_samples]
-
-    # Stratified train/val split with fallback
-    if stratified:
-        try:
-            train_indices, val_indices = train_test_split(
-                list(range(len(all_samples))),
-                test_size=val_fraction,
-                random_state=seed,
-                stratify=all_labels,
-            )
-        except ValueError:
-            # Fallback: non-stratified split (class has < 2 samples)
-            warnings.warn(
-                "Stratified split failed (class with < 2 samples). "
-                "Falling back to non-stratified random split.",
-                UserWarning,
-            )
-            train_indices, val_indices = train_test_split(
-                list(range(len(all_samples))),
-                test_size=val_fraction,
-                random_state=seed,
-            )
-    else:
-        train_indices, val_indices = train_test_split(
-            list(range(len(all_samples))),
-            test_size=val_fraction,
-            random_state=seed,
+    if not os.path.isdir(train_dir) or not os.path.isdir(val_dir):
+        raise FileNotFoundError(
+            f"Expected train/ and val/ subdirectories in {data_root}. "
+            f"Run the preprocessing notebook to create the split."
         )
 
-    train_samples = [all_samples[i] for i in train_indices]
-    val_samples = [all_samples[i] for i in val_indices]
+    train_samples = _discover_samples(train_dir, class_names)
+    val_samples = _discover_samples(val_dir, class_names)
+
+    if len(train_samples) == 0:
+        raise ValueError(f"No training samples found in {train_dir}")
+    if len(val_samples) == 0:
+        raise ValueError(f"No validation samples found in {val_dir}")
 
     # Create datasets
     train_dataset = OmniPretrainDataset(
@@ -763,7 +748,7 @@ def get_omnipretrain_dataloaders(
     worker_init_fn = _WorkerInitFn(seed)
 
     # Weighted sampling for training (class imbalance) or simple shuffle
-    if stratified:
+    if balanced_sampling:
         sample_weights = train_dataset.get_sample_weights()
         train_sampler = WeightedRandomSampler(
             weights=sample_weights,
@@ -803,9 +788,10 @@ def get_omnipretrain_dataloaders(
         worker_init_fn=worker_init_fn,
     )
 
-    sampling_mode = "weighted" if stratified else "shuffle"
+    sampling_mode = "weighted" if balanced_sampling else "shuffle"
+    total = len(train_dataset) + len(val_dataset)
     print(f"\nOmniPretrain Dataset:")
-    print(f"  Total samples: {len(all_samples)}")
+    print(f"  Total samples: {total}")
     print(f"  Train: {len(train_dataset)}, Val: {len(val_dataset)}")
     print(f"  Classes: {num_classes}")
     print(f"  Train batches: {len(train_loader)}")
