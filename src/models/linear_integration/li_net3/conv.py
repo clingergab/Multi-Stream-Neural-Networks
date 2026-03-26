@@ -838,6 +838,39 @@ class _LIBatchNorm(_LINormBase):
 
         return stream_outputs, integrated_out
 
+    def forward_integrated(self, integrated_input: Tensor, apply_relu: bool = False) -> Tensor:
+        """Forward pass for integrated pathway only, skipping all stream BN.
+
+        Use in the last residual block where stream outputs are discarded.
+
+        Returns:
+            Batch-normalized integrated output tensor.
+        """
+        self._check_input_dim(integrated_input)
+
+        if self.momentum is None:
+            exponential_average_factor = 0.0
+        else:
+            exponential_average_factor = self.momentum
+
+        if self.training and self.track_running_stats:
+            if self.num_batches_tracked is not None:
+                self.num_batches_tracked.add_(1)
+                if self.momentum is None:
+                    exponential_average_factor = 1.0 / float(self.num_batches_tracked)
+                else:
+                    exponential_average_factor = self.momentum
+
+        return self._forward_single_pathway(
+            integrated_input,
+            self.integrated_running_mean,
+            self.integrated_running_var,
+            self.integrated_weight,
+            self.integrated_bias,
+            exponential_average_factor,
+            apply_relu=apply_relu,
+        )
+
     def _forward_single_pathway(
         self,
         input: Tensor,

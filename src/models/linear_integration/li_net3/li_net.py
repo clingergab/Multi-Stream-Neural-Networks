@@ -159,6 +159,7 @@ class LINet(BaseModel):
         self.layer2 = self._make_layer(block, [base[1]] * self.num_streams, base[1], layers[1], stride=2, dilate=replace_stride_with_dilation[0])
         self.layer3 = self._make_layer(block, [base[2]] * self.num_streams, base[2], layers[2], stride=2, dilate=replace_stride_with_dilation[1])
         self.layer4 = self._make_layer(block, [base[3]] * self.num_streams, base[3], layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+        self.layer4[-1].skip_stream_tail = True
 
         # Adaptive average pooling for integrated stream only
         # (Stream pooling happens in LIMaxPool2d layers)

@@ -112,6 +112,7 @@ class LIBasicBlock(nn.Module):
 
         self.downsample = downsample
         self.stride = stride
+        self.skip_stream_tail = False
 
     def forward(
         self,
@@ -141,21 +142,35 @@ class LIBasicBlock(nn.Module):
 
         # Second conv block: conv2 → bn2 (no relu — relu comes after residual)
         stream_outputs, integrated = self.conv2(stream_outputs, integrated, blanked_mask)
-        stream_outputs, integrated = self.bn2(stream_outputs, integrated, blanked_mask)
 
-        # Apply downsampling to identities if needed (handles all N streams together)
-        # Downsample is an LISequential containing LIConv2d + LIBatchNorm2d - accepts blanked_mask
-        if self.downsample is not None:
-            stream_identities, integrated_identity = self.downsample(
-                stream_identities, integrated_identity, blanked_mask
-            )
+        if self.skip_stream_tail:
+            # Last block before classifier — only integrated stream needs BN + residual + ReLU.
+            # Stream outputs are discarded by the caller so we skip their BN/residual/ReLU
+            # to eliminate wasted gradient signal on stream conv weights.
+            integrated = self.bn2.forward_integrated(integrated)
+            if self.downsample is not None:
+                # Single-block layers: downsample identity for integrated pathway only
+                _, integrated_identity = self.downsample(
+                    stream_identities, integrated_identity, blanked_mask
+                )
+            if integrated_identity is not None:
+                integrated = F.relu(integrated + integrated_identity, inplace=True)
+        else:
+            stream_outputs, integrated = self.bn2(stream_outputs, integrated, blanked_mask)
 
-        # Residual connections + final activation
-        # Note: for blanked samples, both stream_outputs and stream_identities are zeros
-        # so the result is 0 + 0 = 0 (blanked samples stay zeroed)
-        stream_outputs = [F.relu(s + s_id, inplace=True) for s, s_id in zip(stream_outputs, stream_identities)]
-        if integrated_identity is not None:
-            integrated = F.relu(integrated + integrated_identity, inplace=True)
+            # Apply downsampling to identities if needed (handles all N streams together)
+            # Downsample is an LISequential containing LIConv2d + LIBatchNorm2d - accepts blanked_mask
+            if self.downsample is not None:
+                stream_identities, integrated_identity = self.downsample(
+                    stream_identities, integrated_identity, blanked_mask
+                )
+
+            # Residual connections + final activation
+            # Note: for blanked samples, both stream_outputs and stream_identities are zeros
+            # so the result is 0 + 0 = 0 (blanked samples stay zeroed)
+            stream_outputs = [F.relu(s + s_id, inplace=True) for s, s_id in zip(stream_outputs, stream_identities)]
+            if integrated_identity is not None:
+                integrated = F.relu(integrated + integrated_identity, inplace=True)
 
         return stream_outputs, integrated
 
@@ -255,7 +270,8 @@ class LIBottleneck(nn.Module):
         self.relu = LIReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
-    
+        self.skip_stream_tail = False
+
     def forward(
         self,
         stream_inputs: list[Tensor],
@@ -282,21 +298,35 @@ class LIBottleneck(nn.Module):
         stream_outputs, integrated = self.bn2(stream_outputs, integrated, blanked_mask, apply_relu=True)
 
         stream_outputs, integrated = self.conv3(stream_outputs, integrated, blanked_mask)
-        stream_outputs, integrated = self.bn3(stream_outputs, integrated, blanked_mask)
 
-        # Apply downsampling to identities if needed (handles all N streams together)
-        # Downsample is an LISequential containing LIConv2d + LIBatchNorm2d - accepts blanked_mask
-        if self.downsample is not None:
-            stream_identities, integrated_identity = self.downsample(
-                stream_identities, integrated_identity, blanked_mask
-            )
+        if self.skip_stream_tail:
+            # Last block before classifier — only integrated stream needs BN + residual + ReLU.
+            # Stream outputs are discarded by the caller so we skip their BN/residual/ReLU
+            # to eliminate wasted gradient signal on stream conv weights.
+            integrated = self.bn3.forward_integrated(integrated)
+            if self.downsample is not None:
+                # Single-block layers: downsample identity for integrated pathway only
+                _, integrated_identity = self.downsample(
+                    stream_identities, integrated_identity, blanked_mask
+                )
+            if integrated_identity is not None:
+                integrated = F.relu(integrated + integrated_identity, inplace=True)
+        else:
+            stream_outputs, integrated = self.bn3(stream_outputs, integrated, blanked_mask)
 
-        # Residual connections + final activation
-        # Note: for blanked samples, both stream_outputs and stream_identities are zeros
-        # so the result is 0 + 0 = 0 (blanked samples stay zeroed)
-        stream_outputs = [F.relu(s + s_id, inplace=True) for s, s_id in zip(stream_outputs, stream_identities)]
-        if integrated_identity is not None:
-            integrated = F.relu(integrated + integrated_identity, inplace=True)
+            # Apply downsampling to identities if needed (handles all N streams together)
+            # Downsample is an LISequential containing LIConv2d + LIBatchNorm2d - accepts blanked_mask
+            if self.downsample is not None:
+                stream_identities, integrated_identity = self.downsample(
+                    stream_identities, integrated_identity, blanked_mask
+                )
+
+            # Residual connections + final activation
+            # Note: for blanked samples, both stream_outputs and stream_identities are zeros
+            # so the result is 0 + 0 = 0 (blanked samples stay zeroed)
+            stream_outputs = [F.relu(s + s_id, inplace=True) for s, s_id in zip(stream_outputs, stream_identities)]
+            if integrated_identity is not None:
+                integrated = F.relu(integrated + integrated_identity, inplace=True)
 
         return stream_outputs, integrated
 
