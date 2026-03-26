@@ -1499,3 +1499,72 @@ class TestResNetUncoveredLines(unittest.TestCase):
         self.assertEqual(predictions.shape, (6,))
         self.assertTrue(torch.all(predictions >= 0))
         self.assertTrue(torch.all(predictions < 10))
+
+
+class TestResNetWidthMultiplier(unittest.TestCase):
+    """Test cases for ResNet width_multiplier parameter."""
+
+    def test_width_multiplier_default(self):
+        """Test that default width_multiplier=1.0 preserves standard channels."""
+        model = resnet18(num_classes=10, device='cpu')
+        self.assertEqual(model.width_multiplier, 1.0)
+        self.assertEqual(model.conv1.out_channels, 64)
+        self.assertEqual(model.fc.in_features, 512)
+
+    def test_width_multiplier_075(self):
+        """Test 0.75x width produces channels [48, 96, 192, 384]."""
+        model = resnet18(num_classes=10, width_multiplier=0.75, device='cpu')
+        self.assertEqual(model.conv1.out_channels, 48)
+        self.assertEqual(model.layer1[0].conv1.out_channels, 48)
+        self.assertEqual(model.layer2[0].conv1.out_channels, 96)
+        self.assertEqual(model.layer3[0].conv1.out_channels, 192)
+        self.assertEqual(model.layer4[0].conv1.out_channels, 384)
+        self.assertEqual(model.fc.in_features, 384)
+
+    def test_width_multiplier_050(self):
+        """Test 0.5x width produces channels [32, 64, 128, 256]."""
+        model = resnet18(num_classes=10, width_multiplier=0.5, device='cpu')
+        self.assertEqual(model.conv1.out_channels, 32)
+        self.assertEqual(model.layer1[0].conv1.out_channels, 32)
+        self.assertEqual(model.layer2[0].conv1.out_channels, 64)
+        self.assertEqual(model.layer3[0].conv1.out_channels, 128)
+        self.assertEqual(model.layer4[0].conv1.out_channels, 256)
+        self.assertEqual(model.fc.in_features, 256)
+
+    def test_width_multiplier_forward_pass(self):
+        """Test forward pass works with scaled width."""
+        model = resnet18(num_classes=10, width_multiplier=0.75, device='cpu')
+        x = torch.randn(2, 3, 224, 224)
+        output = model(x)
+        self.assertEqual(output.shape, (2, 10))
+
+    def test_width_multiplier_param_reduction(self):
+        """Test that smaller width_multiplier produces fewer parameters."""
+        model_full = resnet18(num_classes=10, device='cpu')
+        model_075 = resnet18(num_classes=10, width_multiplier=0.75, device='cpu')
+        model_050 = resnet18(num_classes=10, width_multiplier=0.5, device='cpu')
+
+        params_full = sum(p.numel() for p in model_full.parameters())
+        params_075 = sum(p.numel() for p in model_075.parameters())
+        params_050 = sum(p.numel() for p in model_050.parameters())
+
+        self.assertGreater(params_full, params_075)
+        self.assertGreater(params_075, params_050)
+
+    def test_width_multiplier_bottleneck(self):
+        """Test width_multiplier works with Bottleneck blocks (ResNet-50)."""
+        model = resnet50(num_classes=10, width_multiplier=0.75, device='cpu')
+        x = torch.randn(1, 3, 64, 64)
+        output = model(x)
+        self.assertEqual(output.shape, (1, 10))
+        # Bottleneck expansion=4, so fc.in_features = 384 * 4 = 1536
+        self.assertEqual(model.fc.in_features, 384 * 4)
+
+    def test_width_multiplier_factory_functions(self):
+        """Test width_multiplier passes through all factory functions."""
+        model34 = resnet34(num_classes=10, width_multiplier=0.75, device='cpu')
+        model50 = resnet50(num_classes=10, width_multiplier=0.75, device='cpu')
+        self.assertEqual(model34.width_multiplier, 0.75)
+        self.assertEqual(model50.width_multiplier, 0.75)
+        self.assertEqual(model34.conv1.out_channels, 48)
+        self.assertEqual(model50.conv1.out_channels, 48)

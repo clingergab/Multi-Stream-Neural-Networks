@@ -69,6 +69,7 @@ class ResNet(nn.Module):
                 width_per_group: int = 64,
                 replace_stride_with_dilation: Optional[list[bool]] = None,
                 norm_layer: Optional[Callable[..., nn.Module]] = None,
+                width_multiplier: float = 1.0,
                 device: Optional[str] = None,
                 use_amp: bool = False,
             ) -> None:
@@ -78,6 +79,7 @@ class ResNet(nn.Module):
         self.num_classes = num_classes
         self.groups = groups
         self.base_width = width_per_group
+        self.width_multiplier = width_multiplier
         
         # Norm layer setup
         if norm_layer is None:
@@ -85,7 +87,6 @@ class ResNet(nn.Module):
         self._norm_layer = norm_layer
 
         # Initialize internal parameters
-        self.inplanes = 64
         self.dilation = 1
         
         # Process replace_stride_with_dilation parameter like PyTorch does (but don't store)
@@ -148,17 +149,22 @@ class ResNet(nn.Module):
     
     def _build_network(self, block: type[Union[BasicBlock, Bottleneck]], layers: list[int], replace_stride_with_dilation: list[bool]):
         """Build the ResNet network architecture - exactly like PyTorch."""
+        # Compute scaled channel progression
+        w = self.width_multiplier
+        base = [int(c * w) for c in [64, 128, 256, 512]]
+        self.inplanes = base[0]
+
         # Network architecture - exactly like PyTorch
         self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = self._norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
+        self.layer1 = self._make_layer(block, base[0], layers[0])
+        self.layer2 = self._make_layer(block, base[1], layers[1], stride=2, dilate=replace_stride_with_dilation[0])
+        self.layer3 = self._make_layer(block, base[2], layers[2], stride=2, dilate=replace_stride_with_dilation[1])
+        self.layer4 = self._make_layer(block, base[3], layers[3], stride=2, dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 * block.expansion, self.num_classes)
+        self.fc = nn.Linear(base[3] * block.expansion, self.num_classes)
     
     def _initialize_weights(self, zero_init_residual: bool):
         """Initialize network weights - exactly like PyTorch."""
@@ -780,6 +786,7 @@ def resnet18(
     width_per_group: int = 64,
     replace_stride_with_dilation: Optional[list[bool]] = None,
     norm_layer: Optional[Callable[..., nn.Module]] = None,
+    width_multiplier: float = 1.0,
     **kwargs: Any
 ) -> ResNet:
     """ResNet-18 model for image classification.
@@ -793,8 +800,9 @@ def resnet18(
         width_per_group: Width of each group. Default: 64
         replace_stride_with_dilation: Replace 2x2 stride with dilated convolution. Default: None
         norm_layer: Normalization layer. Default: BatchNorm2d
+        width_multiplier: Scale channel widths (0.5 = half, 0.75 = 3/4). Default: 1.0
         **kwargs: Additional arguments passed to the ResNet constructor
-            
+
     Returns:
         ResNet: A ResNet-18 model instance
     """
@@ -806,6 +814,7 @@ def resnet18(
         width_per_group=width_per_group,
         replace_stride_with_dilation=replace_stride_with_dilation,
         norm_layer=norm_layer,
+        width_multiplier=width_multiplier,
         device=device,
         use_amp=use_amp,
         **kwargs
@@ -821,6 +830,7 @@ def resnet34(
     width_per_group: int = 64,
     replace_stride_with_dilation: Optional[list[bool]] = None,
     norm_layer: Optional[Callable[..., nn.Module]] = None,
+    width_multiplier: float = 1.0,
     **kwargs: Any
 ) -> ResNet:
     """ResNet-34 model for image classification.
@@ -834,8 +844,9 @@ def resnet34(
         width_per_group: Width of each group. Default: 64
         replace_stride_with_dilation: Replace 2x2 stride with dilated convolution. Default: None
         norm_layer: Normalization layer. Default: BatchNorm2d
+        width_multiplier: Scale channel widths (0.5 = half, 0.75 = 3/4). Default: 1.0
         **kwargs: Additional arguments passed to the ResNet constructor
-            
+
     Returns:
         ResNet: A ResNet-34 model instance
     """
@@ -847,6 +858,7 @@ def resnet34(
         width_per_group=width_per_group,
         replace_stride_with_dilation=replace_stride_with_dilation,
         norm_layer=norm_layer,
+        width_multiplier=width_multiplier,
         device=device,
         use_amp=use_amp,
         **kwargs
@@ -862,11 +874,12 @@ def resnet50(
     width_per_group: int = 64,
     replace_stride_with_dilation: Optional[list[bool]] = None,
     norm_layer: Optional[Callable[..., nn.Module]] = None,
+    width_multiplier: float = 1.0,
     **kwargs: Any
 ) -> ResNet:
     """ResNet-50 model for image classification.
 
-    This implementation follows the ResNet V1.5 variant which places the stride for 
+    This implementation follows the ResNet V1.5 variant which places the stride for
     downsampling to the second 3x3 convolution, improving accuracy over the original.
 
     Args:
@@ -878,8 +891,9 @@ def resnet50(
         width_per_group: Width of each group. Default: 64
         replace_stride_with_dilation: Replace 2x2 stride with dilated convolution. Default: None
         norm_layer: Normalization layer. Default: BatchNorm2d
+        width_multiplier: Scale channel widths (0.5 = half, 0.75 = 3/4). Default: 1.0
         **kwargs: Additional arguments passed to the ResNet constructor
-            
+
     Returns:
         ResNet: A ResNet-50 model instance
     """
@@ -891,6 +905,7 @@ def resnet50(
         width_per_group=width_per_group,
         replace_stride_with_dilation=replace_stride_with_dilation,
         norm_layer=norm_layer,
+        width_multiplier=width_multiplier,
         device=device,
         use_amp=use_amp,
         **kwargs
@@ -906,11 +921,12 @@ def resnet101(
     width_per_group: int = 64,
     replace_stride_with_dilation: Optional[list[bool]] = None,
     norm_layer: Optional[Callable[..., nn.Module]] = None,
+    width_multiplier: float = 1.0,
     **kwargs: Any
 ) -> ResNet:
     """ResNet-101 model for image classification.
 
-    This implementation follows the ResNet V1.5 variant which places the stride for 
+    This implementation follows the ResNet V1.5 variant which places the stride for
     downsampling to the second 3x3 convolution, improving accuracy over the original.
 
     Args:
@@ -922,8 +938,9 @@ def resnet101(
         width_per_group: Width of each group. Default: 64
         replace_stride_with_dilation: Replace 2x2 stride with dilated convolution. Default: None
         norm_layer: Normalization layer. Default: BatchNorm2d
+        width_multiplier: Scale channel widths (0.5 = half, 0.75 = 3/4). Default: 1.0
         **kwargs: Additional arguments passed to the ResNet constructor
-            
+
     Returns:
         ResNet: A ResNet-101 model instance
     """
@@ -935,6 +952,7 @@ def resnet101(
         width_per_group=width_per_group,
         replace_stride_with_dilation=replace_stride_with_dilation,
         norm_layer=norm_layer,
+        width_multiplier=width_multiplier,
         device=device,
         use_amp=use_amp,
         **kwargs
@@ -950,11 +968,12 @@ def resnet152(
     width_per_group: int = 64,
     replace_stride_with_dilation: Optional[list[bool]] = None,
     norm_layer: Optional[Callable[..., nn.Module]] = None,
+    width_multiplier: float = 1.0,
     **kwargs: Any
 ) -> ResNet:
     """ResNet-152 model for image classification.
 
-    This implementation follows the ResNet V1.5 variant which places the stride for 
+    This implementation follows the ResNet V1.5 variant which places the stride for
     downsampling to the second 3x3 convolution, improving accuracy over the original.
 
     Args:
@@ -966,8 +985,9 @@ def resnet152(
         width_per_group: Width of each group. Default: 64
         replace_stride_with_dilation: Replace 2x2 stride with dilated convolution. Default: None
         norm_layer: Normalization layer. Default: BatchNorm2d
+        width_multiplier: Scale channel widths (0.5 = half, 0.75 = 3/4). Default: 1.0
         **kwargs: Additional arguments passed to the ResNet constructor
-            
+
     Returns:
         ResNet: A ResNet-152 model instance
     """
@@ -979,6 +999,7 @@ def resnet152(
         width_per_group=width_per_group,
         replace_stride_with_dilation=replace_stride_with_dilation,
         norm_layer=norm_layer,
+        width_multiplier=width_multiplier,
         device=device,
         use_amp=use_amp,
         **kwargs
