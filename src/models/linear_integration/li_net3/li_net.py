@@ -939,6 +939,7 @@ class LINet(BaseModel):
             gradient_health_tracker = GradientHealthTracker(self)
             history['gradient_norms'] = []
             history['gradient_health'] = []
+            history['gradient_inf_steps'] = []
             if verbose:
                 print(f"Gradient monitoring enabled (log_freq={gradient_log_freq}, pre-clip norms)")
 
@@ -1137,8 +1138,12 @@ class LINet(BaseModel):
             extra_postfix = None
             if gradient_health_tracker is not None:
                 grad_norm = gradient_health_tracker.get_latest_total_norm()
+                inf_steps = gradient_health_tracker.get_epoch_inf_steps()
                 if grad_norm > 0:
-                    extra_postfix = {'grad': f'{grad_norm:.2e}'}
+                    grad_str = f'{grad_norm:.2e}'
+                    if inf_steps > 0:
+                        grad_str += f' ({inf_steps} inf)'
+                    extra_postfix = {'grad': grad_str}
 
             finalize_progress_bar(
                 pbar, avg_train_loss, train_accuracy, val_loader,
@@ -1189,8 +1194,15 @@ class LINet(BaseModel):
                 epoch_grad_summary = gradient_health_tracker.get_epoch_summary()
                 history['gradient_norms'].append(epoch_grad_summary['norms'])
                 history['gradient_health'].append(epoch_grad_summary['health'])
+                history['gradient_inf_steps'].append(epoch_grad_summary.get('inf_steps', 0))
 
-                # Print warnings if unhealthy
+                # Report AMP overflow steps (informational, not a warning)
+                inf_steps = epoch_grad_summary.get('inf_steps', 0)
+                if inf_steps > 0 and verbose:
+                    total_steps = epoch_grad_summary['num_steps'] + inf_steps
+                    print(f"  AMP: {inf_steps}/{total_steps} steps had inf grads (scaler overflow, optimizer skipped)")
+
+                # Print warnings only for genuine gradient issues (assessed on finite norms)
                 health_status = epoch_grad_summary['health']['status']
                 if health_status not in ('healthy', 'warming_up', 'no_data') and verbose:
                     print(f"  WARNING: Gradient health: {epoch_grad_summary['health']['details']}")
@@ -1682,8 +1694,12 @@ class LINet(BaseModel):
                 # Add gradient norm if monitoring (byproduct of existing pass, no extra computation)
                 if gradient_health_tracker is not None:
                     grad_norm = gradient_health_tracker.get_latest_total_norm()
+                    inf_steps = gradient_health_tracker.get_epoch_inf_steps()
                     if grad_norm > 0:
-                        postfix['grad'] = f'{grad_norm:.2e}'
+                        grad_str = f'{grad_norm:.2e}'
+                        if inf_steps > 0:
+                            grad_str += f' ({inf_steps} inf)'
+                        postfix['grad'] = grad_str
 
                 # Add stream balance loss if active
                 if use_balance_loss and balance_loss_count > 0:

@@ -512,15 +512,16 @@ class GradientHealthTracker:
         self._param_categories = self._build_param_index()
 
         # Per-epoch accumulators (cleared each epoch via reset_epoch)
-        self._epoch_norms = []  # List of per-step norm dicts
+        self._epoch_norms = []  # List of per-step norm dicts (finite steps only)
+        self._epoch_inf_steps = 0  # Count of steps where any norm was inf (AMP overflow)
 
         # Cross-epoch history (spans entire training, for health assessment)
-        self._total_norm_history = deque(maxlen=window_size)  # For oscillation detection
+        self._total_norm_history = deque(maxlen=window_size)  # For oscillation detection (finite only)
         self._epoch_mean_norms = deque(maxlen=window_size)  # Per-epoch mean norms (dicts)
 
         # Latest stats (for progress bar)
         self._latest_stats = None
-        self._latest_total_norm = 0.0
+        self._latest_total_norm = 0.0  # Last finite total norm
 
     def _build_param_index(self) -> dict[str, list[tuple[str, torch.nn.Parameter]]]:
         """Pre-categorize all parameters into stream/integrated/shared buckets."""
@@ -553,12 +554,17 @@ class GradientHealthTracker:
         BEFORE gradient clipping and optimizer.step().
         Pre-clip norms are recorded to detect actual gradient health.
 
+        When AMP overflow produces inf gradients, the step is counted
+        separately (inf_steps) and excluded from norm statistics so that
+        benign scaler overflows don't trigger false explosion warnings.
+
         Returns:
             Dict with per-stream norms, total norm, and health status.
         """
         # Compute norms from pre-categorized parameters (fast path)
         norms = {}
         total_norm_sq = 0.0
+        has_inf = False
 
         for category, params in self._param_categories.items():
             cat_norm_sq = 0.0
@@ -569,23 +575,32 @@ class GradientHealthTracker:
             norm = cat_norm_sq ** 0.5
             norms[category] = norm
             total_norm_sq += cat_norm_sq
+            if not np.isfinite(norm):
+                has_inf = True
 
         total_norm = total_norm_sq ** 0.5
         norms['total'] = total_norm
 
-        # Store for epoch summary
-        self._epoch_norms.append(norms)
-        self._total_norm_history.append(total_norm)
-
-        # Update latest for progress bar
-        self._latest_stats = norms
-        self._latest_total_norm = total_norm
+        if has_inf or not np.isfinite(total_norm):
+            # AMP overflow — count but don't pollute finite statistics
+            self._epoch_inf_steps += 1
+        else:
+            # Finite step — store for health assessment
+            self._epoch_norms.append(norms)
+            self._total_norm_history.append(total_norm)
+            # Update latest finite norm for progress bar
+            self._latest_stats = norms
+            self._latest_total_norm = total_norm
 
         return norms
 
     def get_latest_total_norm(self) -> float:
-        """Get the most recent total gradient norm (for progress bar display)."""
+        """Get the most recent finite total gradient norm (for progress bar display)."""
         return self._latest_total_norm
+
+    def get_epoch_inf_steps(self) -> int:
+        """Get the number of inf-norm steps in the current epoch (AMP overflows)."""
+        return self._epoch_inf_steps
 
     def _assess_health(self) -> dict[str, str]:
         """
@@ -680,20 +695,22 @@ class GradientHealthTracker:
 
         Returns:
             Dict with:
-            - 'norms': Dict of mean/max/min norms per stream for this epoch
+            - 'norms': Dict of mean/max/min norms per stream (finite steps only)
             - 'health': Health assessment dict
             - 'total_norm_mean': Mean total gradient norm for progress display
-            - 'num_steps': Number of gradient steps recorded
+            - 'num_steps': Number of finite gradient steps recorded
+            - 'inf_steps': Number of inf-norm steps (AMP overflows)
         """
         if not self._epoch_norms:
             return {
                 'norms': {},
                 'health': {'status': 'no_data', 'details': 'No gradient steps recorded', 'per_stream': {}},
                 'total_norm_mean': 0.0,
-                'num_steps': 0
+                'num_steps': 0,
+                'inf_steps': self._epoch_inf_steps
             }
 
-        # Aggregate norms across all steps in this epoch
+        # Aggregate finite norms across all steps in this epoch
         summary_norms = {}
         categories = list(self._epoch_norms[0].keys())
         for cat in categories:
@@ -715,10 +732,12 @@ class GradientHealthTracker:
             'norms': summary_norms,
             'health': health,
             'total_norm_mean': float(np.mean(total_norms)),
-            'num_steps': len(self._epoch_norms)
+            'num_steps': len(self._epoch_norms),
+            'inf_steps': self._epoch_inf_steps
         }
 
     def reset_epoch(self):
         """Clear per-epoch accumulators. Call at the start of each epoch."""
         self._epoch_norms = []
+        self._epoch_inf_steps = 0
         # Note: _total_norm_history is NOT cleared -- it spans epochs for oscillation detection
