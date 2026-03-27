@@ -680,7 +680,7 @@ def get_omnipretrain_dataloaders(
         data_root: Root directory containing ``train/``, ``val/``,
             ``class_names.txt``, and ``norm_stats.json``.
         batch_size: Batch size.
-        num_workers: Number of dataloader workers.
+        num_workers: Number of dataloader workers (will be halved for validation).
         crop_size: Output crop size.
         use_class_weights: If True, return class_weights as fourth element.
         seed: Random seed for reproducible loading.
@@ -781,7 +781,7 @@ def get_omnipretrain_dataloaders(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=num_workers // 2,
         prefetch_factor=val_prefetch,
         pin_memory=True,
         persistent_workers=True if num_workers > 0 else False,
