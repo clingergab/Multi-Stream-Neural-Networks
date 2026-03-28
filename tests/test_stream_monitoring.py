@@ -76,12 +76,14 @@ def test_validate_returns_tuple():
 
     result = model._validate(loader)
     assert isinstance(result, tuple), f"Expected tuple, got {type(result)}"
-    assert len(result) == 2, f"Expected 2 elements, got {len(result)}"
-    loss, acc = result
+    assert len(result) == 3, f"Expected 3 elements, got {len(result)}"
+    loss, acc, mca = result
     assert isinstance(loss, float), f"Loss should be float, got {type(loss)}"
     assert isinstance(acc, float), f"Acc should be float, got {type(acc)}"
+    assert isinstance(mca, float), f"MCA should be float, got {type(mca)}"
     assert 0 <= acc <= 1, f"Accuracy should be 0-1, got {acc}"
-    print(f"  OK: loss={loss:.4f}, acc={acc:.4f}")
+    assert 0 <= mca <= 1, f"MCA should be 0-1, got {mca}"
+    print(f"  OK: loss={loss:.4f}, acc={acc:.4f}, mca={mca:.4f}")
 
 
 def test_validate_with_blanking():
@@ -106,9 +108,9 @@ def test_validate_with_blanking():
             model.optimizer.step()
 
     # Now test blanking
-    baseline_loss, baseline_acc = model._validate(loader)
-    blanked0_loss, blanked0_acc = model._validate(loader, blanked_streams={0})
-    blanked1_loss, blanked1_acc = model._validate(loader, blanked_streams={1})
+    baseline_loss, baseline_acc, _ = model._validate(loader)
+    blanked0_loss, blanked0_acc, _ = model._validate(loader, blanked_streams={0})
+    blanked1_loss, blanked1_acc, _ = model._validate(loader, blanked_streams={1})
 
     print(f"  Baseline:        loss={baseline_loss:.4f}, acc={baseline_acc:.4f}")
     print(f"  Stream 0 blanked: loss={blanked0_loss:.4f}, acc={blanked0_acc:.4f}")
@@ -488,6 +490,215 @@ def test_deterministic_eval_subset():
     print("  OK: Deterministic subset selection")
 
 
+def test_mca_correctness():
+    """Test that MCA is computed correctly by hand for a known distribution."""
+    print("\nTest 14: MCA correctness with known predictions...")
+    model = create_test_model(num_classes=3)
+    model.compile(
+        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+        loss='cross_entropy',
+    )
+
+    # Create a dataset with known class distribution: 50 class-0, 30 class-1, 20 class-2
+    torch.manual_seed(0)
+    labels = torch.cat([torch.zeros(50), torch.ones(30), torch.full((20,), 2)]).long()
+    rgb = torch.randn(100, 3, 32, 32)
+    depth = torch.randn(100, 1, 32, 32)
+    dataset = TensorDataset(rgb, depth, labels)
+    loader = DataLoader(dataset, batch_size=100, shuffle=False)
+
+    loss, acc, mca = model._validate(loader)
+
+    # Manually compute expected MCA from same predictions
+    model.eval()
+    with torch.no_grad():
+        outputs = model([rgb, depth])
+        preds = outputs.argmax(1)
+
+    per_class_acc = []
+    for c in range(3):
+        mask = labels == c
+        if mask.sum() > 0:
+            per_class_acc.append((preds[mask] == c).float().mean().item())
+    expected_mca = sum(per_class_acc) / len(per_class_acc)
+
+    assert abs(mca - expected_mca) < 1e-6, \
+        f"MCA mismatch: _validate={mca:.6f}, manual={expected_mca:.6f}"
+    # MCA should differ from overall acc when classes are imbalanced
+    print(f"  Overall acc: {acc:.4f}, MCA: {mca:.4f}")
+    print(f"  Per-class acc: {[f'{a:.4f}' for a in per_class_acc]}")
+    print("  OK: MCA matches manual computation")
+
+
+def test_mca_in_evaluate():
+    """Test that evaluate() includes mean_class_accuracy in results."""
+    print("\nTest 15: evaluate() returns mean_class_accuracy...")
+    model = create_test_model()
+    model.compile(
+        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+        loss='cross_entropy',
+    )
+    loader, _ = create_test_data()
+
+    # With stream monitoring
+    result = model.evaluate(loader, stream_monitoring=True)
+    assert 'mean_class_accuracy' in result, "Missing mean_class_accuracy"
+    assert 'baseline_mca' in result, "Missing baseline_mca"
+    assert abs(result['mean_class_accuracy'] - result['baseline_mca']) < 1e-10, \
+        "mean_class_accuracy should equal baseline_mca"
+    for i in range(2):
+        assert f'stream_{i}_blanked_mca' in result, f"Missing stream_{i}_blanked_mca"
+    print(f"  MCA={result['mean_class_accuracy']:.4f}, baseline_mca={result['baseline_mca']:.4f}")
+    print(f"  stream_0_blanked_mca={result['stream_0_blanked_mca']:.4f}")
+    print(f"  stream_1_blanked_mca={result['stream_1_blanked_mca']:.4f}")
+
+    # Without stream monitoring
+    result2 = model.evaluate(loader, stream_monitoring=False)
+    assert 'mean_class_accuracy' in result2, "Missing mean_class_accuracy (no monitoring)"
+    assert 'baseline_mca' not in result2, "Should not have baseline_mca when monitoring=False"
+    print(f"  No-monitoring MCA={result2['mean_class_accuracy']:.4f}")
+    print("  OK: mean_class_accuracy present in all evaluate() modes")
+
+
+def test_mca_in_fit_history():
+    """Test that fit() populates train_mca (and val_mca when val_loader provided)."""
+    print("\nTest 16: fit() history includes MCA...")
+    model = create_test_model()
+    model.compile(
+        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+        loss='cross_entropy',
+    )
+    train_loader, _ = create_test_data(n_samples=50)
+    val_loader, _ = create_test_data(n_samples=30)
+
+    # Without val_loader
+    history_no_val = model.fit(train_loader=train_loader, epochs=2, verbose=False)
+    assert 'train_mca' in history_no_val, "Missing train_mca in history"
+    assert len(history_no_val['train_mca']) == 2, "train_mca should have 2 entries"
+    assert all(0 <= m <= 1 for m in history_no_val['train_mca']), "train_mca values should be 0-1"
+    print(f"  train_mca (no val): {history_no_val['train_mca']}")
+
+    # With val_loader
+    model2 = create_test_model()
+    model2.compile(
+        optimizer=torch.optim.Adam(model2.parameters(), lr=1e-3),
+        loss='cross_entropy',
+    )
+    history_val = model2.fit(
+        train_loader=train_loader, val_loader=val_loader, epochs=2, verbose=False
+    )
+    assert 'train_mca' in history_val, "Missing train_mca"
+    assert 'val_mca' in history_val, "Missing val_mca"
+    assert len(history_val['val_mca']) == 2, "val_mca should have 2 entries"
+    assert all(0 <= m <= 1 for m in history_val['val_mca']), "val_mca values should be 0-1"
+    print(f"  train_mca (with val): {history_val['train_mca']}")
+    print(f"  val_mca:              {history_val['val_mca']}")
+    print("  OK: MCA tracked in history for both train and val")
+
+
+def test_mca_with_blanked_streams():
+    """Test that blanked-stream evaluation also returns MCA."""
+    print("\nTest 17: Blanked-stream evaluation includes MCA...")
+    model = create_test_model()
+    model.compile(
+        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+        loss='cross_entropy',
+    )
+    loader, _ = create_test_data()
+
+    result = model.evaluate(loader, stream_monitoring=True, blanked_streams={0})
+    assert 'mean_class_accuracy' in result, "Missing MCA with blanked_streams"
+    assert 0 <= result['mean_class_accuracy'] <= 1
+    print(f"  MCA with stream 0 blanked: {result['mean_class_accuracy']:.4f}")
+    print("  OK: MCA returned for blanked-stream evaluation")
+
+
+def test_early_stopping_monitor_val_mca():
+    """Test that early stopping works with monitor='val_mca'."""
+    print("\nTest 18: Early stopping with monitor='val_mca'...")
+    model = create_test_model()
+    model.compile(
+        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+        loss='cross_entropy',
+    )
+    train_loader, _ = create_test_data(n_samples=50)
+    val_loader, _ = create_test_data(n_samples=30)
+
+    # Should not raise with val_mca monitor
+    history = model.fit(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        epochs=3,
+        verbose=False,
+        early_stopping=True,
+        patience=2,
+        monitor='val_mca',
+        restore_best_weights=True,
+    )
+
+    assert 'val_mca' in history, "Missing val_mca in history"
+    assert len(history['val_mca']) == 3, f"Expected 3 val_mca entries, got {len(history['val_mca'])}"
+    print(f"  val_mca: {history['val_mca']}")
+    print("  OK: Early stopping with monitor='val_mca' runs without error")
+
+
+def test_monitor_val_mca_rejects_invalid():
+    """Test that invalid monitor values are rejected."""
+    print("\nTest 19: Invalid monitor value rejected...")
+    model = create_test_model()
+    model.compile(
+        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+        loss='cross_entropy',
+    )
+    train_loader, _ = create_test_data(n_samples=50)
+    val_loader, _ = create_test_data(n_samples=30)
+
+    try:
+        model.fit(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            epochs=1,
+            verbose=False,
+            early_stopping=True,
+            monitor='invalid_metric',
+        )
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert 'val_mca' in str(e), f"Error message should mention val_mca: {e}"
+        print(f"  Raised ValueError: {e}")
+    print("  OK: Invalid monitor rejected, error mentions val_mca")
+
+
+def test_stream_early_stopping_monitor_val_mca():
+    """Test that stream early stopping works with monitor='val_mca'."""
+    print("\nTest 20: Stream early stopping with monitor='val_mca'...")
+    model = create_test_model()
+    model.compile(
+        optimizer=torch.optim.Adam(model.parameters(), lr=1e-3),
+        loss='cross_entropy',
+    )
+    train_loader, _ = create_test_data(n_samples=50)
+    val_loader, _ = create_test_data(n_samples=30)
+
+    history = model.fit(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        epochs=3,
+        verbose=False,
+        stream_monitoring=True,
+        stream_eval_samples=50,
+        stream_early_stopping=True,
+        stream_patience=2,
+        monitor='val_mca',
+    )
+
+    assert 'val_mca' in history, "Missing val_mca in history"
+    assert 'train_mca' in history, "Missing train_mca in history"
+    print(f"  val_mca: {history['val_mca']}")
+    print(f"  train_mca: {history['train_mca']}")
+    print("  OK: Stream early stopping with monitor='val_mca' runs without error")
+
+
 if __name__ == '__main__':
     print("=" * 60)
     print("STREAM MONITORING TEST SUITE")
@@ -507,6 +718,13 @@ if __name__ == '__main__':
         test_evaluate_without_monitoring,
         test_no_weight_updates_during_monitoring,
         test_deterministic_eval_subset,
+        test_mca_correctness,
+        test_mca_in_evaluate,
+        test_mca_in_fit_history,
+        test_mca_with_blanked_streams,
+        test_early_stopping_monitor_val_mca,
+        test_monitor_val_mca_rejects_invalid,
+        test_stream_early_stopping_monitor_val_mca,
     ]
 
     passed = 0

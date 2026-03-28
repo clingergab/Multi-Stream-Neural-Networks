@@ -677,10 +677,11 @@ def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
 
 def update_history(history: dict[str, Any], avg_train_loss: float, train_accuracy: float,
                   val_loss: float = 0.0, val_acc: float = 0.0, current_lr: float = 0.0,
-                  has_validation: bool = False) -> None:
+                  has_validation: bool = False,
+                  train_mca: float = 0.0, val_mca: float = 0.0) -> None:
     """
     Update training history with current epoch metrics.
-    
+
     Args:
         history: Training history dictionary
         avg_train_loss: Average training loss
@@ -689,11 +690,15 @@ def update_history(history: dict[str, Any], avg_train_loss: float, train_accurac
         val_acc: Validation accuracy
         current_lr: Current learning rate
         has_validation: Whether validation was performed
+        train_mca: Training mean class accuracy
+        val_mca: Validation mean class accuracy
     """
     history['train_loss'].append(avg_train_loss)
     history['train_accuracy'].append(train_accuracy)
+    history['train_mca'].append(train_mca)
     if has_validation:  # Only add validation metrics if validation was performed
         history['val_loss'].append(val_loss)
         history['val_accuracy'].append(val_acc)
+        history['val_mca'].append(val_mca)
     if current_lr > 0:
         history['learning_rates'].append(current_lr)

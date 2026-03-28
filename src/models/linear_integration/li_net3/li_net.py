@@ -445,8 +445,8 @@ class LINet(BaseModel):
             return {'enabled': False}
 
         # Validate monitor
-        if monitor not in ('val_loss', 'val_accuracy'):
-            raise ValueError(f"Invalid monitor: {monitor}. Use 'val_loss' or 'val_accuracy'.")
+        if monitor not in ('val_loss', 'val_accuracy', 'val_mca'):
+            raise ValueError(f"Invalid monitor: {monitor}. Use 'val_loss', 'val_accuracy', or 'val_mca'.")
 
         # Initialize best metric based on monitor type
         best_metric = float('inf') if monitor == 'val_loss' else 0.0
@@ -480,8 +480,8 @@ class LINet(BaseModel):
             return {'enabled': False}
 
         # Validate monitor
-        if monitor not in ('val_loss', 'val_accuracy'):
-            raise ValueError(f"Invalid monitor: {monitor}. Use 'val_loss' or 'val_accuracy'.")
+        if monitor not in ('val_loss', 'val_accuracy', 'val_mca'):
+            raise ValueError(f"Invalid monitor: {monitor}. Use 'val_loss', 'val_accuracy', or 'val_mca'.")
 
         # Convert stream_patience to list if needed
         if isinstance(stream_patience, int):
@@ -531,7 +531,7 @@ class LINet(BaseModel):
         """Check if current metric is better than best metric."""
         if monitor == 'val_loss':
             return current_metric < (best_metric - min_delta)
-        else:  # val_accuracy
+        else:  # val_accuracy or val_mca (higher is better)
             return current_metric > (best_metric + min_delta)
 
     def _save_checkpoint(self) -> dict:
@@ -580,7 +580,8 @@ class LINet(BaseModel):
 
     def _update_best_full_model(self, stream_early_stopping_state: dict,
                                 val_loss: float, val_acc: float,
-                                monitor: str, min_delta: float, epoch: int) -> None:
+                                monitor: str, min_delta: float, epoch: int,
+                                val_mca: float = 0.0) -> None:
         """
         Update best full model checkpoint in stream early stopping state.
 
@@ -589,7 +590,12 @@ class LINet(BaseModel):
         best_full = stream_early_stopping_state['best_full_model']
 
         # Get current metric based on monitor type
-        current_metric = val_loss if monitor == 'val_loss' else val_acc
+        if monitor == 'val_loss':
+            current_metric = val_loss
+        elif monitor == 'val_mca':
+            current_metric = val_mca
+        else:
+            current_metric = val_acc
 
         # Check if we should update
         if self._should_update_checkpoint(current_metric, best_full['best_metric'], monitor, min_delta):
@@ -695,7 +701,8 @@ class LINet(BaseModel):
     def _check_stream_early_stopping(self, stream_early_stopping_state: dict,
                                      stream_stats: dict, epoch: int, monitor: str,
                                      min_delta: float, verbose: bool,
-                                     val_acc: float, val_loss: float) -> bool:
+                                     val_acc: float, val_loss: float,
+                                     val_mca: float = 0.0) -> bool:
         """
         Check stream-specific early stopping and freeze streams when they plateau.
 
@@ -713,7 +720,7 @@ class LINet(BaseModel):
 
         # Update best full model checkpoint
         self._update_best_full_model(stream_early_stopping_state, val_loss, val_acc,
-                                     monitor, min_delta, epoch)
+                                     monitor, min_delta, epoch, val_mca=val_mca)
 
         # Check each stream
         for i, stream_state in enumerate(stream_early_stopping_state['streams']):
@@ -721,6 +728,8 @@ class LINet(BaseModel):
                 # Get current metric for this stream
                 if monitor == 'val_loss':
                     stream_metric = stream_stats.get(f'stream_{i}_val_loss', float('inf'))
+                elif monitor == 'val_mca':
+                    stream_metric = stream_stats.get(f'stream_{i}_val_mca', 0.0)
                 else:
                     stream_metric = stream_stats.get(f'stream_{i}_val_acc', 0.0)
 
@@ -776,7 +785,7 @@ class LINet(BaseModel):
         early_stopping: bool = False,
         patience: int = 10,
         min_delta: float = 0.001,
-        monitor: str = 'val_loss',  # 'val_loss' or 'val_accuracy' (for both main and stream early stopping)
+        monitor: str = 'val_loss',  # 'val_loss', 'val_accuracy', or 'val_mca' (for both main and stream early stopping)
         restore_best_weights: bool = True,
         gradient_accumulation_steps: int = 1,  # Gradient accumulation for larger effective batch size
         grad_clip_norm: Optional[float] = None,  # Gradient clipping max norm (None = disabled)
@@ -817,7 +826,7 @@ class LINet(BaseModel):
             early_stopping: Whether to enable early stopping
             patience: Number of epochs to wait for improvement before stopping
             min_delta: Minimum change to qualify as an improvement
-            monitor: Metric to monitor for both main and stream early stopping ('val_loss' or 'val_accuracy').
+            monitor: Metric to monitor for both main and stream early stopping ('val_loss', 'val_accuracy', or 'val_mca').
                    Applied globally to main model early stopping and stream-specific early stopping.
             restore_best_weights: Whether to restore best weights when early stopping
             gradient_accumulation_steps: Number of steps to accumulate gradients before updating.
@@ -920,6 +929,8 @@ class LINet(BaseModel):
             'val_loss': [],
             'train_accuracy': [],
             'val_accuracy': [],
+            'train_mca': [],
+            'val_mca': [],
             'learning_rates': [],
             # Stream freezing events (populated if stream_early_stopping=True)
             'streams_frozen': []  # List of (epoch, stream_index) tuples
@@ -1008,7 +1019,7 @@ class LINet(BaseModel):
                 gradient_health_tracker.reset_epoch()
 
             # Training phase - use helper method
-            avg_train_loss, train_accuracy = self._train_epoch(
+            avg_train_loss, train_accuracy, train_mca = self._train_epoch(
                 train_loader, history, pbar, gradient_accumulation_steps, grad_clip_norm, clear_cache_per_epoch,
                 modality_dropout_prob=modality_dropout_prob,
                 gradient_health_tracker=gradient_health_tracker,
@@ -1020,9 +1031,10 @@ class LINet(BaseModel):
             # Validation phase
             val_loss = 0.0
             val_acc = 0.0
+            val_mca = 0.0
 
             if val_loader:
-                val_loss, val_acc = self._validate(
+                val_loss, val_acc, val_mca = self._validate(
                     val_loader, pbar=pbar
                 )
 
@@ -1040,7 +1052,12 @@ class LINet(BaseModel):
                 # Check for early stopping
                 if early_stopping_state['enabled']:
 
-                    current_metric = val_loss if monitor == 'val_loss' else val_acc
+                    if monitor == 'val_loss':
+                        current_metric = val_loss
+                    elif monitor == 'val_mca':
+                        current_metric = val_mca
+                    else:
+                        current_metric = val_acc
 
                     # Check if we should update checkpoint
                     if self._should_update_checkpoint(current_metric, early_stopping_state['best_metric'],
@@ -1133,7 +1150,8 @@ class LINet(BaseModel):
                         self.scheduler.step()
             
             # Update history and finalize progress bar
-            update_history(history, avg_train_loss, train_accuracy, val_loss, val_acc, current_lr, bool(val_loader))
+            update_history(history, avg_train_loss, train_accuracy, val_loss, val_acc, current_lr, bool(val_loader),
+                          train_mca=train_mca, val_mca=val_mca if val_loader else 0.0)
             # Build extra postfix for gradient norm (persists in final bar display)
             extra_postfix = None
             if gradient_health_tracker is not None:
@@ -1245,7 +1263,8 @@ class LINet(BaseModel):
                     min_delta=stream_min_delta,
                     verbose=verbose,
                     val_acc=val_acc,
-                    val_loss=val_loss
+                    val_loss=val_loss,
+                    val_mca=val_mca
                 )
 
                 # Record freezing events and update checkpoints for each stream
@@ -1285,7 +1304,9 @@ class LINet(BaseModel):
                     'train_loss': avg_train_loss,
                     'train_accuracy': train_accuracy,
                     'val_loss': val_loss,
-                    'val_accuracy': val_acc
+                    'val_accuracy': val_acc,
+                    'train_mca': train_mca,
+                    'val_mca': val_mca,
                 })
         
         # Restore best weights (no val set: best train loss)
@@ -1377,15 +1398,17 @@ class LINet(BaseModel):
             result = {
                 'loss': stream_contrib['baseline_loss'],
                 'accuracy': stream_contrib['baseline_acc'],
+                'mean_class_accuracy': stream_contrib['baseline_mca'],
             }
             result.update(stream_contrib)
         else:
-            loss, accuracy = self._validate(
+            loss, accuracy, mca = self._validate(
                 data_loader, blanked_streams=blanked_streams
             )
             result = {
                 'loss': loss,
                 'accuracy': accuracy,
+                'mean_class_accuracy': mca,
             }
 
         return result
@@ -1501,6 +1524,8 @@ class LINet(BaseModel):
         train_batches = 0
         train_correct = 0
         train_total = 0
+        train_all_predictions = []
+        train_all_targets = []
 
         # Stream balance loss tracking
         balance_loss_accum = 0.0
@@ -1667,6 +1692,8 @@ class LINet(BaseModel):
                 _, predicted = torch.max(outputs, 1)
                 train_total += targets.size(0)
                 train_correct += (predicted == targets).sum().item()
+                train_all_predictions.append(predicted.cpu())
+                train_all_targets.append(targets.cpu())
 
             # OPTIMIZATION 1: Update progress bar much less frequently - MAJOR SPEEDUP
             if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(train_loader) - 1):
@@ -1724,6 +1751,16 @@ class LINet(BaseModel):
         avg_train_loss = train_loss / train_batches
         train_accuracy = train_correct / train_total
 
+        # Mean class accuracy for training
+        train_all_preds = torch.cat(train_all_predictions)
+        train_all_tgts = torch.cat(train_all_targets)
+        train_per_class_acc = []
+        for c in range(self.num_classes):
+            mask = train_all_tgts == c
+            if mask.sum() > 0:
+                train_per_class_acc.append((train_all_preds[mask] == c).float().mean().item())
+        train_mca = sum(train_per_class_acc) / len(train_per_class_acc) if train_per_class_acc else 0.0
+
         # End-of-epoch modality dropout summary - store in history for analysis
         # Note: Printing is done by fit() after the progress bar closes to avoid output interference
         if dropout_stats is not None and dropout_stats['total_samples'] > 0:
@@ -1757,8 +1794,8 @@ class LINet(BaseModel):
         # if clear_cache_per_epoch and self.device.type == 'cuda':
         #     torch.cuda.empty_cache()
 
-        return avg_train_loss, train_accuracy
-    
+        return avg_train_loss, train_accuracy, train_mca
+
     def _validate(self, data_loader: DataLoader,
                   pbar: Optional['TqdmType'] = None,
                   blanked_streams: Optional[set[int]] = None) -> tuple:
@@ -1772,13 +1809,15 @@ class LINet(BaseModel):
                            Used for single-stream robustness evaluation.
 
         Returns:
-            Tuple of (loss, accuracy)
+            Tuple of (loss, accuracy, mean_class_accuracy)
         """
 
         self.eval()
         total_loss = 0.0
         correct = 0
         total = 0
+        all_predictions = []
+        all_targets = []
 
         # OPTIMIZATION 1: Progress bar update frequency for validation - major performance improvement
         update_frequency = max(1, len(data_loader) // 25)  # Update only 25 times during validation
@@ -1825,6 +1864,8 @@ class LINet(BaseModel):
                 _, predicted = torch.max(outputs, 1)
                 total += targets.size(0)
                 correct += (predicted == targets).sum().item()
+                all_predictions.append(predicted.cpu())
+                all_targets.append(targets.cpu())
 
                 # OPTIMIZATION 1: Update progress bar much less frequently during validation
                 if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(data_loader) - 1):
@@ -1860,7 +1901,17 @@ class LINet(BaseModel):
         avg_loss = total_loss / len(data_loader)
         accuracy = correct / total
 
-        return avg_loss, accuracy
+        # Mean class accuracy: average of per-class recall
+        all_predictions = torch.cat(all_predictions)
+        all_targets = torch.cat(all_targets)
+        per_class_acc = []
+        for c in range(self.num_classes):
+            mask = all_targets == c
+            if mask.sum() > 0:
+                per_class_acc.append((all_predictions[mask] == c).float().mean().item())
+        mean_class_acc = sum(per_class_acc) / len(per_class_acc) if per_class_acc else 0.0
+
+        return avg_loss, accuracy, mean_class_acc
 
     def _evaluate_stream_contributions(self, eval_loader: DataLoader) -> dict:
         """
@@ -1881,18 +1932,20 @@ class LINet(BaseModel):
                 stream_{i}_blanked_acc, stream_{i}_blanked_loss, stream_{i}_contribution
         """
         # Baseline: all streams active
-        baseline_loss, baseline_acc = self._validate(eval_loader)
+        baseline_loss, baseline_acc, baseline_mca = self._validate(eval_loader)
 
         result = {
             'baseline_acc': baseline_acc,
             'baseline_loss': baseline_loss,
+            'baseline_mca': baseline_mca,
         }
 
         # Evaluate with each stream blanked
         for i in range(self.num_streams):
-            blanked_loss, blanked_acc = self._validate(eval_loader, blanked_streams={i})
+            blanked_loss, blanked_acc, blanked_mca = self._validate(eval_loader, blanked_streams={i})
             result[f'stream_{i}_blanked_acc'] = blanked_acc
             result[f'stream_{i}_blanked_loss'] = blanked_loss
+            result[f'stream_{i}_blanked_mca'] = blanked_mca
             result[f'stream_{i}_contribution'] = baseline_acc - blanked_acc
 
         return result
@@ -1955,6 +2008,7 @@ class LINet(BaseModel):
             es_source = val_contrib if val_contrib else train_contrib
             stream_stats[f'stream_{i}_val_acc'] = es_source.get(f'stream_{other_stream}_blanked_acc', 0.0)
             stream_stats[f'stream_{i}_val_loss'] = es_source.get(f'stream_{other_stream}_blanked_loss', 0.0)
+            stream_stats[f'stream_{i}_val_mca'] = es_source.get(f'stream_{other_stream}_blanked_mca', 0.0)
             stream_stats[f'stream_{i}_lr'] = stream_lr
 
         if verbose:
