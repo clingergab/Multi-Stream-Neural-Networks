@@ -49,6 +49,12 @@ from .omnipretrain_dataset import (
     get_omnipretrain_dataloaders,
 )
 
+# ScanNet pretrain dataset for LINet pretraining
+from .scannet_pretrain_dataset import (
+    ScanNetPretrainDataset,
+    get_scannet_pretrain_dataloaders,
+)
+
 # Export all imports
 __all__ = [
     # Modern dual-channel dataset
@@ -83,4 +89,8 @@ __all__ = [
     # OmniPretrain dataset
     'OmniPretrainDataset',
     'get_omnipretrain_dataloaders',
+
+    # ScanNet pretrain dataset
+    'ScanNetPretrainDataset',
+    'get_scannet_pretrain_dataloaders',
 ]
