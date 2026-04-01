@@ -110,7 +110,7 @@ class SUNRGBDDataset(Dataset):
             norm_stats.json
             train/ or val/ or test/
                 rgb_tensors.pt    # [N, 3, 256, 256] uint8
-                depth_tensors.pt  # [N, 1, 256, 256] uint8
+                depth_tensors.pt  # [N, 1, 256, 256] uint16 (mm)
                 labels.txt
     """
 
@@ -278,9 +278,9 @@ class SUNRGBDDataset(Dataset):
         print(f"    [Depth] Erasing prob: {BASE_DEPTH_ERASING_P:.2f} -> {self._depth_erasing_p:.3f}")
 
     def _load_images_tensor(self, idx):
-        """Load pre-resized uint8 images from tensor files as tensors (no PIL)."""
+        """Load pre-resized images from tensor files."""
         rgb = self.rgb_tensors[idx]      # [3, H, W] uint8
-        depth = self.depth_tensors[idx]  # [1, H, W] uint8
+        depth = self.depth_tensors[idx]  # [1, H, W] uint16 (mm)
         return rgb, depth
 
     def _load_images_png(self, idx):
@@ -290,21 +290,14 @@ class SUNRGBDDataset(Dataset):
         rgb_pil = Image.open(rgb_path).convert('RGB')
         rgb = F2.pil_to_tensor(rgb_pil)  # [3, H, W] uint8
 
-        # Depth: handle various PIL modes, normalize to [0,1], then quantize to uint8
+        # Depth: read 16-bit PNG, apply SUN RGB-D bitshift unpacking -> mm
         depth_path = os.path.join(self.depth_dir, f'{idx:05d}.png')
         depth_pil = Image.open(depth_path)
+        depth_arr = np.array(depth_pil, dtype=np.uint16)
+        # SUN RGB-D 3-bit shift packing (from SUNRGBDtoolbox/read3dPoints.m)
+        depth_arr = np.bitwise_or(depth_arr >> 3, depth_arr << 13).astype(np.uint16)
 
-        if depth_pil.mode in ('I', 'I;16', 'I;16B'):
-            depth_arr = np.array(depth_pil, dtype=np.float32)
-            depth_arr = np.clip(depth_arr / 65535.0, 0.0, 1.0)
-        else:
-            depth_arr = np.array(depth_pil.convert('L'), dtype=np.float32)
-            if depth_arr.max() > 1.0:
-                depth_arr = depth_arr / 255.0
-
-        depth = torch.from_numpy(
-            (depth_arr * 255).clip(0, 255).astype(np.uint8)
-        ).unsqueeze(0)  # [1, H, W] uint8
+        depth = torch.from_numpy(depth_arr).unsqueeze(0)  # [1, H, W] uint16 (mm)
 
         return rgb, depth
 
@@ -321,7 +314,7 @@ class SUNRGBDDataset(Dataset):
         else:
             rgb, depth = self._load_images_png(idx)
 
-        # At this point: rgb [3, H, W] uint8, depth [1, H, W] uint8
+        # At this point: rgb [3, H, W] uint8, depth [1, H, W] uint16 (mm)
 
         # ==================== TRAINING AUGMENTATION ====================
         if self.split == 'train':
@@ -356,7 +349,16 @@ class SUNRGBDDataset(Dataset):
 
             # 6. Depth-Only: Combined Appearance Augmentation (torch ops, no numpy/PIL)
             if np.random.random() < self._depth_aug_p:
-                depth = depth.float() / 255.0  # uint8 -> float32 [0, 1]
+                depth = depth.float() / 1000.0  # uint16 mm -> float32 meters
+
+                # Normalize to [0,1] for augmentation
+                d_min = depth.min()
+                d_max = depth.max()
+                d_range = d_max - d_min
+                if d_range > 1e-6:
+                    depth_01 = (depth - d_min) / d_range
+                else:
+                    depth_01 = torch.zeros_like(depth)
 
                 brightness_factor = np.random.uniform(
                     1.0 - self._depth_brightness,
@@ -368,14 +370,16 @@ class SUNRGBDDataset(Dataset):
                 )
 
                 # Apply contrast then brightness (same order as ColorJitter)
-                depth = (depth - 0.5) * contrast_factor + 0.5
-                depth = depth * brightness_factor
+                depth_01 = (depth_01 - 0.5) * contrast_factor + 0.5
+                depth_01 = depth_01 * brightness_factor
 
                 # Add Gaussian noise
-                depth = depth + torch.randn_like(depth) * self._depth_noise_std
+                depth_01 = depth_01 + torch.randn_like(depth_01) * self._depth_noise_std
 
-                depth = depth.clamp(0.0, 1.0)
-                # depth is now float32 [0, 1] — skips later uint8->float conversion
+                # Map back to meters
+                if d_range > 1e-6:
+                    depth = depth_01.clamp(0.0, 1.0) * d_range + d_min
+                # depth is now float32 meters — skips later uint16->float conversion
 
         else:
             # Val/Test: CenterCrop (256 -> crop_size)
@@ -385,8 +389,15 @@ class SUNRGBDDataset(Dataset):
         # ==================== TO FLOAT32 ====================
         if rgb.dtype == torch.uint8:
             rgb = rgb.float() / 255.0
-        if depth.dtype == torch.uint8:
-            depth = depth.float() / 255.0
+        if depth.dtype == torch.uint16:
+            depth = depth.float() / 1000.0  # uint16 mm -> float32 meters
+
+        # ==================== SENTINEL REPLACEMENT ====================
+        # Replace depth=0 (missing data) with depth_mean so normalization
+        # maps them to ~0 (neutral). Consistent with ScanNet/Omni pipelines.
+        zero_mask = (depth == 0.0)
+        if zero_mask.any():
+            depth[zero_mask] = self._norm_stats['depth_mean'][0]
 
         # ==================== NORMALIZATION ====================
         # When normalize=False (GPU augmentation mode), skip — GPU handles it.

@@ -125,10 +125,10 @@ class SUNRGBD3StreamDataset(Dataset):
         return self.num_samples
 
     def _load_images_tensor(self, idx):
-        """Load pre-resized uint8 images from tensor files as tensors (no PIL)."""
+        """Load pre-resized images from tensor files."""
         rgb = self.rgb_tensors[idx]      # [3, H, W] uint8
-        depth = self.depth_tensors[idx]  # [1, H, W] uint8
-        orth = self.orth_tensors[idx]    # [1, H, W] uint8
+        depth = self.depth_tensors[idx]  # [1, H, W] uint16 (mm)
+        orth = self.orth_tensors[idx]    # [1, H, W] uint16 (mm)
         return rgb, depth, orth
 
     def _load_images_png(self, idx):
@@ -138,33 +138,19 @@ class SUNRGBD3StreamDataset(Dataset):
         rgb_pil = Image.open(rgb_path).convert('RGB')
         rgb = F2.pil_to_tensor(rgb_pil)  # [3, H, W] uint8
 
-        # Depth: handle various PIL modes, normalize to [0,1], then quantize to uint8
+        # Depth: read 16-bit PNG, apply SUN RGB-D bitshift unpacking -> mm
         depth_path = os.path.join(self.depth_dir, f'{idx:05d}.png')
         depth_pil = Image.open(depth_path)
-        if depth_pil.mode in ('I', 'I;16', 'I;16B'):
-            depth_arr = np.array(depth_pil, dtype=np.float32)
-            depth_arr = np.clip(depth_arr / 65535.0, 0.0, 1.0)
-        else:
-            depth_arr = np.array(depth_pil.convert('L'), dtype=np.float32)
-            if depth_arr.max() > 1.0:
-                depth_arr = depth_arr / 255.0
-        depth = torch.from_numpy(
-            (depth_arr * 255).clip(0, 255).astype(np.uint8)
-        ).unsqueeze(0)  # [1, H, W] uint8
+        depth_arr = np.array(depth_pil, dtype=np.uint16)
+        depth_arr = np.bitwise_or(depth_arr >> 3, depth_arr << 13).astype(np.uint16)
+        depth = torch.from_numpy(depth_arr).unsqueeze(0)  # [1, H, W] uint16 (mm)
 
         # Orth: same handling as depth
         orth_path = os.path.join(self.orth_dir, f'{idx:05d}.png')
         orth_pil = Image.open(orth_path)
-        if orth_pil.mode in ('I', 'I;16', 'I;16B'):
-            orth_arr = np.array(orth_pil, dtype=np.float32)
-            orth_arr = np.clip(orth_arr / 65535.0, 0.0, 1.0)
-        else:
-            orth_arr = np.array(orth_pil.convert('L'), dtype=np.float32)
-            if orth_arr.max() > 1.0:
-                orth_arr = orth_arr / 255.0
-        orth = torch.from_numpy(
-            (orth_arr * 255).clip(0, 255).astype(np.uint8)
-        ).unsqueeze(0)  # [1, H, W] uint8
+        orth_arr = np.array(orth_pil, dtype=np.uint16)
+        orth_arr = np.bitwise_or(orth_arr >> 3, orth_arr << 13).astype(np.uint16)
+        orth = torch.from_numpy(orth_arr).unsqueeze(0)  # [1, H, W] uint16 (mm)
 
         return rgb, depth, orth
 
@@ -182,7 +168,7 @@ class SUNRGBD3StreamDataset(Dataset):
         else:
             rgb, depth, orth = self._load_images_png(idx)
 
-        # At this point: rgb [3, H, W] uint8, depth [1, H, W] uint8, orth [1, H, W] uint8
+        # At this point: rgb [3, H, W] uint8, depth [1, H, W] uint16 (mm), orth [1, H, W] uint16 (mm)
 
         # ==================== TRAINING AUGMENTATION ====================
         if self.split == 'train':
@@ -216,22 +202,36 @@ class SUNRGBD3StreamDataset(Dataset):
 
             # 6. Depth & Orth: Appearance Augmentation (50% probability each)
             if np.random.random() < 0.5:
-                depth = depth.float() / 255.0
+                depth = depth.float() / 1000.0  # uint16 mm -> meters
+                d_min, d_max = depth.min(), depth.max()
+                d_range = d_max - d_min
+                if d_range > 1e-6:
+                    depth_01 = (depth - d_min) / d_range
+                else:
+                    depth_01 = torch.zeros_like(depth)
                 brightness_factor = np.random.uniform(0.75, 1.25)
                 contrast_factor = np.random.uniform(0.75, 1.25)
-                depth = (depth - 0.5) * contrast_factor + 0.5
-                depth = depth * brightness_factor
-                depth = depth + torch.randn_like(depth) * 0.06
-                depth = depth.clamp(0.0, 1.0)
+                depth_01 = (depth_01 - 0.5) * contrast_factor + 0.5
+                depth_01 = depth_01 * brightness_factor
+                depth_01 = depth_01 + torch.randn_like(depth_01) * 0.06
+                if d_range > 1e-6:
+                    depth = depth_01.clamp(0.0, 1.0) * d_range + d_min
 
             if np.random.random() < 0.5:
-                orth = orth.float() / 255.0
+                orth = orth.float() / 1000.0  # uint16 mm -> meters
+                o_min, o_max = orth.min(), orth.max()
+                o_range = o_max - o_min
+                if o_range > 1e-6:
+                    orth_01 = (orth - o_min) / o_range
+                else:
+                    orth_01 = torch.zeros_like(orth)
                 brightness_factor = np.random.uniform(0.75, 1.25)
                 contrast_factor = np.random.uniform(0.75, 1.25)
-                orth = (orth - 0.5) * contrast_factor + 0.5
-                orth = orth * brightness_factor
-                orth = orth + torch.randn_like(orth) * 0.06
-                orth = orth.clamp(0.0, 1.0)
+                orth_01 = (orth_01 - 0.5) * contrast_factor + 0.5
+                orth_01 = orth_01 * brightness_factor
+                orth_01 = orth_01 + torch.randn_like(orth_01) * 0.06
+                if o_range > 1e-6:
+                    orth = orth_01.clamp(0.0, 1.0) * o_range + o_min
 
         else:
             # Val/Test: CenterCrop (256 -> crop_size)
@@ -242,10 +242,10 @@ class SUNRGBD3StreamDataset(Dataset):
         # ==================== TO FLOAT32 ====================
         if rgb.dtype == torch.uint8:
             rgb = rgb.float() / 255.0
-        if depth.dtype == torch.uint8:
-            depth = depth.float() / 255.0
-        if orth.dtype == torch.uint8:
-            orth = orth.float() / 255.0
+        if depth.dtype == torch.uint16:
+            depth = depth.float() / 1000.0  # uint16 mm -> meters
+        if orth.dtype == torch.uint16:
+            orth = orth.float() / 1000.0  # uint16 mm -> meters
 
         # ==================== NORMALIZATION ====================
         rgb = F2.normalize(
