@@ -204,14 +204,15 @@ def _read_rgb(path: str) -> torch.Tensor:
 
 def _read_depth(path: str) -> torch.Tensor:
     d = Image.open(path)
-    if d.mode in ("I", "I;16", "I;16B"):
-        arr = np.array(d, dtype=np.float32)
-        arr = np.clip(arr / 65535.0 * 255.0, 0, 255).astype(np.uint8)
-        d = Image.fromarray(arr, mode="L")
-    else:
-        d = d.convert("L")
-    d = TF.resize(d, TARGET_SIZE)
-    arr = np.array(d, dtype=np.uint8)
+    arr = np.array(d, dtype=np.uint16)
+    # SUN RGB-D uses a 3-bit shift packing (from SUNRGBDtoolbox/read3dPoints.m):
+    #   unpacked = bitor(bitshift(raw, -3), bitshift(raw, 16-3))
+    # After unpacking, values are in millimeters (divide by 1000 for meters).
+    arr = np.bitwise_or(arr >> 3, arr << 13).astype(np.uint16)
+    # Resize using nearest-neighbor to preserve depth precision
+    d = Image.fromarray(arr, mode="I;16")
+    d = TF.resize(d, TARGET_SIZE, interpolation=TF.InterpolationMode.NEAREST)
+    arr = np.array(d, dtype=np.uint16)
     return torch.from_numpy(arr).unsqueeze(0)
 
 
@@ -224,7 +225,7 @@ def build_split(split_name: str, split_samples: list, output_base: str):
     print(f"\nBuilding {split_name} ({N} samples) ...")
 
     rgb_t   = torch.empty(N, 3, H, W, dtype=torch.uint8)
-    depth_t = torch.empty(N, 1, H, W, dtype=torch.uint8)
+    depth_t = torch.empty(N, 1, H, W, dtype=torch.uint16)
     labels  = []
 
     for i, (_, label, cls, rgb_path, depth_path) in enumerate(tqdm(split_samples)):
@@ -335,15 +336,18 @@ def _compute_and_save_norm_stats(output_base: str):
     rgb_t = torch.load(os.path.join(train_dir, "rgb_tensors.pt"), weights_only=True)
     depth_t = torch.load(os.path.join(train_dir, "depth_tensors.pt"), weights_only=True)
 
-    # Convert uint8 -> float32 [0, 1]
-    rgb_f = rgb_t.float() / 255.0    # [N, 3, H, W]
-    depth_f = depth_t.float() / 255.0  # [N, 1, H, W]
+    # Convert to float32
+    rgb_f = rgb_t.float() / 255.0      # [N, 3, H, W] uint8 -> [0, 1]
+    depth_f = depth_t.float() / 1000.0  # [N, 1, H, W] uint16 mm -> meters
 
     # Per-channel mean and std across all pixels
     rgb_mean = rgb_f.mean(dim=(0, 2, 3)).tolist()
     rgb_std = rgb_f.std(dim=(0, 2, 3)).tolist()
-    depth_mean = [depth_f.mean().item()]
-    depth_std = [depth_f.std().item()]
+
+    # Depth stats: exclude zero pixels (missing data sentinel)
+    valid_depth = depth_f[depth_t.to(torch.int32) > 0]
+    depth_mean = [valid_depth.mean().item()]
+    depth_std = [valid_depth.std().item()]
 
     stats = {
         "rgb_mean": rgb_mean,
