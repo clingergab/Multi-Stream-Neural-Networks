@@ -316,6 +316,10 @@ class SUNRGBDDataset(Dataset):
 
         # At this point: rgb [3, H, W] uint8, depth [1, H, W] uint16 (mm)
 
+        # Convert depth early: uint16 mm -> float32 meters
+        # (PyTorch uint16 has limited op support — flip, crop, etc. fail on it)
+        depth = depth.float() / 1000.0
+
         # ==================== TRAINING AUGMENTATION ====================
         if self.split == 'train':
             # 1. Synchronized Random Horizontal Flip
@@ -347,10 +351,8 @@ class SUNRGBDDataset(Dataset):
                 if np.random.random() < self._grayscale_p:
                     rgb = F2.rgb_to_grayscale(rgb, num_output_channels=3)
 
-            # 6. Depth-Only: Combined Appearance Augmentation (torch ops, no numpy/PIL)
+            # 6. Depth-Only: Combined Appearance Augmentation
             if np.random.random() < self._depth_aug_p:
-                depth = depth.float() / 1000.0  # uint16 mm -> float32 meters
-
                 # Normalize to [0,1] for augmentation
                 d_min = depth.min()
                 d_max = depth.max()
@@ -379,7 +381,6 @@ class SUNRGBDDataset(Dataset):
                 # Map back to meters
                 if d_range > 1e-6:
                     depth = depth_01.clamp(0.0, 1.0) * d_range + d_min
-                # depth is now float32 meters — skips later uint16->float conversion
 
         else:
             # Val/Test: CenterCrop (256 -> crop_size)
@@ -389,8 +390,6 @@ class SUNRGBDDataset(Dataset):
         # ==================== TO FLOAT32 ====================
         if rgb.dtype == torch.uint8:
             rgb = rgb.float() / 255.0
-        if depth.dtype == torch.uint16:
-            depth = depth.float() / 1000.0  # uint16 mm -> float32 meters
 
         # ==================== SENTINEL REPLACEMENT ====================
         # Replace depth=0 (missing data) with depth_mean so normalization

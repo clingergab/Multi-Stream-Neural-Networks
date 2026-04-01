@@ -170,6 +170,11 @@ class SUNRGBD3StreamDataset(Dataset):
 
         # At this point: rgb [3, H, W] uint8, depth [1, H, W] uint16 (mm), orth [1, H, W] uint16 (mm)
 
+        # Convert depth/orth early: uint16 mm -> float32 meters
+        # (PyTorch uint16 has limited op support — flip, crop, etc. fail on it)
+        depth = depth.float() / 1000.0
+        orth = orth.float() / 1000.0
+
         # ==================== TRAINING AUGMENTATION ====================
         if self.split == 'train':
             # 1. Synchronized Random Horizontal Flip (50%)
@@ -202,7 +207,6 @@ class SUNRGBD3StreamDataset(Dataset):
 
             # 6. Depth & Orth: Appearance Augmentation (50% probability each)
             if np.random.random() < 0.5:
-                depth = depth.float() / 1000.0  # uint16 mm -> meters
                 d_min, d_max = depth.min(), depth.max()
                 d_range = d_max - d_min
                 if d_range > 1e-6:
@@ -218,7 +222,6 @@ class SUNRGBD3StreamDataset(Dataset):
                     depth = depth_01.clamp(0.0, 1.0) * d_range + d_min
 
             if np.random.random() < 0.5:
-                orth = orth.float() / 1000.0  # uint16 mm -> meters
                 o_min, o_max = orth.min(), orth.max()
                 o_range = o_max - o_min
                 if o_range > 1e-6:
@@ -242,10 +245,6 @@ class SUNRGBD3StreamDataset(Dataset):
         # ==================== TO FLOAT32 ====================
         if rgb.dtype == torch.uint8:
             rgb = rgb.float() / 255.0
-        if depth.dtype == torch.uint16:
-            depth = depth.float() / 1000.0  # uint16 mm -> meters
-        if orth.dtype == torch.uint16:
-            orth = orth.float() / 1000.0  # uint16 mm -> meters
 
         # ==================== NORMALIZATION ====================
         rgb = F2.normalize(
