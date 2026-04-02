@@ -140,10 +140,11 @@ class BaseModel(nn.Module, ABC):
         This method separates model parameters into N+2 groups:
         - N stream-specific groups (one per stream): Contains ONLY stream_weights.i and stream_biases.i
           (the stream's own feature extraction parameters)
-        - 1 integration group: Contains integration_from_streams.*, integrated_weight, integrated_bias
-          (the parameters that control how streams are combined into the integrated representation)
-        - 1 other group: Contains BN parameters, classifier heads (fc, fc_streams), and any other
-          shared parameters (these conventionally get low/zero weight decay)
+        - 1 integration group: Contains integration_from_streams.*, integrated_weight, integrated_bias,
+          and classifier heads (fc, fc_streams). These are all trainable weight matrices that benefit
+          from weight decay regularization.
+        - 1 other group: Contains BN parameters and any other shared parameters
+          (these conventionally get zero weight decay to avoid hurting normalization)
 
         When integration_weight_decay is None (default), the old behavior is preserved:
         integration params and other params are merged into a single shared group with
@@ -232,7 +233,12 @@ class BaseModel(nn.Module, ABC):
                 else:
                     other_params.append(param)
                 continue
-            # Everything else: BN params, fc, fc_streams, etc.
+            # Classifier heads: fc and fc_streams get weight decay with integration params
+            # (classifier is always trained from scratch, even in transfer learning)
+            if name.startswith('fc.') or name.startswith('fc_streams.'):
+                integration_params.append(param)
+                continue
+            # Everything else: BN params (no weight decay)
             other_params.append(param)
 
         # Build groups
