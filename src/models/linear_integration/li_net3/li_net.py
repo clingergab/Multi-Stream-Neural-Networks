@@ -773,14 +773,17 @@ class LINet(BaseModel):
         return snapshot
 
     def _compute_stream_weight_norms(self) -> dict:
-        """Compute L2 norms of stream backbone and integrated weights per layer.
+        """Compute L2 norms of stream backbone and integrated conv weights per layer.
 
         Tracks stream_weights (main conv kernels per stream) and
         integrated_weight (1x1 conv from previous integrated output).
+        Only includes conv layers (skips BN).
         Does NOT include integration_from_streams (tracked separately).
         """
         norms = {}
         for name, param in self.named_parameters():
+            if 'bn' in name:
+                continue
             if 'stream_weights' in name or 'integrated_weight' in name:
                 norms[name] = param.data.norm().item()
         return norms
