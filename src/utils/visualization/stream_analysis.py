@@ -672,6 +672,79 @@ class IntegrationWeightEvolutionVisualizer:
         plt.tight_layout()
         _save_or_show(fig, save_path)
 
+    def plot_stream_weight_norms(
+        self,
+        history: dict,
+        save_path: Optional[str] = None,
+    ) -> None:
+        """Plot per-stream and integrated backbone weight norms over epochs.
+
+        Args:
+            history: model training history dict containing 'stream_weight_norms'.
+            save_path: optional save path.
+        """
+        norms_history = history.get("stream_weight_norms", [])
+        if not norms_history:
+            print("No stream weight norm data in history.")
+            return
+
+        # Collect all keys
+        all_keys = set()
+        for epoch_norms in norms_history:
+            all_keys.update(epoch_norms.keys())
+
+        # Group by parent layer
+        # Keys: "layer1.0.conv1.stream_weights.0", "layer1.0.conv1.integrated_weight"
+        layer_groups = OrderedDict()
+        for key in sorted(all_keys):
+            if ".stream_weights." in key:
+                layer_prefix, stream_idx = key.rsplit(".", 1)
+                layer_prefix = layer_prefix.rsplit(".", 1)[0]  # strip "stream_weights"
+                if layer_prefix not in layer_groups:
+                    layer_groups[layer_prefix] = {"streams": {}, "integrated": None}
+                layer_groups[layer_prefix]["streams"][int(stream_idx)] = key
+            elif ".integrated_weight" in key or key == "integrated_weight":
+                layer_prefix = key.rsplit(".", 1)[0] if "." in key else key
+                if layer_prefix not in layer_groups:
+                    layer_groups[layer_prefix] = {"streams": {}, "integrated": None}
+                layer_groups[layer_prefix]["integrated"] = key
+
+        # Determine num_streams from data
+        stream_counts = [max(g["streams"].keys()) for g in layer_groups.values() if g["streams"]]
+        num_streams = max(stream_counts) + 1 if stream_counts else 1
+        labels = _default_stream_labels(num_streams, self.stream_labels)
+
+        # Plot per-layer norm evolution
+        n_layers = len(layer_groups)
+        ncols = min(4, n_layers)
+        nrows = (n_layers + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4, nrows * 3), squeeze=False)
+
+        epochs = range(len(norms_history))
+
+        for idx, (layer_prefix, group) in enumerate(layer_groups.items()):
+            ax = axes[idx // ncols, idx % ncols]
+            for si, key in sorted(group["streams"].items()):
+                vals = [nh.get(key, 0.0) for nh in norms_history]
+                ax.plot(epochs, vals, label=labels.get(si, f"S{si}"), marker=".", markersize=3)
+            if group["integrated"] is not None:
+                vals = [nh.get(group["integrated"], 0.0) for nh in norms_history]
+                ax.plot(epochs, vals, label="Integrated", color="green",
+                        linestyle="--", marker=".", markersize=3)
+            ax.set_title(layer_prefix.replace(".", "\n"), fontsize=7)
+            ax.set_xlabel("Epoch", fontsize=8)
+            ax.set_ylabel("L2 Norm", fontsize=8)
+            ax.legend(fontsize=6)
+            ax.grid(True, alpha=0.3)
+
+        # Hide unused axes
+        for idx in range(n_layers, nrows * ncols):
+            axes[idx // ncols, idx % ncols].set_visible(False)
+
+        fig.suptitle("Stream Weight Norm Evolution", fontsize=12)
+        plt.tight_layout()
+        _save_or_show(fig, save_path)
+
     def plot_snapshot_heatmaps(
         self,
         snapshot_dir: str,
@@ -684,7 +757,7 @@ class IntegrationWeightEvolutionVisualizer:
         Args:
             snapshot_dir: directory containing epoch_N_integration_weights.pt files.
             epochs: specific epochs to plot (default: all found).
-            layer_filter: only show layers containing this string.
+            layer_filter: only show layers whose name starts with this string.
             save_path: optional save path.
         """
         import os
@@ -714,7 +787,7 @@ class IntegrationWeightEvolutionVisualizer:
         first_snapshot = torch.load(file_epochs[0][1], map_location="cpu", weights_only=True)
         param_names = sorted(first_snapshot.keys())
         if layer_filter:
-            param_names = [p for p in param_names if layer_filter in p]
+            param_names = [p for p in param_names if p.startswith(layer_filter)]
 
         if not param_names:
             print(f"No parameters match filter '{layer_filter}'.")

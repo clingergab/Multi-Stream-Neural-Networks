@@ -772,6 +772,19 @@ class LINet(BaseModel):
                 snapshot[name] = param.data.cpu().clone()
         return snapshot
 
+    def _compute_stream_weight_norms(self) -> dict:
+        """Compute L2 norms of stream backbone and integrated weights per layer.
+
+        Tracks stream_weights (main conv kernels per stream) and
+        integrated_weight (1x1 conv from previous integrated output).
+        Does NOT include integration_from_streams (tracked separately).
+        """
+        norms = {}
+        for name, param in self.named_parameters():
+            if 'stream_weights' in name or 'integrated_weight' in name:
+                norms[name] = param.data.norm().item()
+        return norms
+
     # ==================== End Integration Weight Tracking ====================
 
     def fit(
@@ -963,6 +976,7 @@ class LINet(BaseModel):
         # Add integration weight tracking (if enabled)
         if track_integration_weights:
             history['integration_weight_norms'] = []
+            history['stream_weight_norms'] = []
 
         # Add modality dropout tracking (if enabled)
         if modality_dropout:
@@ -1229,6 +1243,8 @@ class LINet(BaseModel):
             if track_integration_weights:
                 epoch_int_norms = self._compute_integration_weight_norms()
                 history['integration_weight_norms'].append(epoch_int_norms)
+                epoch_stream_norms = self._compute_stream_weight_norms()
+                history['stream_weight_norms'].append(epoch_stream_norms)
 
                 # Save full snapshots to disk at configured intervals
                 if integration_snapshot_path and (epoch + 1) % integration_snapshot_freq == 0:
