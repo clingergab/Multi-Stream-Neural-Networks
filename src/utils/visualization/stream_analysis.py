@@ -727,14 +727,23 @@ class IntegrationWeightEvolutionVisualizer:
             for si, key in sorted(group["streams"].items()):
                 vals = [nh.get(key, 0.0) for nh in norms_history]
                 ax.plot(epochs, vals, label=labels.get(si, f"S{si}"), marker=".", markersize=3)
+
             if group["integrated"] is not None:
                 vals = [nh.get(group["integrated"], 0.0) for nh in norms_history]
-                ax.plot(epochs, vals, label="Integrated", color="green",
-                        linestyle="--", marker=".", markersize=3)
+                ax2 = ax.twinx()
+                ax2.plot(epochs, vals, label="Integrated", color="green",
+                         linestyle="--", marker=".", markersize=3)
+                ax2.set_ylabel("Integrated", fontsize=7, color="green")
+                ax2.tick_params(axis="y", labelcolor="green", labelsize=6)
+                lines1, labels1 = ax.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax.legend(lines1 + lines2, labels1 + labels2, fontsize=6)
+            else:
+                ax.legend(fontsize=6)
+
             ax.set_title(layer_prefix.replace(".", "\n"), fontsize=7)
             ax.set_xlabel("Epoch", fontsize=8)
             ax.set_ylabel("L2 Norm", fontsize=8)
-            ax.legend(fontsize=6)
             ax.grid(True, alpha=0.3)
 
         # Hide unused axes
