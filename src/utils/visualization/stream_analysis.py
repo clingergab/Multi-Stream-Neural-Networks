@@ -697,6 +697,8 @@ class IntegrationWeightEvolutionVisualizer:
         # Keys: "layer1.0.conv1.stream_weights.0", "layer1.0.conv1.integrated_weight"
         layer_groups = OrderedDict()
         for key in sorted(all_keys):
+            if "downsample" in key:
+                continue
             if ".stream_weights." in key:
                 layer_prefix, stream_idx = key.rsplit(".", 1)
                 layer_prefix = layer_prefix.rsplit(".", 1)[0]  # strip "stream_weights"
