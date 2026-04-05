@@ -629,6 +629,8 @@ class IntegrationWeightEvolutionVisualizer:
         # Group by layer (strip stream index)
         layer_groups = OrderedDict()
         for key in sorted(all_keys):
+            if "downsample" in key:
+                continue
             parts = key.rsplit(".", 1)
             if len(parts) == 2:
                 layer_prefix = parts[0]
