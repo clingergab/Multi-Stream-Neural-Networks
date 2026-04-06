@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+from torchvision.utils import make_grid
 from typing import Optional, Union
 from collections import OrderedDict
 from torch.utils.data import DataLoader
@@ -1032,6 +1033,41 @@ class IntegrationWeightVisualizer:
             result[layer_name][stream_idx] = w
 
         return result
+
+    def visualize_conv1_filters(self, save_path: Optional[str] = None) -> None:
+        """Visualize learned first-layer (7x7) conv filters for each stream.
+
+        Filters are arranged in a square grid using torchvision.make_grid.
+        RGB stream filters are shown as color, single-channel streams are
+        repeated to 3 channels for display.
+        """
+        conv1 = self.model.conv1
+        stream_weights = [w.detach().cpu() for w in conv1.stream_weights]
+
+        fig, axes = plt.subplots(len(stream_weights), 1,
+                                 figsize=(8, 8 * len(stream_weights)))
+        if len(stream_weights) == 1:
+            axes = [axes]
+
+        for si, w in enumerate(stream_weights):
+            n_filters = w.shape[0]
+            kh, kw = w.shape[2], w.shape[3]
+
+            # Repeat single-channel to 3 channels for display
+            w_plot = w.repeat(1, 3, 1, 1) if w.shape[1] == 1 else w
+
+            nrow = int(np.ceil(np.sqrt(n_filters)))
+            grid = make_grid(w_plot, nrow=nrow, normalize=True,
+                             scale_each=True, pad_value=1)
+            axes[si].imshow(grid.permute(1, 2, 0).numpy())
+            axes[si].set_title(
+                f"{self.labels[si]} Stream — {n_filters} filters "
+                f"({w.shape[1]}×{kh}×{kw})", fontsize=14)
+            axes[si].axis("off")
+
+        fig.suptitle("Learned First-Layer Filters (conv1)", fontsize=16, fontweight="bold")
+        plt.tight_layout()
+        _save_or_show(fig, save_path)
 
 
 # ---------------------------------------------------------------------------
