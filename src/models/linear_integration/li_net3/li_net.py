@@ -1133,7 +1133,16 @@ class LINet(BaseModel):
 
             # Capture LRs that were used during this epoch BEFORE stepping the scheduler
             current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
-            epoch_stream_lrs = [pg['lr'] for pg in self.optimizer.param_groups[:self.num_streams]]
+            # With stem_lr_multiplier: groups are [stem_0, stem_1, backbone_0, backbone_1, integ, other]
+            # Without: groups are [stream_0, stream_1, integ, other]
+            n_groups = len(self.optimizer.param_groups)
+            has_stem_split = (n_groups >= 2 * self.num_streams + 2)
+            if has_stem_split:
+                epoch_stem_lrs = [pg['lr'] for pg in self.optimizer.param_groups[:self.num_streams]]
+                epoch_stream_lrs = [pg['lr'] for pg in self.optimizer.param_groups[self.num_streams:2*self.num_streams]]
+            else:
+                epoch_stem_lrs = None
+                epoch_stream_lrs = [pg['lr'] for pg in self.optimizer.param_groups[:self.num_streams]]
 
             # Step epoch-based schedulers at epoch end
             # Skip OneCycleLR (steps per batch) and schedulers with _step_per_batch=True
@@ -1223,6 +1232,13 @@ class LINet(BaseModel):
                 for i in range(self.num_streams):
                     history[f'stream_{i}_lr'].append(epoch_stream_lrs[i] if i < len(epoch_stream_lrs) else
                                                      self.optimizer.param_groups[0]['lr'])
+                # Log stem LRs when stem split is active
+                if epoch_stem_lrs is not None:
+                    for i in range(self.num_streams):
+                        key = f'stem_{i}_lr'
+                        if key not in history:
+                            history[key] = []
+                        history[key].append(epoch_stem_lrs[i])
 
             # Gradient monitoring epoch summary
             if gradient_health_tracker is not None:

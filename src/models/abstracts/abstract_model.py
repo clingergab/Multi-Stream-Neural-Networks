@@ -133,18 +133,25 @@ class BaseModel(nn.Module, ABC):
                                      stream_weight_decays: Union[float, list[float]] = 0.0,
                                      shared_lr: Optional[float] = None,
                                      shared_weight_decay: float = 0.0,
-                                     integration_weight_decay: Optional[float] = None):
+                                     integration_weight_decay: Optional[float] = None,
+                                     stem_lr_multiplier: float = 1.0):
         """
         Create parameter groups for stream-specific learning rates in N-stream models.
 
-        This method separates model parameters into N+2 groups:
-        - N stream-specific groups (one per stream): Contains ONLY stream_weights.i and stream_biases.i
+        This method separates model parameters into N+2 groups (or 2N+2 when
+        stem_lr_multiplier != 1.0):
+        - N stream-specific groups (one per stream): Contains stream_weights.i and stream_biases.i
           (the stream's own feature extraction parameters)
         - 1 integration group: Contains integration_from_streams.*, integrated_weight, integrated_bias,
           and classifier heads (fc, fc_streams). These are all trainable weight matrices that benefit
           from weight decay regularization.
         - 1 other group: Contains BN parameters and any other shared parameters
           (these conventionally get zero weight decay to avoid hurting normalization)
+
+        When stem_lr_multiplier != 1.0, each stream group is split into a stem group
+        (conv1 parameters, with scaled LR) and a backbone group (layer1-4 parameters),
+        producing 2N+2 groups total. Weight decay for stem groups is scaled down by
+        1/stem_lr_multiplier to keep effective regularization constant under AdamW.
 
         When integration_weight_decay is None (default), the old behavior is preserved:
         integration params and other params are merged into a single shared group with
@@ -164,6 +171,9 @@ class BaseModel(nn.Module, ABC):
             integration_weight_decay: Weight decay for integration parameters
                                      (integration_from_streams.*, integrated_weight, integrated_bias).
                                      If None, integration params use shared_weight_decay (legacy behavior).
+            stem_lr_multiplier: Multiplier for stem (conv1) learning rate relative to stream LRs.
+                               Default 1.0 preserves the existing 4-group structure.
+                               Values > 1.0 give the stem a higher LR to escape Kaiming initialization.
 
         Returns:
             List of parameter group dicts that can be passed to PyTorch optimizers.
@@ -171,17 +181,6 @@ class BaseModel(nn.Module, ABC):
 
         Raises:
             ValueError: If no streams detected or if list lengths don't match number of streams.
-
-        Example:
-            >>> # For a 3-stream model (RGB, Depth, HHA)
-            >>> param_groups = model.get_stream_parameter_groups(
-            ...     stream_lrs=[2e-4, 7e-4, 5e-4],
-            ...     stream_weight_decays=[1e-4, 2e-4, 1.5e-4],
-            ...     shared_lr=5e-4,
-            ...     shared_weight_decay=0.0,              # BN + classifier heads
-            ...     integration_weight_decay=1e-3          # Crank up integration WD independently
-            ... )
-            >>> optimizer = torch.optim.AdamW(param_groups)
         """
         # Detect number of streams
         num_streams = 0
@@ -208,7 +207,9 @@ class BaseModel(nn.Module, ABC):
         if shared_lr is None:
             shared_lr = sum(stream_lrs) / len(stream_lrs)
 
-        # Separate parameters into stream / integration / other
+        # Separate parameters into stem / stream (backbone) / integration / other
+        split_stem = (stem_lr_multiplier != 1.0)
+        stem_params = [[] for _ in range(num_streams)]
         stream_params = [[] for _ in range(num_streams)]
         integration_params = []
         other_params = []
@@ -218,7 +219,11 @@ class BaseModel(nn.Module, ABC):
             if '.stream_weights.' in name or '.stream_biases.' in name:
                 match = re.search(r'\.stream_(?:weights|biases)\.(\d+)(?:\.|$)', name)
                 if match:
-                    stream_params[int(match.group(1))].append(param)
+                    stream_idx = int(match.group(1))
+                    if split_stem and name.startswith('conv1.'):
+                        stem_params[stream_idx].append(param)
+                    else:
+                        stream_params[stream_idx].append(param)
                     continue
             # Integration conv weights: integration_from_streams.* and
             # integrated_weight/integrated_bias that are conv params (4D or 0D for first-layer).
@@ -243,6 +248,17 @@ class BaseModel(nn.Module, ABC):
 
         # Build groups
         param_groups = []
+
+        # Stem groups (only populated when stem_lr_multiplier != 1.0)
+        for i in range(num_streams):
+            if stem_params[i]:
+                param_groups.append({
+                    'params': stem_params[i],
+                    'lr': stream_lrs[i] * stem_lr_multiplier,
+                    'weight_decay': stream_weight_decays[i] / stem_lr_multiplier
+                })
+
+        # Backbone stream groups
         for i in range(num_streams):
             if stream_params[i]:
                 param_groups.append({

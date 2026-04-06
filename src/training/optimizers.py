@@ -18,6 +18,7 @@ def create_stream_optimizer(
     shared_lr=None,
     shared_weight_decay: float = 0.0,
     integration_weight_decay=None,
+    stem_lr_multiplier: float = 1.0,
     **optimizer_kwargs
 ):
     """
@@ -41,6 +42,9 @@ def create_stream_optimizer(
         integration_weight_decay: Weight decay for integration parameters
                                  (integration_from_streams.*, integrated_weight, integrated_bias).
                                  If None, integration params use shared_weight_decay (legacy behavior).
+        stem_lr_multiplier: Multiplier for stem (conv1) learning rate. Default 1.0 (no change).
+                           Values > 1.0 give the stem a higher LR to escape Kaiming initialization.
+                           When != 1.0, produces 2N+2 groups instead of N+2.
         **optimizer_kwargs: Additional optimizer-specific arguments
                            (e.g., betas, eps, momentum, nesterov)
 
@@ -101,7 +105,8 @@ def create_stream_optimizer(
         stream_weight_decays=stream_weight_decays,
         shared_lr=shared_lr,
         shared_weight_decay=shared_weight_decay,
-        integration_weight_decay=integration_weight_decay
+        integration_weight_decay=integration_weight_decay,
+        stem_lr_multiplier=stem_lr_multiplier
     )
 
     # Create optimizer with parameter groups
