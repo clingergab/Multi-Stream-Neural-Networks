@@ -353,6 +353,10 @@ class SUNRGBDDataset(Dataset):
 
             # 6. Depth-Only: Combined Appearance Augmentation
             if np.random.random() < self._depth_aug_p:
+                # Capture missing-data mask BEFORE augmentation so noise
+                # doesn't corrupt sentinel pixels (0.0 = missing in SUN RGB-D)
+                depth_missing_mask = (depth == 0.0)
+
                 # Normalize to [0,1] for augmentation
                 d_min = depth.min()
                 d_max = depth.max()
@@ -381,6 +385,10 @@ class SUNRGBDDataset(Dataset):
                 # Map back to meters
                 if d_range > 1e-6:
                     depth = depth_01.clamp(0.0, 1.0) * d_range + d_min
+
+                # Restore sentinel pixels to 0.0 so downstream replacement works
+                if depth_missing_mask.any():
+                    depth[depth_missing_mask] = 0.0
 
         else:
             # Val/Test: CenterCrop (256 -> crop_size)
