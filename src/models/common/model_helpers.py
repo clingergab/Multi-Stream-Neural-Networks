@@ -58,11 +58,19 @@ def load_pretrained_backbone(
 
     dst_state = model.state_dict()
 
+    # thop.profile() registers total_ops/total_params buffers on every module.
+    # These are not real weights — filter them out silently.
+    THOP_SUFFIXES = ('.total_ops', '.total_params')
+
     loaded_keys: list[str] = []
     skipped_keys: list[str] = []
+    thop_keys: int = 0
 
     filtered_state = {}
     for key, src_param in src_state.items():
+        if key.endswith(THOP_SUFFIXES) or key in ('total_ops', 'total_params'):
+            thop_keys += 1
+            continue
         if key not in dst_state:
             skipped_keys.append(key)
             continue
@@ -77,9 +85,11 @@ def load_pretrained_backbone(
     if verbose:
         print(f"Loaded pretrained backbone from: {checkpoint_path}")
         print(f"  Loaded:  {len(loaded_keys)} keys")
-        print(f"  Skipped: {len(skipped_keys)} keys (shape mismatch or absent)")
         if skipped_keys:
+            print(f"  Skipped: {len(skipped_keys)} keys (shape mismatch or absent)")
             print(f"  Skipped keys: {skipped_keys}")
+        if thop_keys:
+            print(f"  Ignored: {thop_keys} thop profiling buffers")
         if missing.unexpected_keys:
             print(f"  Unexpected keys: {missing.unexpected_keys}")
 

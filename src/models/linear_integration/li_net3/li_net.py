@@ -1166,7 +1166,11 @@ class LINet(BaseModel):
                         else:
                             mode = getattr(sched, 'mode', 'min')
 
-                        if mode == 'max':
+                        # Use the fit() monitor metric when it matches the scheduler mode,
+                        # so plateau can track val_mca (mode='max') or val_loss (mode='min')
+                        if monitor == 'val_mca' and mode == 'max':
+                            metric = val_mca if val_loader else train_mca
+                        elif mode == 'max':
                             metric = val_acc if val_loader else train_accuracy
                         else:
                             metric = val_loss if val_loader else avg_train_loss
