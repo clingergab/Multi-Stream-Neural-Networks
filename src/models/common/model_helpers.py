@@ -618,7 +618,8 @@ def create_progress_bar(verbose: bool, epoch: int, epochs: int, total_steps: int
 def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
                         val_loader, val_loss: float, val_acc: float,
                         early_stopping_state: dict[str, Any], current_lr: float,
-                        extra_postfix: Optional[dict[str, str]] = None) -> None:
+                        extra_postfix: Optional[dict[str, str]] = None,
+                        train_mca: float = 0.0, val_mca: float = 0.0) -> None:
     """
     Update and close progress bar with final epoch metrics.
 
@@ -632,20 +633,26 @@ def finalize_progress_bar(pbar, avg_train_loss: float, train_accuracy: float,
         early_stopping_state: Early stopping state dictionary
         current_lr: Current learning rate
         extra_postfix: Optional extra key-value pairs to include (e.g., grad norm)
+        train_mca: Training mean class accuracy
+        val_mca: Validation mean class accuracy
     """
     if pbar is None:
         return
-        
+
     final_postfix = {
         'train_loss': f'{avg_train_loss:.4f}',
-        'train_acc': f'{train_accuracy:.4f}'
+        'train_acc': f'{train_accuracy:.4f}',
     }
-    
+    if train_mca > 0:
+        final_postfix['train_mca'] = f'{train_mca:.4f}'
+
     if val_loader:
         final_postfix.update({
             'val_loss': f'{val_loss:.4f}',
-            'val_acc': f'{val_acc:.4f}'
+            'val_acc': f'{val_acc:.4f}',
         })
+        if val_mca > 0:
+            final_postfix['val_mca'] = f'{val_mca:.4f}'
     
     # Add early stopping info to progress bar
     if early_stopping_state['enabled'] and val_loader is not None:

@@ -1192,7 +1192,8 @@ class LINet(BaseModel):
             finalize_progress_bar(
                 pbar, avg_train_loss, train_accuracy, val_loader,
                 val_loss, val_acc, early_stopping_state, current_lr,
-                extra_postfix=extra_postfix
+                extra_postfix=extra_postfix,
+                train_mca=train_mca, val_mca=val_mca if val_loader else 0.0
             )
 
             # Stream contribution monitoring via blanked-stream evaluation
