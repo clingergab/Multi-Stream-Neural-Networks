@@ -252,7 +252,7 @@ def validate_split(h5f):
     for local_idx in train_sample:
         mat_idx = train_indices_csv[local_idx]
         rgb_mat = np.array(images_ds[mat_idx])
-        rgb_mat = np.transpose(rgb_mat, (1, 2, 0))
+        rgb_mat = np.transpose(rgb_mat, (2, 1, 0))
         if rgb_mat.dtype != np.uint8:
             rgb_mat = rgb_mat.astype(np.uint8)
         rgb_img = Image.fromarray(rgb_mat, mode="RGB")
@@ -265,7 +265,7 @@ def validate_split(h5f):
     for local_idx in test_sample:
         mat_idx = test_indices_csv[local_idx]
         rgb_mat = np.array(images_ds[mat_idx])
-        rgb_mat = np.transpose(rgb_mat, (1, 2, 0))
+        rgb_mat = np.transpose(rgb_mat, (2, 1, 0))
         if rgb_mat.dtype != np.uint8:
             rgb_mat = rgb_mat.astype(np.uint8)
         rgb_img = Image.fromarray(rgb_mat, mode="RGB")
@@ -337,7 +337,7 @@ def validate_depth_sanity(h5f):
     all_depth_match = True
     for local_idx in sample_idxs:
         mat_idx = train_indices_csv[local_idx]
-        depth_mat = np.array(depths_ds[mat_idx])  # (640, 480) float, meters
+        depth_mat = np.array(depths_ds[mat_idx]).T  # h5py reverses MATLAB (H,W)->(W,H); .T recovers (H,W)
         depth_mm = depth_mat * 1000.0
         depth_mm = np.clip(depth_mm, 0, 65535).astype(np.uint16)
         depth_img = Image.fromarray(depth_mm, mode="I;16")

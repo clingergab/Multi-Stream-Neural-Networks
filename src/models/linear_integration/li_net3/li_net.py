@@ -828,6 +828,9 @@ class LINet(BaseModel):
         track_integration_weights: bool = False,  # Track integration weight norms per epoch
         integration_snapshot_path: Optional[str] = None,  # Path to save full weight snapshots
         integration_snapshot_freq: int = 10,  # Save full snapshots every N epochs
+        # Explicit epoch checkpointing
+        checkpoint_epochs: Optional[list[int]] = None,  # Save checkpoints at these 1-based epochs (e.g. [85, 95, 105])
+        checkpoint_dir: Optional[str] = None,  # Directory to save epoch checkpoints
     ) -> dict:
         """
         Train the model with optional early stopping.
@@ -1348,7 +1351,19 @@ class LINet(BaseModel):
                     'train_mca': train_mca,
                     'val_mca': val_mca,
                 })
-        
+
+            # Save explicit epoch checkpoints
+            if checkpoint_epochs and checkpoint_dir and (epoch + 1) in checkpoint_epochs:
+                save_checkpoint(
+                    model_state_dict=self.state_dict(),
+                    optimizer_state_dict=self.optimizer.state_dict() if self.optimizer else None,
+                    scheduler_state_dict=self.scheduler.state_dict() if self.scheduler else None,
+                    path=f"{checkpoint_dir}/checkpoint_epoch_{epoch + 1}.pt",
+                    history=history
+                )
+                if verbose:
+                    print(f"  Saved checkpoint: checkpoint_epoch_{epoch + 1}.pt")
+
         # Restore best weights (no val set: best train loss)
         if restore_best_weights and val_loader is None and best_train_loss_weights is not None:
             self._restore_checkpoint(best_train_loss_weights, verbose=False,

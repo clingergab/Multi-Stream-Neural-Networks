@@ -119,9 +119,13 @@ class MultiStreamTrainer:
     
     def save_checkpoint(self, path):
         """Save model checkpoint."""
+        # Filter out total_ops/total_params buffers injected by FLOPs counters (e.g. thop)
+        state_dict = {k: v for k, v in self.model.state_dict().items()
+                      if not k.endswith('.total_ops') and not k.endswith('.total_params')
+                      and k not in ('total_ops', 'total_params')}
         torch.save({
             'epoch': self.current_epoch,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': state_dict,
             'best_accuracy': self.best_accuracy,
             'training_history': self.training_history
         }, path)
@@ -129,7 +133,11 @@ class MultiStreamTrainer:
     def load_checkpoint(self, path):
         """Load model checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Filter out total_ops/total_params buffers injected by FLOPs counters
+        state_dict = {k: v for k, v in checkpoint['model_state_dict'].items()
+                      if not k.endswith('.total_ops') and not k.endswith('.total_params')
+                      and k not in ('total_ops', 'total_params')}
+        self.model.load_state_dict(state_dict)
         self.current_epoch = checkpoint['epoch']
         self.best_accuracy = checkpoint['best_accuracy']
         self.training_history = checkpoint['training_history']

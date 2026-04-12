@@ -195,11 +195,13 @@ def build_split(split_name, indices, mapped_categories, h5f, output_base):
 
     for i, idx in enumerate(tqdm(indices)):
         # --- RGB ---
+        # h5py reverses MATLAB's column-major dims: (H,W,C) -> (C,W,H)
+        # Transpose (2,1,0) recovers correct (H,W,C) orientation.
         rgb = np.array(images_ds[idx])
         assert rgb.shape == (3, 640, 480), (
             f"Sample {idx}: expected images shape (3, 640, 480), got {rgb.shape}"
         )
-        rgb = np.transpose(rgb, (1, 2, 0))  # [640, 480, 3]
+        rgb = np.transpose(rgb, (2, 1, 0))  # [480, 640, 3]
         if rgb.dtype != np.uint8:
             rgb = rgb.astype(np.uint8)
         rgb_img = Image.fromarray(rgb, mode="RGB")
@@ -208,9 +210,11 @@ def build_split(split_name, indices, mapped_categories, h5f, output_base):
         rgb_t[i] = torch.from_numpy(rgb_arr).permute(2, 0, 1)
 
         # --- Depth ---
-        depth = np.array(depths_ds[idx])
-        assert depth.shape == (640, 480), (
-            f"Sample {idx}: expected depths shape (640, 480), got {depth.shape}"
+        # h5py reverses MATLAB's column-major dims: (H,W) -> (W,H)
+        # Transpose recovers correct (H,W) orientation.
+        depth = np.array(depths_ds[idx]).T  # (640, 480) -> (480, 640)
+        assert depth.shape == (480, 640), (
+            f"Sample {idx}: expected depths shape (480, 640), got {depth.shape}"
         )
         # Convert meters -> millimeters
         depth_mm = depth * 1000.0

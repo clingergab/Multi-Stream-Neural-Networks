@@ -31,9 +31,13 @@ class Checkpointer:
     
     def _save_checkpoint(self, model, metrics, filename):
         """Save model checkpoint."""
+        # Filter out total_ops/total_params buffers injected by FLOPs counters (e.g. thop)
+        state_dict = {k: v for k, v in model.state_dict().items()
+                      if not k.endswith('.total_ops') and not k.endswith('.total_params')
+                      and k not in ('total_ops', 'total_params')}
         checkpoint = {
             'epoch': metrics.get('epoch', 0),
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': state_dict,
             'metrics': metrics
         }
         

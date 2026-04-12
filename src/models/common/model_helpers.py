@@ -140,6 +140,11 @@ def save_checkpoint(model_state_dict: dict[str, torch.Tensor],
     # Create directory if it doesn't exist
     os.makedirs(os.path.dirname(path), exist_ok=True)
     
+    # Filter out total_ops/total_params buffers injected by FLOPs counters (e.g. thop)
+    model_state_dict = {k: v for k, v in model_state_dict.items()
+                        if not k.endswith('.total_ops') and not k.endswith('.total_params')
+                        and k not in ('total_ops', 'total_params')}
+
     checkpoint = {
         'model_state_dict': model_state_dict,
         'optimizer_state_dict': optimizer_state_dict,
