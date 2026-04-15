@@ -206,7 +206,7 @@ class GPUAugmentation(nn.Module):
 
         Args:
             rgb: RGB tensor [B, 3, H, W] in [0, 1] range (NOT normalized)
-            depth: Depth tensor [B, 1, H, W] in [0, 1] range (NOT normalized)
+            depth: Depth tensor [B, 1, H, W] in meters (NOT normalized)
 
         Returns:
             Tuple of (rgb, depth) tensors, both normalized.

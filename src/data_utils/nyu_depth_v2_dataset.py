@@ -297,13 +297,20 @@ class NYUDepthV2Dataset(Dataset):
             if np.random.random() < self._depth_aug_p:
                 depth_missing_mask = (depth == 0.0)
 
-                d_min = depth.min()
-                d_max = depth.max()
-                d_range = d_max - d_min
-                if d_range > 1e-6:
-                    depth_01 = (depth - d_min) / d_range
+                # Normalize valid pixels to [0,1] for augmentation
+                # Exclude missing pixels (0.0) from min/max to avoid compressing
+                # the augmentation range (matches scannet_pretrain_dataset.py)
+                valid_mask = ~depth_missing_mask
+                if valid_mask.any():
+                    d_min = depth[valid_mask].min()
+                    d_max = depth[valid_mask].max()
                 else:
-                    depth_01 = torch.zeros_like(depth)
+                    d_min = depth.min()
+                    d_max = depth.max()
+                d_range = d_max - d_min
+                depth_01 = torch.zeros_like(depth)
+                if d_range > 1e-6:
+                    depth_01[valid_mask] = (depth[valid_mask] - d_min) / d_range
 
                 brightness_factor = np.random.uniform(
                     1.0 - self._depth_brightness,
@@ -318,8 +325,9 @@ class NYUDepthV2Dataset(Dataset):
                 depth_01 = depth_01 * brightness_factor
                 depth_01 = depth_01 + torch.randn_like(depth_01) * self._depth_noise_std
 
+                # Map back to meters (only valid pixels; missing stay at 0.0)
                 if d_range > 1e-6:
-                    depth = depth_01.clamp(0.0, 1.0) * d_range + d_min
+                    depth[valid_mask] = depth_01[valid_mask].clamp(0.0, 1.0) * d_range + d_min
 
                 if depth_missing_mask.any():
                     depth[depth_missing_mask] = 0.0

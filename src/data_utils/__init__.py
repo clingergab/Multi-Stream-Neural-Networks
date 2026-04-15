@@ -43,12 +43,6 @@ from .rgb_to_rgbl import (
     process_dataset_to_streams
 )
 
-# OmniPretrain dataset for LINet pretraining
-from .omnipretrain_dataset import (
-    OmniPretrainDataset,
-    get_omnipretrain_dataloaders,
-)
-
 # ScanNet pretrain dataset for LINet pretraining
 from .scannet_pretrain_dataset import (
     ScanNetPretrainDataset,
@@ -85,10 +79,6 @@ __all__ = [
     'process_dataset_to_streams',
     'RGBtoRGBL',
     'create_rgbl_transform',
-
-    # OmniPretrain dataset
-    'OmniPretrainDataset',
-    'get_omnipretrain_dataloaders',
 
     # ScanNet pretrain dataset
     'ScanNetPretrainDataset',
