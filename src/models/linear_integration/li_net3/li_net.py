@@ -1986,6 +1986,14 @@ class LINet(BaseModel):
                 baseline_acc, baseline_loss,
                 stream_{i}_blanked_acc, stream_{i}_blanked_loss, stream_{i}_contribution
         """
+        # Save RNG state so monitoring doesn't perturb training reproducibility.
+        # The eval_loader may wrap the training dataset whose __getitem__ fires
+        # random augmentations (RandomCrop, flip, jitter, etc.), consuming the
+        # global numpy/torch RNG and shifting subsequent training epochs.
+        np_rng_state = np.random.get_state()
+        torch_rng_state = torch.random.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+
         # Baseline: all streams active
         baseline_loss, baseline_acc, baseline_mca = self._validate(eval_loader)
 
@@ -2002,6 +2010,12 @@ class LINet(BaseModel):
             result[f'stream_{i}_blanked_loss'] = blanked_loss
             result[f'stream_{i}_blanked_mca'] = blanked_mca
             result[f'stream_{i}_contribution'] = baseline_acc - blanked_acc
+
+        # Restore RNG state — monitoring must have zero side effects on training
+        np.random.set_state(np_rng_state)
+        torch.random.set_rng_state(torch_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state)
 
         return result
 
