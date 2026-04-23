@@ -30,6 +30,7 @@ Output: data/sunrgbd_19/ (or data/sunrgbd_19_traintest/ with --no-val-split)
 import argparse
 import json
 import os
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -63,6 +64,30 @@ _STANDARD_19 = {
 # Populated after build_category_list() is called
 SUNRGBD_CATEGORIES = None
 _CAT_TO_IDX        = None
+
+
+def extract_scene_group(rel_path):
+    """Extract scene group ID from a sample's relative path within SUNRGBD_BASE.
+
+    Groups images from the same physical location so downstream code can do
+    group-aware train/val splitting (preventing data leakage).
+
+    - xtion/sun3ddata/SCENE/...: group = xtion/sun3ddata/SCENE
+    - kv2/kinect2data/SEQNUM_SESSION_rgbfFRAME-resize: group by session
+    - kv1/*, realsense/*: each sample is its own group (1:1)
+    """
+    parts = rel_path.split("/")
+
+    if parts[0] == "xtion" and len(parts) >= 3:
+        return "/".join(parts[:3])
+
+    if parts[0] == "kv2" and len(parts) >= 2:
+        dirname = parts[-1]
+        session = re.sub(r"^\d+_", "", dirname)
+        session = re.sub(r"_rgbf\d+-resize$", "", session)
+        return f"kv2/kinect2data/{session}"
+
+    return rel_path
 
 
 def build_category_list(category_counts: Counter, min_samples: int = 80):
@@ -241,10 +266,20 @@ def build_split(split_name: str, split_samples: list, output_base: str):
     with open(os.path.join(split_dir, "labels.txt"), "w") as f:
         f.write("\n".join(map(str, labels)) + "\n")
 
+    # Save scene group IDs and sample paths for group-aware splitting
+    sample_paths = [os.path.relpath(s[0], SUNRGBD_BASE) for s in split_samples]
+    scene_groups = [extract_scene_group(p) for p in sample_paths]
+
+    with open(os.path.join(split_dir, "scene_groups.json"), "w") as f:
+        json.dump(scene_groups, f)
+    with open(os.path.join(split_dir, "sample_paths.json"), "w") as f:
+        json.dump(sample_paths, f)
+
     print(f"  rgb_tensors.pt:   {tuple(rgb_t.shape)}  "
           f"{os.path.getsize(rgb_out)/1e6:.1f} MB")
     print(f"  depth_tensors.pt: {tuple(depth_t.shape)}  "
           f"{os.path.getsize(depth_out)/1e6:.1f} MB")
+    print(f"  scene_groups.json: {len(set(scene_groups))} unique groups")
     return labels
 
 

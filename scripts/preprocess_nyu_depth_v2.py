@@ -85,25 +85,28 @@ def _map_to_category(scene_type: str) -> str:
 
 
 def load_scene_labels(h5f):
-    """Extract per-sample scene types from the HDF5 scenes dataset.
+    """Extract per-sample scene names and types from the HDF5 scenes dataset.
 
     Returns:
-        scene_types: list of str, length 1449 (raw scene types)
+        scene_names: list of str, length 1449 (raw scene names, e.g. 'kitchen_0019')
+        scene_types: list of str, length 1449 (raw scene types, e.g. 'kitchen')
         mapped_categories: list of str, length 1449 (10-category mapped)
     """
     scenes_ds = h5f["scenes"]
     num_samples = scenes_ds.shape[1]  # shape is (1, N) for MATLAB row vector
 
+    scene_names = []
     scene_types = []
     for i in range(num_samples):
         ref = scenes_ds[0, i]
         ascii_array = np.array(h5f[ref])
         scene_name = "".join(chr(int(c)) for c in ascii_array.flatten())
+        scene_names.append(scene_name)
         scene_type = _extract_scene_type(scene_name)
         scene_types.append(scene_type)
 
     mapped = [_map_to_category(st) for st in scene_types]
-    return scene_types, mapped
+    return scene_names, scene_types, mapped
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +180,7 @@ def load_official_split():
 # Tensor building
 # ---------------------------------------------------------------------------
 
-def build_split(split_name, indices, mapped_categories, h5f, output_base):
+def build_split(split_name, indices, mapped_categories, scene_names, h5f, output_base):
     """Build RGB/depth tensors and labels for one split."""
     split_dir = os.path.join(output_base, split_name)
     os.makedirs(split_dir, exist_ok=True)
@@ -243,10 +246,18 @@ def build_split(split_name, indices, mapped_categories, h5f, output_base):
     with open(os.path.join(split_dir, "labels.txt"), "w") as f:
         f.write("\n".join(map(str, labels)) + "\n")
 
+    # Save scene group IDs and sample paths for group-aware splitting
+    split_scene_groups = [scene_names[idx] for idx in indices]
+    with open(os.path.join(split_dir, "scene_groups.json"), "w") as f:
+        json.dump(split_scene_groups, f)
+    with open(os.path.join(split_dir, "sample_paths.json"), "w") as f:
+        json.dump(list(indices), f)
+
     print(f"  rgb_tensors.pt:   {tuple(rgb_t.shape)}  "
           f"{os.path.getsize(rgb_out)/1e6:.1f} MB")
     print(f"  depth_tensors.pt: {tuple(depth_t.shape)}  "
           f"{os.path.getsize(depth_out)/1e6:.1f} MB")
+    print(f"  scene_groups.json: {len(set(split_scene_groups))} unique scenes")
     return labels
 
 
@@ -254,7 +265,7 @@ def build_split(split_name, indices, mapped_categories, h5f, output_base):
 # Split routing
 # ---------------------------------------------------------------------------
 
-def run_three_way(mapped_categories, h5f, output_base, val_ratio=0.2, seed=42):
+def run_three_way(mapped_categories, scene_names, h5f, output_base, val_ratio=0.2, seed=42):
     train_indices, test_indices = load_official_split()
 
     # Stratified sub-split of train -> train/val
@@ -277,23 +288,23 @@ def run_three_way(mapped_categories, h5f, output_base, val_ratio=0.2, seed=42):
     print(f"  Val:   {len(val_sub)}   (20% of official train)")
     print(f"  Test:  {len(test_indices)}  (official test set)")
 
-    trl = build_split("train", train_sub, mapped_categories, h5f, output_base)
-    vl = build_split("val", val_sub, mapped_categories, h5f, output_base)
-    tel = build_split("test", test_indices, mapped_categories, h5f, output_base)
+    trl = build_split("train", train_sub, mapped_categories, scene_names, h5f, output_base)
+    vl = build_split("val", val_sub, mapped_categories, scene_names, h5f, output_base)
+    tel = build_split("test", test_indices, mapped_categories, scene_names, h5f, output_base)
     _compute_and_save_norm_stats(output_base)
     _write_meta(output_base, len(train_sub), len(val_sub), len(test_indices),
                 trl, vl, tel, val_ratio, seed)
 
 
-def run_two_way(mapped_categories, h5f, output_base):
+def run_two_way(mapped_categories, scene_names, h5f, output_base):
     train_indices, test_indices = load_official_split()
 
     print(f"\n2-way split (no val sub-split, for k-fold CV):")
     print(f"  Train: {len(train_indices)}  (all official train)")
     print(f"  Test:  {len(test_indices)}  (official test)")
 
-    trl = build_split("train", train_indices, mapped_categories, h5f, output_base)
-    tel = build_split("test", test_indices, mapped_categories, h5f, output_base)
+    trl = build_split("train", train_indices, mapped_categories, scene_names, h5f, output_base)
+    tel = build_split("test", test_indices, mapped_categories, scene_names, h5f, output_base)
     _compute_and_save_norm_stats(output_base)
     _write_meta(output_base, len(train_indices), 0, len(test_indices),
                 trl, [], tel, None, None)
@@ -434,7 +445,7 @@ def main():
     print(f"Loading {args.mat_file} ...")
     with h5py.File(args.mat_file, "r") as h5f:
         # Step A: extract scene types
-        scene_types, mapped_categories = load_scene_labels(h5f)
+        scene_names, scene_types, mapped_categories = load_scene_labels(h5f)
         print_distribution(scene_types, mapped_categories)
 
         if args.dry_run:
@@ -445,10 +456,10 @@ def main():
         n_cats = len(NYU_CATEGORIES)
         if args.no_val_split:
             default_out = args.output_dir or f"data/nyu_depth_v2_{n_cats}_traintest"
-            run_two_way(mapped_categories, h5f, default_out)
+            run_two_way(mapped_categories, scene_names, h5f, default_out)
         else:
             default_out = args.output_dir or f"data/nyu_depth_v2_{n_cats}"
-            run_three_way(mapped_categories, h5f, default_out)
+            run_three_way(mapped_categories, scene_names, h5f, default_out)
 
 
 if __name__ == "__main__":
