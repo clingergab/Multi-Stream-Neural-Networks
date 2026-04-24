@@ -65,6 +65,89 @@ def test_maxout_k1_math_equals_linear():
     assert torch.equal(linear(x), maxout_k1(x))
 
 
+def test_maxout_k1_skips_init_perturbation_and_dropout():
+    """At K=1 both anti-dead-unit counter-measures must be no-ops.
+
+    Otherwise MaxoutHead(K=1) can't remain byte-identical to LinearHead under
+    matched seeding (see test_maxout_k1_strict_construction_equals_linear).
+    Specifically: (a) init perturbation is skipped so fc weights are whatever
+    nn.Linear's default init produced, and (b) sub-node dropout is an identity
+    map in forward because .amax over a singleton K dim is unambiguous.
+    """
+    torch.manual_seed(0)
+    maxout_k1 = MaxoutHead(384, 19, num_subnodes=1, subnode_dropout=0.5, init_perturb_std=10.0)
+    torch.manual_seed(0)
+    bare_linear = nn.Linear(384, 19)
+    # Init perturbation with std=10.0 would be enormous; if it had fired, these
+    # would diverge by huge amounts. Byte-identical means K=1 short-circuited.
+    assert torch.equal(maxout_k1.fc.weight, bare_linear.weight)
+    assert torch.equal(maxout_k1.fc.bias, bare_linear.bias)
+    # Dropout must be inactive at K=1 even in train mode; outputs are deterministic.
+    maxout_k1.train()
+    x = torch.randn(16, 384)
+    out_a = maxout_k1(x)
+    out_b = maxout_k1(x)
+    assert torch.equal(out_a, out_b), "K=1 dropout must be a no-op"
+
+
+def test_maxout_init_perturbation_changes_weights_for_k_gt_1():
+    """At K>1, init_perturb_std>0 must produce different fc weights than std=0.
+
+    Symmetry-breaking perturbation is what reduces the probability that one
+    sub-node wins on every sample at step 0. If std=0 and std>0 constructions
+    were identical, the perturbation was not applied.
+    """
+    torch.manual_seed(0)
+    no_perturb = MaxoutHead(384, 19, num_subnodes=3, init_perturb_std=0.0)
+    torch.manual_seed(0)
+    with_perturb = MaxoutHead(384, 19, num_subnodes=3, init_perturb_std=0.1)
+    # With std=0.1 added to a ~0.03-std Kaiming init, weights should diverge.
+    assert not torch.equal(no_perturb.fc.weight, with_perturb.fc.weight)
+    # Bias is not perturbed — the perturbation targets fc.weight only.
+    assert torch.equal(no_perturb.fc.bias, with_perturb.fc.bias)
+
+
+def test_maxout_subnode_dropout_stochastic_in_train_mode():
+    """Sub-node dropout at K>1 in train mode must be stochastic across forward calls.
+
+    Without dropout, forward is a deterministic function of (x, weights). With
+    dropout, different random masks per call produce different outputs. This
+    test verifies the mask is actually being applied.
+    """
+    torch.manual_seed(0)
+    head = MaxoutHead(384, 19, num_subnodes=3, subnode_dropout=0.5, init_perturb_std=0.0)
+    head.train()
+    x = torch.randn(32, 384)
+    torch.manual_seed(1); out_a = head(x)
+    torch.manual_seed(2); out_b = head(x)
+    assert not torch.equal(out_a, out_b), (
+        "train-mode sub-node dropout produced identical outputs across two "
+        "calls with different RNG — dropout is not firing"
+    )
+
+
+def test_maxout_subnode_dropout_deterministic_in_eval_mode():
+    """Sub-node dropout must be inactive at eval time.
+
+    Two forward calls in eval mode must produce bit-identical outputs regardless
+    of subnode_dropout prob, because inference does not randomize sub-nodes.
+    """
+    head = MaxoutHead(384, 19, num_subnodes=3, subnode_dropout=0.9)  # high prob to make leakage obvious
+    head.eval()
+    x = torch.randn(32, 384)
+    out_a = head(x)
+    out_b = head(x)
+    assert torch.equal(out_a, out_b), "eval-mode output must be deterministic"
+
+
+def test_maxout_rejects_invalid_subnode_dropout():
+    """subnode_dropout outside [0, 1) raises AssertionError."""
+    with pytest.raises(AssertionError, match="subnode_dropout"):
+        MaxoutHead(384, 19, num_subnodes=3, subnode_dropout=-0.1)
+    with pytest.raises(AssertionError, match="subnode_dropout"):
+        MaxoutHead(384, 19, num_subnodes=3, subnode_dropout=1.0)
+
+
 # ---------------------------------------------------------------------------
 # Group B — LINet integration tests
 # ---------------------------------------------------------------------------

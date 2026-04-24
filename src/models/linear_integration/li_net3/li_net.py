@@ -94,6 +94,8 @@ class LINet(BaseModel):
         width_multiplier: float = 1.0,  # Scale channel widths (0.5 = half, 0.75 = 3/4)
         classifier_head: str = 'linear',  # 'linear' (default, baseline) | 'maxout'
         num_subnodes: int = 3,  # K sub-nodes per class; only used when classifier_head='maxout'
+        subnode_dropout: float = 0.1,  # per-sub-node dropout during training to combat winner-takes-all; only for maxout with K>1
+        maxout_init_perturb_std: float = 0.1,  # Gaussian noise std added to maxout fc.weight at init; only for maxout with K>1
         **kwargs
     ) -> None:
         # Store LINet-specific parameters BEFORE calling super().__init__
@@ -107,6 +109,8 @@ class LINet(BaseModel):
         # with `self.fc`, which is the constructed head module instance.
         self.classifier_head_type = classifier_head
         self.num_subnodes = num_subnodes
+        self.subnode_dropout = subnode_dropout
+        self.maxout_init_perturb_std = maxout_init_perturb_std
 
         # Set LINet default norm layer if not specified
         if norm_layer is None:
@@ -185,7 +189,13 @@ class LINet(BaseModel):
         if self.classifier_head_type == 'linear':
             self.fc = LinearHead(feature_dim, self.num_classes)
         elif self.classifier_head_type == 'maxout':
-            self.fc = MaxoutHead(feature_dim, self.num_classes, self.num_subnodes)
+            self.fc = MaxoutHead(
+                feature_dim,
+                self.num_classes,
+                num_subnodes=self.num_subnodes,
+                subnode_dropout=self.subnode_dropout,
+                init_perturb_std=self.maxout_init_perturb_std,
+            )
         else:
             raise ValueError(
                 f"Unknown classifier_head: {self.classifier_head_type!r}. "
@@ -2805,6 +2815,8 @@ def li_resnet18(
     width_multiplier: float = 1.0,
     classifier_head: str = 'linear',
     num_subnodes: int = 3,
+    subnode_dropout: float = 0.1,
+    maxout_init_perturb_std: float = 0.1,
     **kwargs,
 ) -> LINet:
     """
@@ -2852,6 +2864,8 @@ def li_resnet18(
         width_multiplier=width_multiplier,
         classifier_head=classifier_head,
         num_subnodes=num_subnodes,
+        subnode_dropout=subnode_dropout,
+        maxout_init_perturb_std=maxout_init_perturb_std,
         **kwargs
     )
 
