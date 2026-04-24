@@ -148,6 +148,72 @@ def test_maxout_rejects_invalid_subnode_dropout():
         MaxoutHead(384, 19, num_subnodes=3, subnode_dropout=1.0)
 
 
+def test_linear_head_diversity_loss_always_zero():
+    """LinearHead.diversity_loss is a no-op for any weight (one hyperplane per class)."""
+    head = LinearHead(384, 19)
+    assert head.diversity_loss(weight=0.0).item() == 0.0
+    assert head.diversity_loss(weight=1.0).item() == 0.0
+    assert head.diversity_loss(weight=100.0).item() == 0.0
+
+
+def test_maxout_diversity_loss_zero_at_k1():
+    """MaxoutHead(K=1).diversity_loss is zero for any weight — no pairs to diversify."""
+    head = MaxoutHead(384, 19, num_subnodes=1)
+    assert head.diversity_loss(weight=0.5).item() == 0.0
+
+
+def test_maxout_diversity_loss_zero_when_weight_zero():
+    """weight=0 short-circuits to 0 regardless of K."""
+    head = MaxoutHead(384, 19, num_subnodes=3)
+    assert head.diversity_loss(weight=0.0).item() == 0.0
+
+
+def test_maxout_diversity_loss_equals_one_when_subnodes_identical():
+    """If all K sub-nodes of every class share one weight vector, |cos-sim| between
+    distinct sub-nodes is 1 and the per-class mean off-diagonal is exactly 1.
+    With weight=1.0 the returned penalty must equal 1.0 (after .mean() over classes).
+    """
+    head = MaxoutHead(384, 19, num_subnodes=3, init_perturb_std=0.0)
+    # Overwrite: every (class, sub-node) gets the SAME random vector.
+    feat_dim, C, K = 384, 19, 3
+    shared = torch.randn(feat_dim)
+    W = shared.view(1, 1, feat_dim).expand(C, K, feat_dim).contiguous()
+    head.fc.weight.data = W.view(C * K, feat_dim).clone()
+    assert head.diversity_loss(weight=1.0).item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_maxout_diversity_loss_zero_when_subnodes_orthogonal():
+    """Orthogonal sub-nodes → off-diagonal cos-sim is 0 → penalty is 0."""
+    head = MaxoutHead(64, 5, num_subnodes=3, init_perturb_std=0.0)  # feat_dim >= C*K so ortho fits
+    feat_dim, C, K = 64, 5, 3
+    with torch.no_grad():
+        for c in range(C):
+            # Generate K orthonormal vectors in feat_dim. Since K < feat_dim this is feasible.
+            block = torch.randn(K, feat_dim)
+            q, _ = torch.linalg.qr(block.T)  # feat_dim x K, columns orthonormal
+            head.fc.weight.data[c * K:(c + 1) * K] = q.T
+    loss = head.diversity_loss(weight=1.0).item()
+    assert loss == pytest.approx(0.0, abs=1e-5), f"expected ~0 for orthogonal sub-nodes, got {loss}"
+
+
+def test_maxout_diversity_loss_scales_with_weight():
+    """Returned penalty must scale linearly with the weight kwarg."""
+    head = MaxoutHead(384, 19, num_subnodes=3, init_perturb_std=0.0)
+    base = head.diversity_loss(weight=1.0).item()
+    assert head.diversity_loss(weight=0.1).item() == pytest.approx(base * 0.1, rel=1e-5)
+    assert head.diversity_loss(weight=2.5).item() == pytest.approx(base * 2.5, rel=1e-5)
+
+
+def test_maxout_diversity_loss_is_differentiable():
+    """Diversity loss must produce gradients on fc.weight so it can be added to CE loss."""
+    head = MaxoutHead(64, 5, num_subnodes=3, init_perturb_std=0.0)
+    loss = head.diversity_loss(weight=0.3)
+    assert loss.requires_grad, "diversity_loss output must be differentiable"
+    loss.backward()
+    assert head.fc.weight.grad is not None
+    assert head.fc.weight.grad.abs().sum().item() > 0, "gradient should be non-zero for non-orthogonal sub-nodes"
+
+
 # ---------------------------------------------------------------------------
 # Group B — LINet integration tests
 # ---------------------------------------------------------------------------

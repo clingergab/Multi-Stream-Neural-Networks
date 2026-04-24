@@ -869,6 +869,10 @@ class LINet(BaseModel):
         # SAM — Sharpness-Aware Minimization (Foret et al. 2021)
         use_sam: bool = False,
         sam_rho: float = 0.05,
+        # Classifier-head diversity regularization (MaxoutHead: cosine-similarity penalty
+        # between sub-node weights per class; LinearHead: always 0). Adds an aux loss
+        # term before each .backward() to counter winner-takes-all gradient starvation.
+        diversity_loss_weight: float = 0.0,
     ) -> dict:
         """
         Train the model with optional early stopping.
@@ -1114,6 +1118,7 @@ class LINet(BaseModel):
                 use_mixup=use_mixup,
                 mixup_alpha=mixup_alpha,
                 sam_optimizer=sam_optimizer,
+                diversity_loss_weight=diversity_loss_weight,
             )
 
             # Validation phase
@@ -1633,7 +1638,8 @@ class LINet(BaseModel):
                      stream_balance_layer: str = 'layer4',
                      use_mixup: bool = False,
                      mixup_alpha: float = 0.2,
-                     sam_optimizer: Optional[object] = None) -> tuple:
+                     sam_optimizer: Optional[object] = None,
+                     diversity_loss_weight: float = 0.0) -> tuple:
         """
         Train the model for one epoch with GPU optimizations and gradient accumulation.
 
@@ -1744,6 +1750,11 @@ class LINet(BaseModel):
                 if use_balance_loss:
                     bal_first = self.compute_stream_balance_loss(stream_balance_layer)
                     loss_first = loss_first + stream_balance_weight * bal_first
+                # Classifier-head diversity regularizer: present in both SAM passes so
+                # SAM's perturbation direction reflects the regularized loss landscape.
+                # No-op (returns 0 tensor) for LinearHead or when weight==0.
+                if diversity_loss_weight > 0.0:
+                    loss_first = loss_first + self.fc.diversity_loss(weight=diversity_loss_weight)
                 loss_first.backward()
                 sam_optimizer.first_step(zero_grad=True)
 
@@ -1762,6 +1773,8 @@ class LINet(BaseModel):
                         loss = loss + stream_balance_weight * bal_loss
                         balance_loss_accum += bal_loss.item()
                         balance_loss_count += 1
+                    if diversity_loss_weight > 0.0:
+                        loss = loss + self.fc.diversity_loss(weight=diversity_loss_weight)
                     loss.backward()
 
                     # Gradient health monitoring on second-pass (actually-applied) grads
@@ -1802,6 +1815,10 @@ class LINet(BaseModel):
                     loss = loss + stream_balance_weight * bal_loss
                     balance_loss_accum += bal_loss.item()
                     balance_loss_count += 1
+
+                # Classifier-head diversity regularizer (fp32; no-op for LinearHead or weight==0)
+                if diversity_loss_weight > 0.0:
+                    loss = loss + self.fc.diversity_loss(weight=diversity_loss_weight)
 
                 # Scale loss for gradient accumulation
                 if gradient_accumulation_steps > 1:
@@ -1855,6 +1872,10 @@ class LINet(BaseModel):
                     loss = loss + stream_balance_weight * bal_loss
                     balance_loss_accum += bal_loss.item()
                     balance_loss_count += 1
+
+                # Classifier-head diversity regularizer (no-op for LinearHead or weight==0)
+                if diversity_loss_weight > 0.0:
+                    loss = loss + self.fc.diversity_loss(weight=diversity_loss_weight)
 
                 # Scale loss for gradient accumulation
                 if gradient_accumulation_steps > 1:
@@ -2834,6 +2855,13 @@ def li_resnet18(
             num_subnodes=1 reduces mathematically to 'linear'.
         num_subnodes: K, the number of sub-classifiers per class. Only used when
             classifier_head='maxout'. Default 3.
+        subnode_dropout: Per-(batch, class, sub-node) dropout probability during
+            training to combat winner-takes-all gradient starvation. Forces
+            runner-up sub-nodes to occasionally win argmax and receive gradient.
+            Only active for maxout with K>1; no-op at eval. Default 0.1.
+        maxout_init_perturb_std: Gaussian std added to MaxoutHead ``fc.weight``
+            at init, on top of default Kaiming. ~3x default Kaiming std at
+            feat_dim=384. Only applied for maxout with K>1. Default 0.1.
         **kwargs: Additional arguments passed to LINet constructor
 
     Returns:

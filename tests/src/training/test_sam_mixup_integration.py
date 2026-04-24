@@ -154,3 +154,95 @@ class TestFitWithMixupAndSam:
                 epochs=1, verbose=False,
                 use_sam=True, gradient_accumulation_steps=4,
             )
+
+
+@pytest.fixture
+def tiny_maxout_model():
+    """Same tiny LiNet3 but with classifier_head='maxout' so the diversity-loss
+    path has a real MaxoutHead at self.fc. Default LinearHead's diversity_loss
+    returns 0 unconditionally and wouldn't exercise the fc.weight gradient path."""
+    model = li_resnet18(
+        num_classes=4,
+        stream_input_channels=[3, 1],
+        width_multiplier=0.25,
+        device="cpu",
+        use_amp=False,
+        classifier_head='maxout',
+        num_subnodes=3,
+        subnode_dropout=0.1,
+        maxout_init_perturb_std=0.1,
+    )
+    model.compile(
+        optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+        scheduler=None,
+        loss="cross_entropy",
+        label_smoothing=0.0,
+        gpu_augmentation=False,
+    )
+    return model
+
+
+class TestFitWithDiversityLoss:
+    """Verify diversity_loss_weight threads through fit() into all four loss-
+    injection branches: plain, mixup, SAM, SAM+mixup. Guards against silent
+    regression when any of those branches gets refactored."""
+
+    def test_diversity_plain(self, tiny_maxout_model, tiny_loaders):
+        train_loader, val_loader = tiny_loaders
+        w0 = tiny_maxout_model.fc.fc.weight.detach().clone()
+        history = tiny_maxout_model.fit(
+            train_loader=train_loader, val_loader=val_loader,
+            epochs=2, verbose=False,
+            use_mixup=False, use_sam=False,
+            diversity_loss_weight=0.1,
+        )
+        assert len(history["train_loss"]) == 2
+        assert not torch.equal(tiny_maxout_model.fc.fc.weight, w0)
+
+    def test_diversity_with_mixup(self, tiny_maxout_model, tiny_loaders):
+        train_loader, val_loader = tiny_loaders
+        w0 = tiny_maxout_model.fc.fc.weight.detach().clone()
+        history = tiny_maxout_model.fit(
+            train_loader=train_loader, val_loader=val_loader,
+            epochs=2, verbose=False,
+            use_mixup=True, mixup_alpha=0.2, use_sam=False,
+            diversity_loss_weight=0.1,
+        )
+        assert len(history["train_loss"]) == 2
+        assert not torch.equal(tiny_maxout_model.fc.fc.weight, w0)
+
+    def test_diversity_with_sam(self, tiny_maxout_model, tiny_loaders):
+        train_loader, val_loader = tiny_loaders
+        w0 = tiny_maxout_model.fc.fc.weight.detach().clone()
+        history = tiny_maxout_model.fit(
+            train_loader=train_loader, val_loader=val_loader,
+            epochs=2, verbose=False,
+            use_mixup=False, use_sam=True, sam_rho=0.05,
+            diversity_loss_weight=0.1,
+        )
+        assert len(history["train_loss"]) == 2
+        assert not torch.equal(tiny_maxout_model.fc.fc.weight, w0)
+
+    def test_diversity_with_sam_and_mixup(self, tiny_maxout_model, tiny_loaders):
+        train_loader, val_loader = tiny_loaders
+        w0 = tiny_maxout_model.fc.fc.weight.detach().clone()
+        history = tiny_maxout_model.fit(
+            train_loader=train_loader, val_loader=val_loader,
+            epochs=2, verbose=False,
+            use_mixup=True, mixup_alpha=0.2, use_sam=True, sam_rho=0.05,
+            diversity_loss_weight=0.1,
+        )
+        assert len(history["train_loss"]) == 2
+        assert not torch.equal(tiny_maxout_model.fc.fc.weight, w0)
+
+    def test_diversity_zero_weight_is_noop_on_linear_head(self, tiny_model, tiny_loaders):
+        """diversity_loss_weight=0.1 on a LinearHead must not error — LinearHead's
+        diversity_loss returns 0, so adding it is identity. Guards the default
+        'linear' path against accidental breakage when users leave the knob on."""
+        train_loader, val_loader = tiny_loaders
+        history = tiny_model.fit(
+            train_loader=train_loader, val_loader=val_loader,
+            epochs=1, verbose=False,
+            diversity_loss_weight=0.1,  # set but head is LinearHead → no-op
+        )
+        assert len(history["train_loss"]) == 1

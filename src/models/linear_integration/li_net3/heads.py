@@ -12,6 +12,7 @@ Adding a new head: define an ``nn.Module`` here, export it from this package's
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class LinearHead(nn.Module):
@@ -25,6 +26,14 @@ class LinearHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x)
+
+    def diversity_loss(self, weight: float = 0.0) -> torch.Tensor:
+        """Always zero for LinearHead (one hyperplane per class, nothing to diversify).
+
+        Defined so the training loop can unconditionally call
+        ``model.fc.diversity_loss(weight=...)`` regardless of head type.
+        """
+        return torch.zeros((), device=self.fc.weight.device)
 
 
 class MaxoutHead(nn.Module):
@@ -57,6 +66,12 @@ class MaxoutHead(nn.Module):
     Both counter-measures are skipped when ``num_subnodes == 1`` so that
     MaxoutHead(K=1) stays byte-identical to LinearHead under matched seeding
     (preserves the construction-equivalence test).
+
+    A third, opt-in counter-measure — ``diversity_loss(weight)`` — is exposed
+    as a method for the training loop to add to the CE loss before each
+    ``.backward()``. It penalizes off-diagonal |cos-sim| between sub-node
+    weight vectors per class, giving gradient to ALL sub-nodes (not just the
+    argmax winner). See the method docstring.
     """
 
     def __init__(
@@ -91,3 +106,25 @@ class MaxoutHead(nn.Module):
             drop = drop & ~all_dropped                            # keep at least one
             sub = sub.masked_fill(drop, float('-inf'))
         return sub.amax(dim=2)  # (B, C)
+
+    def diversity_loss(self, weight: float = 0.0) -> torch.Tensor:
+        """Per-class cosine-diversity penalty on sub-node weight vectors.
+
+        For each class, computes the mean absolute off-diagonal cosine similarity
+        between its K sub-node weight vectors, then averages over classes. Scaled
+        by ``weight`` and returned as a scalar tensor to be added to the CE loss
+        before ``.backward()``. Minimizing pushes sub-node weights into distinct
+        directions in feature space, complementing forward-time sub-node dropout
+        against winner-takes-all gradient starvation.
+
+        Returns a zero scalar when ``num_subnodes == 1`` or ``weight == 0.0``.
+        """
+        if self.num_subnodes == 1 or weight == 0.0:
+            return torch.zeros((), device=self.fc.weight.device)
+        W = self.fc.weight.view(self.num_classes, self.num_subnodes, self.feat_dim)
+        W_norm = F.normalize(W, dim=-1)                                    # unit vectors
+        sim = torch.matmul(W_norm, W_norm.transpose(-1, -2))               # (C, K, K)
+        K = self.num_subnodes
+        off_diag = 1.0 - torch.eye(K, device=sim.device, dtype=sim.dtype)  # (K, K)
+        penalty_per_class = (sim.abs() * off_diag).sum(dim=(1, 2)) / (K * (K - 1))
+        return penalty_per_class.mean() * weight
