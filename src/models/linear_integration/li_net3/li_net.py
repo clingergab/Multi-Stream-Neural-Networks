@@ -1914,12 +1914,20 @@ class LINet(BaseModel):
             train_batches += 1
 
             # Calculate training accuracy
+            # Under mixup, score against the dominant label (λ-threshold convention):
+            # the loss is dominated by y_a when λ≥0.5 and by y_b otherwise, so the
+            # model is effectively trained to predict whichever label is dominant.
+            # λ is a per-batch scalar in this implementation (see mixup.mixup_batch).
             with torch.no_grad():
                 _, predicted = torch.max(outputs, 1)
-                train_total += targets.size(0)
-                train_correct += (predicted == targets).sum().item()
+                if _mixup_active:
+                    effective_targets = _mixup_labels_a if _mixup_lam >= 0.5 else _mixup_labels_b
+                else:
+                    effective_targets = targets
+                train_total += effective_targets.size(0)
+                train_correct += (predicted == effective_targets).sum().item()
                 train_all_predictions.append(predicted.cpu())
-                train_all_targets.append(targets.cpu())
+                train_all_targets.append(effective_targets.cpu())
 
             # OPTIMIZATION 1: Update progress bar much less frequently - MAJOR SPEEDUP
             if pbar is not None and (batch_idx % update_frequency == 0 or batch_idx == len(train_loader) - 1):
