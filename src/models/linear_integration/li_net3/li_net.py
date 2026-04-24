@@ -20,6 +20,8 @@ from src.training.schedulers import WarmupReduceLROnPlateau, PerGroupSchedulerWr
 
 from src.models.abstracts.abstract_model import BaseModel
 from src.training.modality_dropout import get_modality_dropout_prob, generate_per_sample_blanked_mask
+from src.training.mixup import mixup_batch as _mixup_batch, mixup_loss as _mixup_loss
+from src.training.sam import SAM, disable_running_stats as _disable_bn_stats, enable_running_stats as _enable_bn_stats
 from src.models.common import (
     save_checkpoint,
     create_progress_bar,
@@ -831,6 +833,12 @@ class LINet(BaseModel):
         # Explicit epoch checkpointing
         checkpoint_epochs: Optional[list[int]] = None,  # Save checkpoints at these 1-based epochs (e.g. [85, 95, 105])
         checkpoint_dir: Optional[str] = None,  # Directory to save epoch checkpoints
+        # MixUp (Zhang et al. 2018) — per-batch convex combination of samples + labels
+        use_mixup: bool = False,
+        mixup_alpha: float = 0.2,
+        # SAM — Sharpness-Aware Minimization (Foret et al. 2021)
+        use_sam: bool = False,
+        sam_rho: float = 0.05,
     ) -> dict:
         """
         Train the model with optional early stopping.
@@ -993,6 +1001,33 @@ class LINet(BaseModel):
 
         # Scheduler is already set by compile(), no need to create it here
 
+        # ============ MixUp / SAM setup ============
+        # SAM (Sharpness-Aware Minimization) takes two forward+backward passes per step.
+        # It's incompatible with torch.amp.GradScaler's "unscale once per iteration"
+        # rule, so when use_sam=True we disable AMP for the duration of fit() and
+        # restore it after the epoch loop. Mid-training exceptions leave self.use_amp
+        # disabled — caller should re-instantiate the process in that case.
+        sam_optimizer = None
+        _sam_amp_was_disabled = False
+        if use_sam:
+            if gradient_accumulation_steps > 1:
+                raise ValueError(
+                    "use_sam=True is incompatible with gradient_accumulation_steps > 1; "
+                    "SAM requires exactly one full forward+backward per iteration per SAM pass."
+                )
+            sam_optimizer = SAM(self.optimizer, rho=sam_rho)
+            if self.use_amp:
+                self.use_amp = False
+                _sam_amp_was_disabled = True
+                if verbose:
+                    print("[SAM] Disabling AMP for SAM run (GradScaler does not compose "
+                          "cleanly with SAM's two forward+backward passes per step).")
+        if verbose:
+            if use_mixup:
+                print(f"[MixUp] enabled with alpha={mixup_alpha}")
+            if use_sam:
+                print(f"[SAM] enabled with rho={sam_rho}")
+
         for epoch in range(epochs):
             # Compute modality dropout probability for this epoch
             modality_dropout_prob = 0.0
@@ -1045,7 +1080,10 @@ class LINet(BaseModel):
                 gradient_health_tracker=gradient_health_tracker,
                 gradient_log_freq=gradient_log_freq,
                 stream_balance_weight=stream_balance_weight,
-                stream_balance_layer=stream_balance_layer
+                stream_balance_layer=stream_balance_layer,
+                use_mixup=use_mixup,
+                mixup_alpha=mixup_alpha,
+                sam_optimizer=sam_optimizer,
             )
 
             # Validation phase
@@ -1414,6 +1452,10 @@ class LINet(BaseModel):
                     else:
                         print(f"   Stream_{i}: Not frozen (final {monitor}: {stream_early_stopping_state['streams'][i]['best_metric']:.4f})")
 
+        # Restore AMP if we disabled it for SAM
+        if _sam_amp_was_disabled:
+            self.use_amp = True
+
         return history
 
     def evaluate(
@@ -1558,7 +1600,10 @@ class LINet(BaseModel):
                      gradient_health_tracker: Optional[GradientHealthTracker] = None,
                      gradient_log_freq: int = 0,
                      stream_balance_weight: float = 0.0,
-                     stream_balance_layer: str = 'layer4') -> tuple:
+                     stream_balance_layer: str = 'layer4',
+                     use_mixup: bool = False,
+                     mixup_alpha: float = 0.2,
+                     sam_optimizer: Optional[object] = None) -> tuple:
         """
         Train the model for one epoch with GPU optimizations and gradient accumulation.
 
@@ -1640,15 +1685,86 @@ class LINet(BaseModel):
 
                 # Per-batch dropout stats are added to pbar postfix below
 
+            # MixUp (optional) — mix batch ONCE before any forward pass so the same
+            # mixed batch is used for SAM's two passes if SAM is also active.
+            if use_mixup and mixup_alpha > 0:
+                stream_batches, _mixup_labels_a, _mixup_labels_b, _mixup_lam = _mixup_batch(
+                    stream_batches, targets, mixup_alpha
+                )
+                _mixup_active = True
+            else:
+                _mixup_labels_a = targets
+                _mixup_labels_b = None
+                _mixup_lam = 1.0
+                _mixup_active = False
+
             # OPTIMIZATION 5: Gradient accumulation - zero gradients only when starting accumulation
             if batch_idx % gradient_accumulation_steps == 0:
                 self.optimizer.zero_grad()
 
-            if self.use_amp:
+            if sam_optimizer is not None:
+                # ===== SAM branch (fp32; two forward+backward passes) =====
+                # First forward + backward at current weights w.
+                outputs_first = self(stream_batches, blanked_mask=blanked_mask)
+                if _mixup_active:
+                    loss_first = _mixup_loss(self.criterion, outputs_first,
+                                             _mixup_labels_a, _mixup_labels_b, _mixup_lam)
+                else:
+                    loss_first = self.criterion(outputs_first, targets)
+                if use_balance_loss:
+                    bal_first = self.compute_stream_balance_loss(stream_balance_layer)
+                    loss_first = loss_first + stream_balance_weight * bal_first
+                loss_first.backward()
+                sam_optimizer.first_step(zero_grad=True)
+
+                # Second forward + backward at perturbed weights (w + e). Freeze BN
+                # running-stats so they aren't updated twice per batch; restore after.
+                _disable_bn_stats(self)
+                try:
+                    outputs = self(stream_batches, blanked_mask=blanked_mask)
+                    if _mixup_active:
+                        loss = _mixup_loss(self.criterion, outputs,
+                                           _mixup_labels_a, _mixup_labels_b, _mixup_lam)
+                    else:
+                        loss = self.criterion(outputs, targets)
+                    if use_balance_loss:
+                        bal_loss = self.compute_stream_balance_loss(stream_balance_layer)
+                        loss = loss + stream_balance_weight * bal_loss
+                        balance_loss_accum += bal_loss.item()
+                        balance_loss_count += 1
+                    loss.backward()
+
+                    # Gradient health monitoring on second-pass (actually-applied) grads
+                    if gradient_health_tracker is not None:
+                        _should_log = (gradient_log_freq == 0 and batch_idx == len(train_loader) - 1) or \
+                                      (gradient_log_freq > 0 and batch_idx % gradient_log_freq == 0)
+                        if _should_log:
+                            gradient_health_tracker.step()
+
+                    # Gradient clipping on second-pass grads (the ones that step the model)
+                    if grad_clip_norm is not None:
+                        clip_grad_norm_(self.parameters(), grad_clip_norm)
+
+                    sam_optimizer.second_step(zero_grad=True)
+                finally:
+                    _enable_bn_stats(self)
+
+                # Scheduler step (same logic as other branches)
+                if self.scheduler is not None:
+                    should_step = (isinstance(self.scheduler, OneCycleLR) or
+                                  getattr(self.scheduler, '_step_per_batch', False))
+                    if should_step:
+                        self.scheduler.step()
+                        history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
+            elif self.use_amp:
                 # Use automatic mixed precision
                 with autocast(device_type=self.device.type):
                     outputs = self(stream_batches, blanked_mask=blanked_mask)
-                    loss = self.criterion(outputs, targets)
+                    if _mixup_active:
+                        loss = _mixup_loss(self.criterion, outputs,
+                                           _mixup_labels_a, _mixup_labels_b, _mixup_lam)
+                    else:
+                        loss = self.criterion(outputs, targets)
 
                 # Stream balance penalty (computed in FP32, outside autocast)
                 if use_balance_loss:
@@ -1697,7 +1813,11 @@ class LINet(BaseModel):
             else:
                 # Standard precision training
                 outputs = self(stream_batches, blanked_mask=blanked_mask)
-                loss = self.criterion(outputs, targets)
+                if _mixup_active:
+                    loss = _mixup_loss(self.criterion, outputs,
+                                       _mixup_labels_a, _mixup_labels_b, _mixup_lam)
+                else:
+                    loss = self.criterion(outputs, targets)
 
                 # Stream balance penalty
                 if use_balance_loss:
