@@ -234,11 +234,11 @@ def test_gradient_cliff_structure():
         assert sw_val > 0, f"{name}.stream_weights[0].grad is all zeros!"
         assert not torch.isnan(sw_grad).any(), f"{name}.stream_weights[0].grad has NaN!"
 
-    # Also print fc
-    fc_grad = model.fc.weight.grad
-    assert fc_grad is not None, "fc.weight.grad is None!"
+    # Also print fc — head module wraps the inner nn.Linear at .fc.fc
+    fc_grad = model.fc.fc.weight.grad
+    assert fc_grad is not None, "fc.fc.weight.grad is None!"
     fc_val = fc_grad.abs().mean().item()
-    print(f"{'fc.weight':<20} | {fc_val:>15.2e} | {'N/A':>20} | {'N/A':>20}")
+    print(f"{'fc.fc.weight':<20} | {fc_val:>15.2e} | {'N/A':>20} | {'N/A':>20}")
 
 
 # ---------------------------------------------------------------------------

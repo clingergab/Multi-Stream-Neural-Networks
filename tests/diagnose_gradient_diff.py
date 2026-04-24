@@ -207,9 +207,11 @@ def test_specific_weight_gradients():
     print(f"stream1/0 BN weight grad max diff: {diff:.2e}")
 
     print("\n--- fc Weight Gradients ---")
-    # fc is the final classifier
+    # fc is the final classifier. In LINet3 the head is a LinearHead/MaxoutHead
+    # module that wraps the inner nn.Linear at .fc.fc; in the original LINet
+    # model.fc is the nn.Linear directly.
     orig_fc_grad = model_orig.fc.weight.grad
-    li3_fc_grad = model_linet3.fc.weight.grad
+    li3_fc_grad = model_linet3.fc.fc.weight.grad
     diff = (orig_fc_grad - li3_fc_grad).abs().max().item()
     print(f"fc weight grad max diff: {diff:.2e}")
 

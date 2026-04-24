@@ -55,6 +55,7 @@ from .conv import LIConv2d, LIBatchNorm2d
 from .blocks import LIBasicBlock, LIBottleneck
 from .container import LISequential, LIReLU
 from .pooling import LIMaxPool2d, LIAdaptiveAvgPool2d
+from .heads import LinearHead, MaxoutHead
 # Note: LINet doesn't use fusion - it uses the integrated stream directly
 
 
@@ -91,6 +92,8 @@ class LINet(BaseModel):
         stream_input_channels: list[int] = [3, 1],  # Default: [RGB=3, Depth=1] for backward compatibility
         dropout_p: float = 0.0,  # Dropout probability (0.0 = no dropout, 0.5 = 50% dropout)
         width_multiplier: float = 1.0,  # Scale channel widths (0.5 = half, 0.75 = 3/4)
+        classifier_head: str = 'linear',  # 'linear' (default, baseline) | 'maxout'
+        num_subnodes: int = 3,  # K sub-nodes per class; only used when classifier_head='maxout'
         **kwargs
     ) -> None:
         # Store LINet-specific parameters BEFORE calling super().__init__
@@ -99,6 +102,11 @@ class LINet(BaseModel):
         self.num_streams = len(stream_input_channels)
         self.dropout_p = dropout_p
         self.width_multiplier = width_multiplier
+        # classifier_head dispatch happens in _build_network; MaxoutHead validates num_subnodes.
+        # Attribute is `classifier_head_type` (not `classifier_head`) to avoid colliding
+        # with `self.fc`, which is the constructed head module instance.
+        self.classifier_head_type = classifier_head
+        self.num_subnodes = num_subnodes
 
         # Set LINet default norm layer if not specified
         if norm_layer is None:
@@ -170,9 +178,19 @@ class LINet(BaseModel):
         # Add dropout for regularization (configurable, critical for small datasets)
         self.dropout = nn.Dropout(p=self.dropout_p) if self.dropout_p > 0.0 else nn.Identity()
 
-        # Single classifier for integrated stream features
+        # Pluggable classifier head for integrated stream features.
+        # Both heads return (B, num_classes) so the backbone forward stays
+        # `logits = self.fc(features)` with no head-type branching.
         feature_dim = base[3] * block.expansion
-        self.fc = nn.Linear(feature_dim, self.num_classes)
+        if self.classifier_head_type == 'linear':
+            self.fc = LinearHead(feature_dim, self.num_classes)
+        elif self.classifier_head_type == 'maxout':
+            self.fc = MaxoutHead(feature_dim, self.num_classes, self.num_subnodes)
+        else:
+            raise ValueError(
+                f"Unknown classifier_head: {self.classifier_head_type!r}. "
+                f"Must be 'linear' or 'maxout'."
+            )
 
     
     def _initialize_weights(self, zero_init_residual: bool):
@@ -295,7 +313,9 @@ class LINet(BaseModel):
                          When a stream is blanked for a sample, its output is zeroed.
 
         Returns:
-            Classification logits [batch_size, num_classes] from integrated stream
+            Classification logits [batch_size, num_classes] from integrated stream.
+            The classifier head is selected by the ``classifier_head`` kwarg
+            ('linear' or 'maxout'); both return ``(B, num_classes)``.
         """
         # Convert inputs to channels_last for better cuDNN performance
         if _conv_module.USE_CHANNELS_LAST:
@@ -2779,7 +2799,14 @@ class LINet(BaseModel):
         return result 
 
 # Factory functions for common LINet architectures
-def li_resnet18(num_classes: int = 19, stream_input_channels: list[int] = None, width_multiplier: float = 1.0, **kwargs) -> LINet:
+def li_resnet18(
+    num_classes: int = 19,
+    stream_input_channels: list[int] = None,
+    width_multiplier: float = 1.0,
+    classifier_head: str = 'linear',
+    num_subnodes: int = 3,
+    **kwargs,
+) -> LINet:
     """
     Create a Linear Integration ResNet-18 model.
 
@@ -2790,6 +2817,11 @@ def li_resnet18(num_classes: int = 19, stream_input_channels: list[int] = None, 
                               For 3 streams: [3, 1, 1] for RGB + Depth + Orthogonal
         width_multiplier: Scale channel widths. 1.0 = standard ResNet-18 [64,128,256,512].
             0.75 → [48,96,192,384] (~56% params), 0.5 → [32,64,128,256] (~25% params).
+        classifier_head: 'linear' (default, single hyperplane per class) or 'maxout'
+            (K parallel hyperplanes per class with max-pooling). 'maxout' with
+            num_subnodes=1 reduces mathematically to 'linear'.
+        num_subnodes: K, the number of sub-classifiers per class. Only used when
+            classifier_head='maxout'. Default 3.
         **kwargs: Additional arguments passed to LINet constructor
 
     Returns:
@@ -2804,6 +2836,9 @@ def li_resnet18(num_classes: int = 19, stream_input_channels: list[int] = None, 
 
         # Smaller model for limited data
         model = li_resnet18(num_classes=19, width_multiplier=0.5)
+
+        # Max-out classifier head for multi-modal class structure
+        model = li_resnet18(num_classes=19, classifier_head='maxout', num_subnodes=3)
     """
     # Default to 2-stream for backward compatibility with existing code
     if stream_input_channels is None:
@@ -2815,6 +2850,8 @@ def li_resnet18(num_classes: int = 19, stream_input_channels: list[int] = None, 
         num_classes=num_classes,
         stream_input_channels=stream_input_channels,
         width_multiplier=width_multiplier,
+        classifier_head=classifier_head,
+        num_subnodes=num_subnodes,
         **kwargs
     )
 

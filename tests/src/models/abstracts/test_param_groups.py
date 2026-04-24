@@ -58,8 +58,12 @@ class TestClassifierRouting:
         integration_group = groups[2]
         assert integration_group['weight_decay'] == 1e-3
 
-        # Verify fc.weight is in this group
-        fc_weight = dict(model.named_parameters())['fc.weight']
+        # Verify the head's inner Linear weight is in this group. After the head
+        # refactor, model.fc is a LinearHead/MaxoutHead module wrapping nn.Linear
+        # at .fc; the parameter is registered as 'fc.fc.weight'. The routing
+        # logic in abstract_model.py uses ``name.startswith('fc.')`` which still
+        # matches both 'fc.weight' (older variants) and 'fc.fc.weight' (LINet3).
+        fc_weight = dict(model.named_parameters())['fc.fc.weight']
         assert any(p is fc_weight for p in integration_group['params'])
 
     def test_bn_params_not_in_integration_group(self, model):

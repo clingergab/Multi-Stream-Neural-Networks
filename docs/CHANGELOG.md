@@ -4,6 +4,73 @@ All notable changes to this project are documented here.
 
 ---
 
+## 2026-04-24 — Pluggable Classifier Head (Linear + Max-Out)
+
+### Added
+
+- `LinearHead` and `MaxoutHead` — two pluggable `nn.Module` classifier heads in a new file
+  `src/models/linear_integration/li_net3/heads.py`. `LinearHead` is a thin wrapper around
+  `nn.Linear`. `MaxoutHead` projects features to `C·K` logits, reshapes to
+  `(B, num_classes, num_subnodes)`, and takes `.amax(dim=2)`, giving each class K parallel
+  sub-classifiers whose maximum score is used for prediction. Both return `(B, num_classes)`
+  logits; no downstream changes were required.
+
+- `classifier_head: str = 'linear'` and `num_subnodes: int = 3` kwargs on `LINet.__init__`
+  and `li_resnet18`. The default `'linear'` preserves byte-identical behavior relative to the
+  pre-refactor baseline (verified by `torch.equal` on weights and forward output, no weight
+  copying). An unknown head name raises `ValueError` at construction time.
+
+- Sub-node utilization diagnostic cell (cell 69, `# --- 19.12 ---`) in
+  `notebooks/colab_LINet3_SUN_training_with_val.ipynb`. After training, a forward hook on
+  `model.fc.fc` captures pre-max logits, computes per-class sub-node utilization counts and
+  normalized entropy, renders a bar chart, and saves results to
+  `results/maxout_subnode_utilization_{timestamp}.json` with a full config block. The cell
+  skips gracefully if the model's head is `'linear'`.
+
+- Hard-abort in the notebook's pretrained-load block (cell 21): `load_state_dict(strict=False)`
+  return value is now checked explicitly. If any keys beyond the expected classifier-head
+  key swap (`fc.weight`/`fc.bias` → `fc.fc.weight`/`fc.fc.bias`) appear in the mismatch
+  sets, a `RuntimeError` is raised immediately rather than letting the run continue silently
+  with a corrupt backbone.
+
+- 8 new unit tests in `tests/test_classifier_head.py` covering: output shapes, the K=0
+  rejection assertion, head-level math equivalence at K=1 (with explicit weight copying),
+  RNG-consumption equivalence of the full model at K=1 (no weight copying — tests that
+  construction order is identical), `ValueError` on unknown head name, and a slow behavioral
+  test (`test_maxout_k3_argmax_specialization`) verifying that K=3 sub-nodes specialize on
+  XOR-like 2-mode-per-class synthetic data (mean cross-cluster disagreement ≥ 0.7).
+
+- `LinearHead` and `MaxoutHead` added to the `src/models/linear_integration/li_net3`
+  package exports.
+
+### Changed
+
+- `MODEL_CONFIG` in notebook cell 16 now includes `'classifier_head': 'maxout'` and
+  `'num_subnodes': 3`. The notebook default is `'maxout'`; the LINet class default remains
+  `'linear'` for backward compatibility.
+
+- Notebook cell 21 prints `Classifier head`, `Sub-nodes per class`, and
+  `Classifier head params` after model construction, and passes both new kwargs through to
+  `li_resnet18`.
+
+- `tests/diagnose_gradient_diff.py`, `tests/test_conv1_gradient_flow.py`, and
+  `tests/src/models/abstracts/test_param_groups.py` updated to access the classifier weight
+  at `model.fc.fc.weight` (the inner `nn.Linear` of the head module) rather than
+  `model.fc.weight` (which is no longer valid).
+
+### Notes
+
+- The state-dict key for the classifier changed from `fc.weight`/`fc.bias` to
+  `fc.fc.weight`/`fc.fc.bias`. Pre-refactor checkpoints loaded with `strict=False` will
+  silently skip those two keys; all backbone keys still load correctly. The notebook's
+  hard-abort guard catches any mismatch beyond this expected swap.
+- Gates 4 (K=1 end-to-end within ±0.1pp of baseline) and 5 (K=3 full training run;
+  primary signal: test `dining_area` accuracy above the 25% baseline) require a GPU machine
+  and the SUN RGB-D dataset. Infrastructure is in place; experimental results will be
+  documented separately.
+
+---
+
 ## 2026-03-20 — OmniPretrain Dataset Loader
 
 ### Added
