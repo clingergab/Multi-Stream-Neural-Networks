@@ -52,6 +52,11 @@ from src.training.augmentation_config import (
     BASE_HOLE_DROPOUT_NUM_MAX,
     BASE_HOLE_DROPOUT_SIZE_MIN,
     BASE_HOLE_DROPOUT_SIZE_MAX,
+    # HHA-specific
+    BASE_DISPARITY_SCALE_P,
+    BASE_DISP_SCALE,
+    BASE_HEIGHT_OFFSET_P,
+    BASE_HEIGHT_SIGMA,
     # Caps
     MAX_PROBABILITY,
     MAX_BRIGHTNESS,
@@ -92,7 +97,10 @@ def _load_class_names(data_root: str) -> list[str]:
 def _load_norm_stats(data_root: str) -> dict:
     """Load normalization statistics from norm_stats.json in data_root.
 
-    Returns dict with keys: rgb_mean, rgb_std, depth_mean, depth_std.
+    Always returns rgb_mean / rgb_std. Returns either depth_mean / depth_std
+    (raw-depth dataset) or hha_mean / hha_std (HHA dataset), or both
+    (with-hha dataset). Callers select which key set to consume based on
+    their ``use_hha`` flag.
     """
     path = os.path.join(data_root, 'norm_stats.json')
     if not os.path.exists(path):
@@ -101,7 +109,18 @@ def _load_norm_stats(data_root: str) -> dict:
             f"Run the preprocessing script with stats computation first."
         )
     with open(path, 'r') as f:
-        return json.load(f)
+        stats = json.load(f)
+    if 'rgb_mean' not in stats or 'rgb_std' not in stats:
+        raise ValueError(
+            f"norm_stats.json in {data_root} missing rgb_mean/rgb_std"
+        )
+    has_depth = 'depth_mean' in stats and 'depth_std' in stats
+    has_hha = 'hha_mean' in stats and 'hha_std' in stats
+    if not (has_depth or has_hha):
+        raise ValueError(
+            f"norm_stats.json in {data_root} has neither depth_* nor hha_* keys"
+        )
+    return stats
 
 
 class SUNRGBDDataset(Dataset):
@@ -115,7 +134,7 @@ class SUNRGBDDataset(Dataset):
       - Train: RandomCrop(crop_size) from 256x256
       - Val/Test: CenterCrop(crop_size) from 256x256
 
-    Directory structure:
+    Directory structure (raw-depth dataset):
         data_root/
             class_names.txt
             norm_stats.json
@@ -123,6 +142,22 @@ class SUNRGBDDataset(Dataset):
                 rgb_tensors.pt    # [N, 3, 256, 256] uint8
                 depth_tensors.pt  # [N, 1, 256, 256] uint16 (mm)
                 labels.txt
+
+    Directory structure (HHA dataset, ``use_hha=True``):
+        data_root/
+            class_names.txt
+            norm_stats.json   # contains hha_mean (3) and hha_std (3)
+            train/ or val/ or test/
+                rgb_tensors.pt    # [N, 3, 256, 256] uint8
+                hha_tensors.pt    # [N, 3, 256, 256] float16 (NaN at missing)
+                labels.txt
+
+    When ``use_hha=True``, the dataset's ``__getitem__`` returns the HHA
+    tensor in place of raw depth (same tuple shape, channel count 3 instead
+    of 1). Internally, ``hha_mean`` / ``hha_std`` from ``norm_stats.json``
+    are aliased onto ``self._norm_stats['depth_mean'/'depth_std']`` so the
+    rest of the dataset code, gpu_augmentation, and any downstream consumer
+    sees a uniform interface.
     """
 
     VALID_SPLITS = ('train', 'val', 'test')
@@ -138,6 +173,7 @@ class SUNRGBDDataset(Dataset):
         depth_aug_prob: float = 1.0,
         depth_aug_mag: float = 1.0,
         return_two_views: bool = False,
+        use_hha: bool = False,
     ):
         """
         Args:
@@ -156,6 +192,12 @@ class SUNRGBDDataset(Dataset):
                 are produced by independent stochastic-augmentation calls on
                 the same raw image. Used by KL consistency training. Only
                 valid for ``split='train'`` — raises ValueError otherwise.
+            use_hha: If True, load ``hha_tensors.pt`` (3-channel float HHA)
+                instead of ``depth_tensors.pt``. Requires ``hha_mean`` and
+                ``hha_std`` keys in ``norm_stats.json``. The depth-channel
+                slot of every returned tuple has shape ``[3, H, W]`` instead
+                of ``[1, H, W]``. CPU depth augmentation is replaced with an
+                HHA-aware pipeline (see ``_apply_hha_aug``).
         """
         if split not in self.VALID_SPLITS:
             raise ValueError(f"split must be one of {self.VALID_SPLITS}, got '{split}'")
@@ -170,13 +212,26 @@ class SUNRGBDDataset(Dataset):
         self.crop_size = crop_size
         self.normalize = normalize
         self.return_two_views = return_two_views
+        self.use_hha = use_hha
 
         # Load class names dynamically from data root
         self.CLASS_NAMES = _load_class_names(data_root)
         self.num_classes = len(self.CLASS_NAMES)
 
-        # Load normalization statistics from data root
+        # Load normalization statistics from data root. When use_hha is on,
+        # alias hha_mean/std onto depth_mean/std so the rest of the dataset
+        # code (and downstream consumers) sees a uniform interface.
         self._norm_stats = _load_norm_stats(data_root)
+        if use_hha:
+            if 'hha_mean' not in self._norm_stats or 'hha_std' not in self._norm_stats:
+                raise ValueError(
+                    f"use_hha=True requires hha_mean/hha_std in norm_stats.json "
+                    f"(at {data_root}). Re-run preprocess_sunrgbd_19.py "
+                    f"with --hha-mode hha-only or --hha-mode with-hha."
+                )
+            # Alias for uniform downstream interface.
+            self._norm_stats['depth_mean'] = list(self._norm_stats['hha_mean'])
+            self._norm_stats['depth_std'] = list(self._norm_stats['hha_std'])
 
         # Store augmentation scaling parameters
         self.rgb_aug_prob = rgb_aug_prob
@@ -203,14 +258,22 @@ class SUNRGBDDataset(Dataset):
         # and random access triggers page faults that duplicate pages per-worker.
         # With mmap, all workers share the same OS-level memory-mapped pages.
         rgb_tensor_path = os.path.join(self.split_dir, 'rgb_tensors.pt')
-        depth_tensor_path = os.path.join(self.split_dir, 'depth_tensors.pt')
+        depth_tensor_name = 'hha_tensors.pt' if use_hha else 'depth_tensors.pt'
+        depth_tensor_path = os.path.join(self.split_dir, depth_tensor_name)
         if os.path.exists(rgb_tensor_path) and os.path.exists(depth_tensor_path):
             self.rgb_tensors = torch.load(rgb_tensor_path, weights_only=True, mmap=True)
             self.depth_tensors = torch.load(depth_tensor_path, weights_only=True, mmap=True)
             self.use_tensors = True
+            modality = 'HHA' if use_hha else 'depth'
             print(f"Loaded SUN RGB-D {split}: {self.num_samples} samples, "
-                  f"{self.num_classes} classes (tensors, mmap)")
+                  f"{self.num_classes} classes (tensors, mmap, modality={modality})")
         else:
+            if use_hha:
+                raise FileNotFoundError(
+                    f"use_hha=True requires {depth_tensor_path}; PNG fallback is "
+                    f"not implemented for HHA. Run preprocess_sunrgbd_19.py with "
+                    f"--hha-mode hha-only first."
+                )
             self.rgb_tensors = None
             self.depth_tensors = None
             self.use_tensors = False
@@ -270,6 +333,23 @@ class SUNRGBDDataset(Dataset):
         self._depth_blur_p = min(BASE_BLUR_P * self.depth_aug_prob, MAX_PROBABILITY)
         self._depth_blur_sigma_min = BASE_BLUR_SIGMA_MIN
         self._depth_blur_sigma_max = min(BASE_BLUR_SIGMA_MAX * self.depth_aug_mag, MAX_BLUR_SIGMA)
+
+        # === HHA-ONLY (Tier B equivalents for the HHA channel set; only used
+        # when use_hha=True; same scaling pattern as raw-depth ops above so
+        # caps cap, magnitudes scale, probabilities never exceed MAX_PROBABILITY)
+        self._hha_disp_scale_p = min(
+            BASE_DISPARITY_SCALE_P * self.depth_aug_prob, MAX_PROBABILITY
+        )
+        self._hha_disp_scale_halfwidth = min(
+            BASE_DISP_SCALE * self.depth_aug_mag, MAX_DEPTH_SCALE_HALFWIDTH
+        )
+        self._hha_height_offset_p = min(
+            BASE_HEIGHT_OFFSET_P * self.depth_aug_prob, MAX_PROBABILITY
+        )
+        # Height channel std (~1.3 m) bounds the meaningful sigma; cap at 0.5 m
+        # so an aggressive depth_aug_mag can't push the offset distribution
+        # past a quarter of the channel std.
+        self._hha_height_sigma = min(BASE_HEIGHT_SIGMA * self.depth_aug_mag, 0.5)
 
         # Depth value-scale jitter — multiply valid depth by (1 ± halfwidth).
         # Simulates per-sensor calibration differences in absolute distance values.
@@ -339,6 +419,11 @@ class SUNRGBDDataset(Dataset):
               f"{self._hole_dropout_p:.3f}, num: [{self._hole_dropout_num_min}, "
               f"{self._hole_dropout_num_max}], size: [{self._hole_dropout_size_min}, "
               f"{self._hole_dropout_size_max}] px")
+        if getattr(self, "use_hha", False):
+            print(f"    [HHA]   Disparity scale prob: {BASE_DISPARITY_SCALE_P:.2f} -> "
+                  f"{self._hha_disp_scale_p:.3f}, halfwidth: ±{self._hha_disp_scale_halfwidth:.3f}")
+            print(f"    [HHA]   Height offset prob: {BASE_HEIGHT_OFFSET_P:.2f} -> "
+                  f"{self._hha_height_offset_p:.3f}, sigma: {self._hha_height_sigma:.3f} m")
 
     def _load_images_tensor(self, idx):
         """Load pre-resized images from tensor files."""
@@ -365,26 +450,36 @@ class SUNRGBDDataset(Dataset):
         return rgb, depth
 
     def _load_raw(self, idx):
-        """Phase 1 (deterministic) — load uint8 RGB ``[3, H, W]`` and float32
-        depth ``[1, H, W]`` in meters from disk/mmap. No augmentation.
+        """Phase 1 (deterministic) — load uint8 RGB ``[3, H, W]`` and the
+        depth-channel tensor from disk/mmap. No augmentation.
 
-        Returns: (rgb_uint8, depth_float_meters)
+        Returns:
+            (rgb_uint8, depth_float)
 
-        Note: ``self.rgb_tensors[idx]`` returns an mmap-backed view. Standard
-        torchvision v2 ops (flip, crop, color jitter) return new tensors and
-        do not mutate the mmap, so the single-view path is safe. The
-        two-view path explicitly clones in ``__getitem__`` before each
-        augmentation pipeline call to defend against in-place ops in
-        ``_apply_depth_aug``.
+            When ``use_hha=False``: depth shape ``[1, H, W]`` float32 in
+            meters; missing pixels are 0.
+
+            When ``use_hha=True``: HHA shape ``[3, H, W]`` float32 (cast up
+            from on-disk float16); missing pixels are NaN.
+
+        Note: ``self.rgb_tensors[idx]`` and ``self.depth_tensors[idx]``
+        return mmap-backed views. The conversion to float32 below creates a
+        new tensor so the working copy no longer aliases the mmap, which is
+        what protects in-place augmentation ops from corrupting shared
+        memory.
         """
         if self.use_tensors:
             rgb, depth = self._load_images_tensor(idx)
         else:
             rgb, depth = self._load_images_png(idx)
-        # Convert depth early: uint16 mm -> float32 meters (uint16 has limited
-        # op support — flip/crop/etc. fail on it). The .float() creates a new
-        # tensor so depth no longer aliases the mmap.
-        depth = depth.float() / 1000.0
+        if self.use_hha:
+            # On-disk dtype is float16 (or float32 if --hha-dtype float32 was
+            # used at preprocessing). Cast to float32 for stable math.
+            depth = depth.float()
+        else:
+            # uint16 mm -> float32 meters. The .float() creates a new tensor
+            # so depth no longer aliases the mmap.
+            depth = depth.float() / 1000.0
         return rgb, depth
 
     def _apply_spatial_aug(self, rgb, depth):
@@ -510,18 +605,119 @@ class SUNRGBDDataset(Dataset):
 
         return depth
 
+    def _apply_hha_aug(self, hha):
+        """HHA-specific train augmentation. Geometrically valid ops only.
+
+        Order is fixed (matters because hole dropout creates new NaNs and
+        blur would propagate them if it ran after):
+            1. Disparity scale jitter — channel 0 only.
+            2. Ground-plane offset — channel 1 only.
+            3. Blur — NaN-aware via normalized (Knutsson) convolution; same
+               kernel across all 3 channels.
+            4. Hole dropout — sets a rectangular region to NaN across all 3
+               channels; the unconditional NaN-replacement step in
+               ``_normalize_and_erase`` then converts these to channel mean.
+
+        Operates on a [3, H, W] float32 tensor with NaN at missing pixels.
+        Brightness / contrast / additive noise / generic-multiply scale
+        jitter from raw-depth aug are intentionally absent — they mix
+        channels with different physical units (1/m, m, deg) and corrupt
+        geometric semantics.
+        """
+        # Defensive clone: this method mutates hha in-place via channel
+        # assignment. _load_raw materializes a non-mmap copy via .float(), so
+        # the input is currently safe to mutate, but the contract is fragile.
+        # An extra 224x224x3 float32 clone is ~600 KB — negligible vs. safety.
+        hha = hha.clone()
+
+        # 1. Disparity scale jitter (channel 0 only).
+        if self._hha_disp_scale_halfwidth > 0 and np.random.random() < self._hha_disp_scale_p:
+            half = self._hha_disp_scale_halfwidth
+            s = float(np.random.uniform(1.0 - half, 1.0 + half))
+            hha[0] = hha[0] * s
+
+        # 2. Ground-plane offset (channel 1 only). Additive Gaussian.
+        if self._hha_height_sigma > 0 and np.random.random() < self._hha_height_offset_p:
+            offset = float(np.random.normal(0.0, self._hha_height_sigma))
+            valid = ~torch.isnan(hha[1])
+            hha[1] = torch.where(valid, hha[1] + offset, hha[1])
+
+        # 3. Blur — normalized convolution so missing pixels don't drag
+        # boundary-valid pixels toward zero (which would destroy the angle
+        # channel's signal exactly at glass / depth-discontinuity edges
+        # where it's most informative).
+        if self._depth_blur_sigma_max > 0 and np.random.random() < (
+            self._depth_blur_p
+        ):
+            kernel_size = int(np.random.choice([3, 5]))
+            sigma = float(np.random.uniform(
+                self._depth_blur_sigma_min,
+                self._depth_blur_sigma_max,
+            ))
+            nan_mask = torch.isnan(hha)
+            valid = (~nan_mask).to(hha.dtype)
+            clean = torch.where(nan_mask, torch.zeros_like(hha), hha)
+            blurred_data = F2.gaussian_blur(clean, kernel_size=kernel_size, sigma=sigma)
+            blurred_mask = F2.gaussian_blur(valid, kernel_size=kernel_size, sigma=sigma)
+            hha = torch.where(
+                blurred_mask > 1e-6,
+                blurred_data / torch.clamp(blurred_mask, min=1e-6),
+                torch.full_like(hha, float('nan')),
+            )
+            # Re-mark originally-NaN pixels.
+            hha = torch.where(nan_mask, torch.full_like(hha, float('nan')), hha)
+
+        # 4. Hole dropout (creates NaN — must be last).
+        if self._hole_dropout_num_max >= self._hole_dropout_num_min and \
+           np.random.random() < self._hole_dropout_p:
+            _H, _W = hha.shape[-2], hha.shape[-1]
+            n_holes = int(np.random.randint(
+                self._hole_dropout_num_min,
+                self._hole_dropout_num_max + 1,
+            ))
+            for _ in range(n_holes):
+                h = int(np.random.randint(
+                    self._hole_dropout_size_min,
+                    self._hole_dropout_size_max + 1,
+                ))
+                w = int(np.random.randint(
+                    self._hole_dropout_size_min,
+                    self._hole_dropout_size_max + 1,
+                ))
+                i = int(np.random.randint(0, max(1, _H - h)))
+                j = int(np.random.randint(0, max(1, _W - w)))
+                hha[:, i:i + h, j:j + w] = float('nan')
+
+        return hha
+
     def _normalize_and_erase(self, rgb, depth):
-        """Phase 5 — uint8→float32, sentinel replacement (depth=0 →
-        depth_mean), and (when ``self.normalize`` is True) normalization +
-        post-normalization random erasing on train. GPU-augmentation mode
-        leaves the un-normalized [0, 1]-range tensors for the GPU pipeline.
+        """Phase 5 — uint8→float32, sentinel replacement, and (when
+        ``self.normalize`` is True) normalization + post-normalization
+        random erasing on train. GPU-augmentation mode leaves the
+        un-normalized tensors for the GPU pipeline.
+
+        Sentinel replacement runs **unconditionally** (regardless of
+        ``self.normalize``) so the dataset never returns NaN-laced (HHA)
+        or 0-sentineled (raw-depth) tensors to any downstream consumer.
         """
         if rgb.dtype == torch.uint8:
             rgb = rgb.float() / 255.0
 
-        zero_mask = (depth == 0.0)
-        if zero_mask.any():
-            depth[zero_mask] = self._norm_stats['depth_mean'][0]
+        if self.use_hha:
+            # HHA: NaN sentinel, per-channel mean substitution.
+            nan_mask = torch.isnan(depth)
+            if nan_mask.any():
+                mean_t = torch.tensor(
+                    self._norm_stats['depth_mean'],
+                    dtype=depth.dtype,
+                    device=depth.device,
+                ).view(-1, 1, 1)
+                depth = torch.where(nan_mask, mean_t.expand_as(depth), depth)
+        else:
+            # Raw depth: 0 sentinel, scalar-mean substitution.
+            zero_mask = (depth == 0.0)
+            if zero_mask.any():
+                depth[zero_mask] = self._norm_stats['depth_mean'][0]
 
         if self.normalize:
             rgb = F2.normalize(
@@ -545,11 +741,14 @@ class SUNRGBDDataset(Dataset):
 
     def _augment_train_view(self, rgb, depth):
         """Run the full train pipeline for one view: spatial → (rgb appearance
-        if CPU mode) → depth aug → normalize/erase."""
+        if CPU mode) → depth/hha aug → normalize/erase."""
         rgb, depth = self._apply_spatial_aug(rgb, depth)
         if self.normalize:
             rgb = self._apply_rgb_aug(rgb)
-        depth = self._apply_depth_aug(depth)
+        if self.use_hha:
+            depth = self._apply_hha_aug(depth)
+        else:
+            depth = self._apply_depth_aug(depth)
         return self._normalize_and_erase(rgb, depth)
 
     def _center_crop_view(self, rgb, depth):
@@ -664,6 +863,7 @@ def get_sunrgbd_dataloaders(
     rgb_aug_mag: float = 1.0,
     depth_aug_prob: float = 1.0,
     depth_aug_mag: float = 1.0,
+    use_hha: bool = False,
 ):
     """
     Create train, validation, and test dataloaders for SUN RGB-D.
@@ -698,6 +898,7 @@ def get_sunrgbd_dataloaders(
         rgb_aug_mag=rgb_aug_mag,
         depth_aug_prob=depth_aug_prob,
         depth_aug_mag=depth_aug_mag,
+        use_hha=use_hha,
     )
 
     # Val split is optional — only create if val/ directory exists
@@ -709,6 +910,7 @@ def get_sunrgbd_dataloaders(
             split='val',
             crop_size=crop_size,
             normalize=normalize,
+            use_hha=use_hha,
         )
 
     test_dataset = SUNRGBDDataset(
@@ -716,6 +918,7 @@ def get_sunrgbd_dataloaders(
         split='test',
         crop_size=crop_size,
         normalize=normalize,
+        use_hha=use_hha,
     )
 
     # Setup reproducibility if seed is provided

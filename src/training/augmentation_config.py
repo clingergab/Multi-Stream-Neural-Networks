@@ -81,6 +81,17 @@ BASE_HOLE_DROPOUT_NUM_MAX = 8
 BASE_HOLE_DROPOUT_SIZE_MIN = 5    # pixels
 BASE_HOLE_DROPOUT_SIZE_MAX = 20   # pixels
 
+# HHA-specific augmentations (only used when SUNRGBDDataset(use_hha=True)).
+# These act on a 3-channel HHA tensor where channel 0 is horizontal disparity
+# (1/m), channel 1 is height above ground (m), channel 2 is angle with gravity
+# (degrees). Brightness/contrast/noise/generic-scale-jitter are NOT in this
+# list because they corrupt geometric semantics across HHA channels with
+# different physical units.
+BASE_DISPARITY_SCALE_P = 0.5      # probability of disparity-only scale jitter
+BASE_DISP_SCALE = 0.15            # half-width of disparity multiply (channel 0)
+BASE_HEIGHT_OFFSET_P = 0.5        # probability of ground-plane offset
+BASE_HEIGHT_SIGMA = 0.05          # std (m) of additive offset on height channel
+
 
 # =============================================================================
 # CAPS TO PREVENT EXTREME VALUES
