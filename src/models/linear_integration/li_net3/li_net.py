@@ -22,6 +22,10 @@ from src.models.abstracts.abstract_model import BaseModel
 from src.training.modality_dropout import get_modality_dropout_prob, generate_per_sample_blanked_mask
 from src.training.mixup import mixup_batch as _mixup_batch, mixup_loss as _mixup_loss
 from src.training.sam import SAM, disable_running_stats as _disable_bn_stats, enable_running_stats as _enable_bn_stats
+from src.models.linear_integration.li_net3.class_balanced_bn import (
+    convert_to_class_balanced_bn as _convert_to_cbbn,
+    stash_labels as _stash_labels,
+)
 from src.models.common import (
     save_checkpoint,
     create_progress_bar,
@@ -873,6 +877,14 @@ class LINet(BaseModel):
         # between sub-node weights per class; LinearHead: always 0). Adds an aux loss
         # term before each .backward() to counter winner-takes-all gradient starvation.
         diversity_loss_weight: float = 0.0,
+        # Class-balanced BatchNorm for the integrated pathway. When True, every
+        # LIBatchNorm2d in the model is converted (in place) to its class-balanced
+        # variant: the integrated pathway accumulates running stats from per-class
+        # batch means/vars averaged with EQUAL weight, so minority classes are not
+        # underrepresented in the running statistics. Targets the same mechanism
+        # AdaBN exploits at inference, but without the majority-class regression.
+        # Per-stream pathways and eval-mode behavior are unchanged.
+        use_class_balanced_bn: bool = False,
     ) -> dict:
         """
         Train the model with optional early stopping.
@@ -1056,6 +1068,16 @@ class LINet(BaseModel):
                 if verbose:
                     print("[SAM] Disabling AMP for SAM run (GradScaler does not compose "
                           "cleanly with SAM's two forward+backward passes per step).")
+        # ============ Class-balanced BN setup ============
+        # Convert LIBatchNorm2d → ClassBalancedLIBatchNorm2d in place so that
+        # the integrated pathway accumulates per-class-balanced running stats.
+        # _train_epoch wraps each forward in stash_labels(targets) to provide
+        # the class identities the BN module reads via thread-local lookup.
+        if use_class_balanced_bn:
+            n_cbbn = _convert_to_cbbn(self)
+            if verbose:
+                print(f"[CBBN] converted {n_cbbn} LIBatchNorm2d module(s) → "
+                      f"ClassBalancedLIBatchNorm2d (integrated-pathway-only)")
         if verbose:
             if use_mixup:
                 print(f"[MixUp] enabled with alpha={mixup_alpha}")
@@ -1119,6 +1141,7 @@ class LINet(BaseModel):
                 mixup_alpha=mixup_alpha,
                 sam_optimizer=sam_optimizer,
                 diversity_loss_weight=diversity_loss_weight,
+                use_class_balanced_bn=use_class_balanced_bn,
             )
 
             # Validation phase
@@ -1639,7 +1662,8 @@ class LINet(BaseModel):
                      use_mixup: bool = False,
                      mixup_alpha: float = 0.2,
                      sam_optimizer: Optional[object] = None,
-                     diversity_loss_weight: float = 0.0) -> tuple:
+                     diversity_loss_weight: float = 0.0,
+                     use_class_balanced_bn: bool = False) -> tuple:
         """
         Train the model for one epoch with GPU optimizations and gradient accumulation.
 
@@ -1734,6 +1758,21 @@ class LINet(BaseModel):
                 _mixup_lam = 1.0
                 _mixup_active = False
 
+            # CBBN: labels to stash for class-balanced integrated BN. Under
+            # mixup, each input row is a blend of two classes (labels_a and
+            # labels_b) with weight (lam, 1-lam). We stash the DOMINANT label
+            # (lam>=0.5 -> labels_a, else labels_b) so the running stats
+            # accumulate against the class that contributed most to each
+            # sample's features. This matches the lam-thresholded convention
+            # used elsewhere (e.g., effective_targets at line ~1948 below).
+            # When mixup is off, _mixup_labels_a == targets and _mixup_lam == 1.0.
+            # None disables the stash entirely.
+            if use_class_balanced_bn:
+                _cbbn_labels = (_mixup_labels_a if _mixup_lam >= 0.5
+                                else _mixup_labels_b)
+            else:
+                _cbbn_labels = None
+
             # OPTIMIZATION 5: Gradient accumulation - zero gradients only when starting accumulation
             if batch_idx % gradient_accumulation_steps == 0:
                 self.optimizer.zero_grad()
@@ -1741,7 +1780,8 @@ class LINet(BaseModel):
             if sam_optimizer is not None:
                 # ===== SAM branch (fp32; two forward+backward passes) =====
                 # First forward + backward at current weights w.
-                outputs_first = self(stream_batches, blanked_mask=blanked_mask)
+                with _stash_labels(_cbbn_labels):
+                    outputs_first = self(stream_batches, blanked_mask=blanked_mask)
                 if _mixup_active:
                     loss_first = _mixup_loss(self.criterion, outputs_first,
                                              _mixup_labels_a, _mixup_labels_b, _mixup_lam)
@@ -1762,7 +1802,8 @@ class LINet(BaseModel):
                 # running-stats so they aren't updated twice per batch; restore after.
                 _disable_bn_stats(self)
                 try:
-                    outputs = self(stream_batches, blanked_mask=blanked_mask)
+                    with _stash_labels(_cbbn_labels):
+                        outputs = self(stream_batches, blanked_mask=blanked_mask)
                     if _mixup_active:
                         loss = _mixup_loss(self.criterion, outputs,
                                            _mixup_labels_a, _mixup_labels_b, _mixup_lam)
@@ -1801,7 +1842,7 @@ class LINet(BaseModel):
                         history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
             elif self.use_amp:
                 # Use automatic mixed precision
-                with autocast(device_type=self.device.type):
+                with autocast(device_type=self.device.type), _stash_labels(_cbbn_labels):
                     outputs = self(stream_batches, blanked_mask=blanked_mask)
                     if _mixup_active:
                         loss = _mixup_loss(self.criterion, outputs,
@@ -1859,7 +1900,8 @@ class LINet(BaseModel):
                             history['learning_rates'].append(self.optimizer.param_groups[-1]['lr'])
             else:
                 # Standard precision training
-                outputs = self(stream_batches, blanked_mask=blanked_mask)
+                with _stash_labels(_cbbn_labels):
+                    outputs = self(stream_batches, blanked_mask=blanked_mask)
                 if _mixup_active:
                     loss = _mixup_loss(self.criterion, outputs,
                                        _mixup_labels_a, _mixup_labels_b, _mixup_lam)
