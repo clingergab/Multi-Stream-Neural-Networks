@@ -21,6 +21,7 @@ from src.training.schedulers import WarmupReduceLROnPlateau, PerGroupSchedulerWr
 from src.models.abstracts.abstract_model import BaseModel
 from src.training.modality_dropout import get_modality_dropout_prob, generate_per_sample_blanked_mask
 from src.training.mixup import mixup_batch as _mixup_batch, mixup_loss as _mixup_loss
+from src.training.consistency_loss import kl_consistency_loss as _kl_consistency_loss
 from src.training.sam import SAM, disable_running_stats as _disable_bn_stats, enable_running_stats as _enable_bn_stats
 from src.models.linear_integration.li_net3.class_balanced_bn import (
     convert_to_class_balanced_bn as _convert_to_cbbn,
@@ -61,6 +62,29 @@ from .container import LISequential, LIReLU
 from .pooling import LIMaxPool2d, LIAdaptiveAvgPool2d
 from .heads import LinearHead, MaxoutHead
 # Note: LINet doesn't use fusion - it uses the integrated stream directly
+
+
+class _StripSecondView(torch.utils.data.Dataset):
+    """Wrap a (Subset of a) two-view dataset so it yields single-view 3-tuples.
+
+    The two-view dataset returns ``(rgb_a, depth_a, rgb_b, depth_b, label)``
+    when ``return_two_views=True``. Stream-monitoring evaluation expects the
+    single-view ``(rgb, depth, label)`` shape, so we project to view A.
+    Single-view items pass through untouched.
+    """
+
+    def __init__(self, base: torch.utils.data.Dataset):
+        self.base = base
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx):
+        item = self.base[idx]
+        if len(item) == 5:
+            # (rgb_a, depth_a, rgb_b, depth_b, label) -> (rgb_a, depth_a, label)
+            return item[0], item[1], item[4]
+        return item
 
 
 class LINet(BaseModel):
@@ -885,6 +909,17 @@ class LINet(BaseModel):
         # AdaBN exploits at inference, but without the majority-class regression.
         # Per-stream pathways and eval-mode behavior are unchanged.
         use_class_balanced_bn: bool = False,
+        # KL consistency regularization (two-view): forces the model to predict
+        # the same softmax distribution for two stochastically-augmented views
+        # of the same raw sample. Requires the train_loader's dataset to be
+        # constructed with return_two_views=True (yields 5-tuples). Total loss
+        # becomes CE(view_a) + consistency_weight * KL_sym(view_a, view_b).
+        # Under mixup, applies SYMMETRIC mixup with shared λ + permutation
+        # across both views (otherwise mixup's regularization fights KL).
+        # Validation path is unaffected (single-view, no KL).
+        use_consistency: bool = False,
+        consistency_weight: float = 1.0,
+        consistency_temperature: float = 1.0,
     ) -> dict:
         """
         Train the model with optional early stopping.
@@ -948,6 +983,17 @@ class LINet(BaseModel):
         if self.optimizer is None or self.criterion is None:
             raise ValueError("Model not compiled. Call compile() before fit().")
 
+        # KL consistency × CBBN: hard-incompatible. CBBN stashes labels of size
+        # B for the integrated-BN forward; consistency stacks views to 2B per
+        # forward, so the stashed labels would mismatch the batch dim. Disable
+        # one or the other.
+        if use_consistency and use_class_balanced_bn:
+            raise ValueError(
+                "use_consistency=True is incompatible with use_class_balanced_bn=True. "
+                "CBBN stashes labels of size B, but consistency requires a stacked 2B "
+                "forward. Disable one of the two flags."
+            )
+
         # Validate GPU augmentation configuration matches dataset
         self._validate_augmentation_config(train_loader, verbose)
 
@@ -972,12 +1018,16 @@ class LINet(BaseModel):
         stream_train_eval_loader = None
         stream_val_eval_loader = None
         if stream_monitoring:
-            # Always create a training subset for stream evaluation
+            # Always create a training subset for stream evaluation. When
+            # use_consistency=True the train dataset returns 5-tuples; the
+            # stream-eval pipeline expects 3-tuples, so wrap the Subset to
+            # project to view A. _StripSecondView passes 3-tuples through
+            # unchanged so this is safe regardless of the consistency flag.
             dataset = train_loader.dataset
             n_samples = min(stream_eval_samples, len(dataset))
             generator = torch.Generator().manual_seed(42)
             indices = torch.randperm(len(dataset), generator=generator)[:n_samples].tolist()
-            subset = torch.utils.data.Subset(dataset, indices)
+            subset = _StripSecondView(torch.utils.data.Subset(dataset, indices))
             stream_train_eval_loader = DataLoader(
                 subset,
                 batch_size=train_loader.batch_size,
@@ -1032,6 +1082,17 @@ class LINet(BaseModel):
             history['stream_balance_loss'] = []
             if verbose:
                 print(f"Stream balance loss enabled (weight={stream_balance_weight}, layer={stream_balance_layer})")
+
+        # Add consistency loss tracking (if enabled). KL logging is non-optional
+        # so diagnostic plots always have the data when use_consistency=True.
+        if use_consistency:
+            history['consistency_loss'] = []
+            if verbose:
+                print(
+                    f"[Consistency] enabled (weight={consistency_weight}, "
+                    f"temperature={consistency_temperature}). Train dataset must "
+                    f"yield 5-tuples (return_two_views=True)."
+                )
 
         # Add integration weight tracking (if enabled)
         if track_integration_weights:
@@ -1142,6 +1203,9 @@ class LINet(BaseModel):
                 sam_optimizer=sam_optimizer,
                 diversity_loss_weight=diversity_loss_weight,
                 use_class_balanced_bn=use_class_balanced_bn,
+                use_consistency=use_consistency,
+                consistency_weight=consistency_weight,
+                consistency_temperature=consistency_temperature,
             )
 
             # Validation phase
@@ -1663,7 +1727,10 @@ class LINet(BaseModel):
                      mixup_alpha: float = 0.2,
                      sam_optimizer: Optional[object] = None,
                      diversity_loss_weight: float = 0.0,
-                     use_class_balanced_bn: bool = False) -> tuple:
+                     use_class_balanced_bn: bool = False,
+                     use_consistency: bool = False,
+                     consistency_weight: float = 1.0,
+                     consistency_temperature: float = 1.0) -> tuple:
         """
         Train the model for one epoch with GPU optimizations and gradient accumulation.
 
@@ -1694,6 +1761,10 @@ class LINet(BaseModel):
         if use_balance_loss:
             self._enable_balance_capture(stream_balance_layer)
 
+        # Consistency (KL) loss tracking
+        consistency_loss_accum = 0.0
+        consistency_loss_count = 0
+
         # Modality dropout statistics tracking (epoch-level accumulators)
         dropout_stats = {
             'total_samples': 0,
@@ -1708,24 +1779,54 @@ class LINet(BaseModel):
         update_frequency = max(1, len(train_loader) // 50)  # Update only 50 times per epoch
 
         for batch_idx, batch_data in enumerate(train_loader):
-            # Unpack N streams + targets from tuple format
-            # DataLoader returns: (stream1, stream2, ..., streamN, labels)
-            *stream_batches, targets = batch_data
+            # ============ Unpack ============
+            # Single-view loader yields (stream1, ..., streamN, labels).
+            # Two-view loader (return_two_views=True) yields
+            # (stream1_a, ..., streamN_a, stream1_b, ..., streamN_b, labels).
+            if use_consistency:
+                *all_streams, targets = batch_data
+                if len(all_streams) != 2 * self.num_streams:
+                    raise RuntimeError(
+                        f"use_consistency=True expected 2*num_streams="
+                        f"{2 * self.num_streams} stream tensors per batch, got "
+                        f"{len(all_streams)}. Did you forget return_two_views=True "
+                        f"on the train dataset?"
+                    )
+                view_a = [s.to(self.device, non_blocking=True) for s in all_streams[:self.num_streams]]
+                view_b = [s.to(self.device, non_blocking=True) for s in all_streams[self.num_streams:]]
+                targets = targets.to(self.device, non_blocking=True)
+                B = targets.shape[0]
+                # stream_batches alias for downstream code that doesn't care
+                # about the two-view distinction (only view A is the "primary"
+                # view used for CE / accuracy bookkeeping).
+                stream_batches = view_a
+            else:
+                *stream_batches, targets = batch_data
+                stream_batches = [batch.to(self.device, non_blocking=True) for batch in stream_batches]
+                targets = targets.to(self.device, non_blocking=True)
+                view_a = None
+                view_b = None
+                B = targets.shape[0]
 
-            # GPU optimization: non-blocking transfer for all streams
-            stream_batches = [batch.to(self.device, non_blocking=True) for batch in stream_batches]
-            targets = targets.to(self.device, non_blocking=True)
-
-            # GPU augmentation (if enabled)
-            # Note: self.gpu_aug.training is True because self.train() was called at start of epoch
-            # Input expected in [0, 1] range when gpu_augmentation=True
+            # ============ GPU augmentation ============
+            # Apply per-view independently when consistency is on so each view
+            # gets independent on-device aug (Kornia's per-image randomness
+            # gives independent draws across the two calls naturally).
             if self.gpu_augmentation and self.gpu_aug is not None:
-                stream_batches[0], stream_batches[1] = self.gpu_aug(
-                    stream_batches[0], stream_batches[1]
-                )
+                if use_consistency:
+                    view_a[0], view_a[1] = self.gpu_aug(view_a[0], view_a[1])
+                    view_b[0], view_b[1] = self.gpu_aug(view_b[0], view_b[1])
+                    stream_batches = view_a
+                else:
+                    stream_batches[0], stream_batches[1] = self.gpu_aug(
+                        stream_batches[0], stream_batches[1]
+                    )
 
-            # Generate per-sample blanked mask for modality dropout
+            # ============ Modality-dropout mask ============
+            # Generate ONCE at size B (shared across views — we want the model
+            # to be invariant to augmentation, not to modality presence).
             blanked_mask = None
+            blanked_mask_2B = None
             if modality_dropout_prob > 0:
                 blanked_mask = generate_per_sample_blanked_mask(
                     batch_size=targets.shape[0],
@@ -1743,20 +1844,62 @@ class LINet(BaseModel):
                         dropout_stats['blanked_per_stream'][i] += blanked_count
                         dropout_stats['total_blanked'] += blanked_count
 
+                # When forwarding the stacked 2B batch under consistency, we
+                # need the mask replicated so view A and view B see the same
+                # per-sample blanking pattern.
+                if use_consistency and blanked_mask is not None:
+                    blanked_mask_2B = {
+                        k: torch.cat([v, v], dim=0) for k, v in blanked_mask.items()
+                    }
+
                 # Per-batch dropout stats are added to pbar postfix below
 
-            # MixUp (optional) — mix batch ONCE before any forward pass so the same
-            # mixed batch is used for SAM's two passes if SAM is also active.
+            # ============ MixUp ============
+            # Mix batch ONCE before any forward pass so the same mixed batch is
+            # used for SAM's two passes if SAM is also active.
+            #
+            # Under consistency: SYMMETRIC mixup — sample lam and perm ONCE,
+            # apply to BOTH views. View A and view B then become augmented
+            # blends of the same (i, j) sample pair with the same coefficient,
+            # so KL between them is coherent with mixup's soft-label CE.
+            # (View-A-only mixup destroys mixup's regularization: CE pulls
+            # logits_a toward the soft target while KL pulls it toward the
+            # sharp logits_b on the un-mixed sample.)
             if use_mixup and mixup_alpha > 0:
-                stream_batches, _mixup_labels_a, _mixup_labels_b, _mixup_lam = _mixup_batch(
-                    stream_batches, targets, mixup_alpha
-                )
+                if use_consistency:
+                    lam_shared = float(np.random.beta(mixup_alpha, mixup_alpha))
+                    perm_shared = torch.randperm(B, device=self.device)
+                    view_a, _mixup_labels_a, _mixup_labels_b, _mixup_lam = _mixup_batch(
+                        view_a, targets, mixup_alpha,
+                        lam=lam_shared, perm=perm_shared,
+                    )
+                    view_b, _, _, _ = _mixup_batch(
+                        view_b, targets, mixup_alpha,
+                        lam=lam_shared, perm=perm_shared,
+                    )
+                    stream_batches = view_a
+                else:
+                    stream_batches, _mixup_labels_a, _mixup_labels_b, _mixup_lam = _mixup_batch(
+                        stream_batches, targets, mixup_alpha
+                    )
                 _mixup_active = True
             else:
                 _mixup_labels_a = targets
                 _mixup_labels_b = None
                 _mixup_lam = 1.0
                 _mixup_active = False
+
+            # ============ Build forward inputs ============
+            # Under consistency, stack the two views along the batch dim so a
+            # single forward pass computes both logits_a and logits_b.
+            if use_consistency:
+                forward_input = [
+                    torch.cat([va, vb], dim=0) for va, vb in zip(view_a, view_b)
+                ]
+                forward_mask = blanked_mask_2B
+            else:
+                forward_input = stream_batches
+                forward_mask = blanked_mask
 
             # CBBN: labels to stash for class-balanced integrated BN. Under
             # mixup, each input row is a blend of two classes (labels_a and
@@ -1781,7 +1924,12 @@ class LINet(BaseModel):
                 # ===== SAM branch (fp32; two forward+backward passes) =====
                 # First forward + backward at current weights w.
                 with _stash_labels(_cbbn_labels):
-                    outputs_first = self(stream_batches, blanked_mask=blanked_mask)
+                    outputs_first_stacked = self(forward_input, blanked_mask=forward_mask)
+                if use_consistency:
+                    outputs_first = outputs_first_stacked[:B]
+                    logits_b_first = outputs_first_stacked[B:]
+                else:
+                    outputs_first = outputs_first_stacked
                 if _mixup_active:
                     loss_first = _mixup_loss(self.criterion, outputs_first,
                                              _mixup_labels_a, _mixup_labels_b, _mixup_lam)
@@ -1795,6 +1943,14 @@ class LINet(BaseModel):
                 # No-op (returns 0 tensor) for LinearHead or when weight==0.
                 if diversity_loss_weight > 0.0:
                     loss_first = loss_first + self.fc.diversity_loss(weight=diversity_loss_weight)
+                # KL consistency — added to BOTH passes so SAM's perturbation
+                # direction reflects the regularized landscape.
+                if use_consistency and consistency_weight > 0.0:
+                    kl_first = _kl_consistency_loss(
+                        outputs_first, logits_b_first,
+                        temperature=consistency_temperature,
+                    )
+                    loss_first = loss_first + consistency_weight * kl_first
                 loss_first.backward()
                 sam_optimizer.first_step(zero_grad=True)
 
@@ -1803,7 +1959,12 @@ class LINet(BaseModel):
                 _disable_bn_stats(self)
                 try:
                     with _stash_labels(_cbbn_labels):
-                        outputs = self(stream_batches, blanked_mask=blanked_mask)
+                        outputs_stacked = self(forward_input, blanked_mask=forward_mask)
+                    if use_consistency:
+                        outputs = outputs_stacked[:B]
+                        logits_b = outputs_stacked[B:]
+                    else:
+                        outputs = outputs_stacked
                     if _mixup_active:
                         loss = _mixup_loss(self.criterion, outputs,
                                            _mixup_labels_a, _mixup_labels_b, _mixup_lam)
@@ -1816,6 +1977,14 @@ class LINet(BaseModel):
                         balance_loss_count += 1
                     if diversity_loss_weight > 0.0:
                         loss = loss + self.fc.diversity_loss(weight=diversity_loss_weight)
+                    if use_consistency and consistency_weight > 0.0:
+                        kl_loss = _kl_consistency_loss(
+                            outputs, logits_b,
+                            temperature=consistency_temperature,
+                        )
+                        loss = loss + consistency_weight * kl_loss
+                        consistency_loss_accum += kl_loss.item()
+                        consistency_loss_count += 1
                     loss.backward()
 
                     # Gradient health monitoring on second-pass (actually-applied) grads
@@ -1843,7 +2012,12 @@ class LINet(BaseModel):
             elif self.use_amp:
                 # Use automatic mixed precision
                 with autocast(device_type=self.device.type), _stash_labels(_cbbn_labels):
-                    outputs = self(stream_batches, blanked_mask=blanked_mask)
+                    outputs_stacked = self(forward_input, blanked_mask=forward_mask)
+                    if use_consistency:
+                        outputs = outputs_stacked[:B]
+                        logits_b = outputs_stacked[B:]
+                    else:
+                        outputs = outputs_stacked
                     if _mixup_active:
                         loss = _mixup_loss(self.criterion, outputs,
                                            _mixup_labels_a, _mixup_labels_b, _mixup_lam)
@@ -1860,6 +2034,16 @@ class LINet(BaseModel):
                 # Classifier-head diversity regularizer (fp32; no-op for LinearHead or weight==0)
                 if diversity_loss_weight > 0.0:
                     loss = loss + self.fc.diversity_loss(weight=diversity_loss_weight)
+
+                # KL consistency (fp32; the loss self-disables autocast internally)
+                if use_consistency and consistency_weight > 0.0:
+                    kl_loss = _kl_consistency_loss(
+                        outputs, logits_b,
+                        temperature=consistency_temperature,
+                    )
+                    loss = loss + consistency_weight * kl_loss
+                    consistency_loss_accum += kl_loss.item()
+                    consistency_loss_count += 1
 
                 # Scale loss for gradient accumulation
                 if gradient_accumulation_steps > 1:
@@ -1901,7 +2085,12 @@ class LINet(BaseModel):
             else:
                 # Standard precision training
                 with _stash_labels(_cbbn_labels):
-                    outputs = self(stream_batches, blanked_mask=blanked_mask)
+                    outputs_stacked = self(forward_input, blanked_mask=forward_mask)
+                if use_consistency:
+                    outputs = outputs_stacked[:B]
+                    logits_b = outputs_stacked[B:]
+                else:
+                    outputs = outputs_stacked
                 if _mixup_active:
                     loss = _mixup_loss(self.criterion, outputs,
                                        _mixup_labels_a, _mixup_labels_b, _mixup_lam)
@@ -1918,6 +2107,16 @@ class LINet(BaseModel):
                 # Classifier-head diversity regularizer (no-op for LinearHead or weight==0)
                 if diversity_loss_weight > 0.0:
                     loss = loss + self.fc.diversity_loss(weight=diversity_loss_weight)
+
+                # KL consistency
+                if use_consistency and consistency_weight > 0.0:
+                    kl_loss = _kl_consistency_loss(
+                        outputs, logits_b,
+                        temperature=consistency_temperature,
+                    )
+                    loss = loss + consistency_weight * kl_loss
+                    consistency_loss_accum += kl_loss.item()
+                    consistency_loss_count += 1
 
                 # Scale loss for gradient accumulation
                 if gradient_accumulation_steps > 1:
@@ -2065,6 +2264,16 @@ class LINet(BaseModel):
                 if 'stream_balance_loss' not in history:
                     history['stream_balance_loss'] = []
                 history['stream_balance_loss'].append(avg_balance)
+
+        # KL consistency loss: record epoch mean (always, when use_consistency=True)
+        if use_consistency:
+            avg_consistency = (
+                consistency_loss_accum / consistency_loss_count
+                if consistency_loss_count > 0 else 0.0
+            )
+            if 'consistency_loss' not in history:
+                history['consistency_loss'] = []
+            history['consistency_loss'].append(avg_consistency)
 
         # Optional: Clear CUDA cache at end of epoch (only if experiencing OOM issues)
         # if clear_cache_per_epoch and self.device.type == 'cuda':

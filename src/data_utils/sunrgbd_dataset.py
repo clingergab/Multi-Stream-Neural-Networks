@@ -137,6 +137,7 @@ class SUNRGBDDataset(Dataset):
         rgb_aug_mag: float = 1.0,
         depth_aug_prob: float = 1.0,
         depth_aug_mag: float = 1.0,
+        return_two_views: bool = False,
     ):
         """
         Args:
@@ -150,14 +151,25 @@ class SUNRGBDDataset(Dataset):
             rgb_aug_mag: Scales magnitude of RGB augmentations (default: 1.0 = baseline)
             depth_aug_prob: Scales probability of Depth augmentations (default: 1.0 = baseline)
             depth_aug_mag: Scales magnitude of Depth augmentations (default: 1.0 = baseline)
+            return_two_views: If True, __getitem__ returns a 5-tuple
+                ``(rgb_a, depth_a, rgb_b, depth_b, label)`` where the two views
+                are produced by independent stochastic-augmentation calls on
+                the same raw image. Used by KL consistency training. Only
+                valid for ``split='train'`` — raises ValueError otherwise.
         """
         if split not in self.VALID_SPLITS:
             raise ValueError(f"split must be one of {self.VALID_SPLITS}, got '{split}'")
+        if return_two_views and split != 'train':
+            raise ValueError(
+                f"return_two_views=True is only valid for split='train' "
+                f"(got split='{split}'). Val/test must use single-view evaluation."
+            )
 
         self.data_root = data_root
         self.split = split
         self.crop_size = crop_size
         self.normalize = normalize
+        self.return_two_views = return_two_views
 
         # Load class names dynamically from data root
         self.CLASS_NAMES = _load_class_names(data_root)
@@ -352,167 +364,165 @@ class SUNRGBDDataset(Dataset):
 
         return rgb, depth
 
-    def __getitem__(self, idx):
+    def _load_raw(self, idx):
+        """Phase 1 (deterministic) — load uint8 RGB ``[3, H, W]`` and float32
+        depth ``[1, H, W]`` in meters from disk/mmap. No augmentation.
+
+        Returns: (rgb_uint8, depth_float_meters)
+
+        Note: ``self.rgb_tensors[idx]`` returns an mmap-backed view. Standard
+        torchvision v2 ops (flip, crop, color jitter) return new tensors and
+        do not mutate the mmap, so the single-view path is safe. The
+        two-view path explicitly clones in ``__getitem__`` before each
+        augmentation pipeline call to defend against in-place ops in
+        ``_apply_depth_aug``.
         """
-        Returns:
-            rgb: RGB image tensor [3, crop_size, crop_size] float32
-            depth: Depth image tensor [1, crop_size, crop_size] float32
-            label: Class label (0 to num_classes-1)
-        """
-        # Load images as uint8 tensors (no PIL conversion)
         if self.use_tensors:
             rgb, depth = self._load_images_tensor(idx)
         else:
             rgb, depth = self._load_images_png(idx)
-
-        # At this point: rgb [3, H, W] uint8, depth [1, H, W] uint16 (mm)
-
-        # Convert depth early: uint16 mm -> float32 meters
-        # (PyTorch uint16 has limited op support — flip, crop, etc. fail on it)
+        # Convert depth early: uint16 mm -> float32 meters (uint16 has limited
+        # op support — flip/crop/etc. fail on it). The .float() creates a new
+        # tensor so depth no longer aliases the mmap.
         depth = depth.float() / 1000.0
+        return rgb, depth
 
-        # ==================== TRAINING AUGMENTATION ====================
-        if self.split == 'train':
-            # 1. Synchronized Random Horizontal Flip
-            if np.random.random() < self._flip_p:
-                rgb = F2.horizontal_flip(rgb)
-                depth = F2.horizontal_flip(depth)
+    def _apply_spatial_aug(self, rgb, depth):
+        """Phase 2 (stochastic, train-only) — synchronized horizontal flip and
+        synchronized RandomCrop ``256 -> crop_size``. Same flip + crop coords
+        applied to RGB and depth within a single call; independent ACROSS
+        calls (each two-view invocation issues two calls)."""
+        if np.random.random() < self._flip_p:
+            rgb = F2.horizontal_flip(rgb)
+            depth = F2.horizontal_flip(depth)
 
-            # 2. Synchronized RandomCrop (256 -> crop_size)
-            i, j, h, w = v2.RandomCrop.get_params(
-                rgb, output_size=(self.crop_size, self.crop_size)
+        i, j, h, w = v2.RandomCrop.get_params(
+            rgb, output_size=(self.crop_size, self.crop_size)
+        )
+        rgb = F2.crop(rgb, i, j, h, w)
+        depth = F2.crop(depth, i, j, h, w)
+        return rgb, depth
+
+    def _apply_rgb_aug(self, rgb):
+        """Phase 3 (stochastic, train-only) — color jitter + gaussian blur +
+        grayscale on uint8 RGB. Caller must gate on ``self.normalize`` (this
+        block is skipped in GPU-augmentation mode where Kornia runs equivalent
+        ops on-device)."""
+        if np.random.random() < self._color_jitter_p:
+            rgb = self._color_jitter_transform(rgb)
+
+        if np.random.random() < self._blur_p:
+            kernel_size = int(np.random.choice([3, 5, 7]))
+            sigma = float(np.random.uniform(self._blur_sigma_min, self._blur_sigma_max))
+            rgb = F2.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
+
+        if np.random.random() < self._grayscale_p:
+            rgb = F2.rgb_to_grayscale(rgb, num_output_channels=3)
+        return rgb
+
+    def _apply_depth_aug(self, depth):
+        """Phase 4 (stochastic, train-only) — Tier A (brightness/contrast/
+        noise) and Tier B (scale jitter, blur, hole dropout). Mask-aware:
+        preserves sentinel zeros (depth == 0.0) for downstream replacement.
+
+        Mutates ``depth`` in-place via ``depth[...] = ...`` and ``depth[mask]
+        = ...`` indexing. The two-view caller MUST clone before passing in
+        the second view's tensor.
+        """
+        # 6. Tier A — combined appearance augmentation
+        if np.random.random() < self._depth_aug_p:
+            depth_missing_mask = (depth == 0.0)
+            valid_mask = ~depth_missing_mask
+            if valid_mask.any():
+                d_min = depth[valid_mask].min()
+                d_max = depth[valid_mask].max()
+            else:
+                d_min = depth.min()
+                d_max = depth.max()
+            d_range = d_max - d_min
+            depth_01 = torch.zeros_like(depth)
+            if d_range > 1e-6:
+                depth_01[valid_mask] = (depth[valid_mask] - d_min) / d_range
+
+            brightness_factor = np.random.uniform(
+                1.0 - self._depth_brightness,
+                1.0 + self._depth_brightness,
             )
-            rgb = F2.crop(rgb, i, j, h, w)
-            depth = F2.crop(depth, i, j, h, w)
+            contrast_factor = np.random.uniform(
+                1.0 - self._depth_contrast,
+                1.0 + self._depth_contrast,
+            )
 
-            # 3-5. RGB-Only Appearance Augmentation
-            # Skip when normalize=False (GPU augmentation mode handles these)
-            if self.normalize:
-                # 3. Color Jitter (pre-created instance, operates on uint8)
-                if np.random.random() < self._color_jitter_p:
-                    rgb = self._color_jitter_transform(rgb)
+            depth_01 = (depth_01 - 0.5) * contrast_factor + 0.5
+            depth_01 = depth_01 * brightness_factor
+            depth_01 = depth_01 + torch.randn_like(depth_01) * self._depth_noise_std
 
-                # 4. Gaussian Blur
-                if np.random.random() < self._blur_p:
-                    kernel_size = int(np.random.choice([3, 5, 7]))
-                    sigma = float(np.random.uniform(self._blur_sigma_min, self._blur_sigma_max))
-                    rgb = F2.gaussian_blur(rgb, kernel_size=kernel_size, sigma=sigma)
+            if d_range > 1e-6:
+                depth[valid_mask] = depth_01[valid_mask].clamp(0.0, 1.0) * d_range + d_min
 
-                # 5. Grayscale
-                if np.random.random() < self._grayscale_p:
-                    rgb = F2.rgb_to_grayscale(rgb, num_output_channels=3)
+            if depth_missing_mask.any():
+                depth[depth_missing_mask] = 0.0
 
-            # 6. Depth-Only: Combined Appearance Augmentation
-            if np.random.random() < self._depth_aug_p:
-                # Capture missing-data mask BEFORE augmentation so noise
-                # doesn't corrupt sentinel pixels (0.0 = missing in SUN RGB-D)
-                depth_missing_mask = (depth == 0.0)
+        # 6b. Tier B — multiplicative scale jitter (calibration drift sim).
+        # Missing pixels (=0) survive because 0*scale = 0.
+        if self._depth_scale_halfwidth > 0 and np.random.random() < self._depth_scale_jitter_p:
+            scale = float(np.random.uniform(
+                1.0 - self._depth_scale_halfwidth,
+                1.0 + self._depth_scale_halfwidth,
+            ))
+            depth = depth * scale
 
-                # Normalize valid pixels to [0,1] for augmentation
-                # Exclude missing pixels (0.0) from min/max to avoid compressing
-                # the augmentation range (matches scannet_pretrain_dataset.py)
-                valid_mask = ~depth_missing_mask
-                if valid_mask.any():
-                    d_min = depth[valid_mask].min()
-                    d_max = depth[valid_mask].max()
-                else:
-                    d_min = depth.min()
-                    d_max = depth.max()
-                d_range = d_max - d_min
-                depth_01 = torch.zeros_like(depth)
-                if d_range > 1e-6:
-                    depth_01[valid_mask] = (depth[valid_mask] - d_min) / d_range
+        # 6c. Tier B — gaussian blur (sensor sharpness drift sim). Mask-aware:
+        # re-zero originally-missing pixels after blur.
+        if self._depth_blur_sigma_max > 0 and np.random.random() < self._depth_blur_p:
+            kernel_size = int(np.random.choice([3, 5, 7]))
+            sigma = float(np.random.uniform(
+                self._depth_blur_sigma_min,
+                self._depth_blur_sigma_max,
+            ))
+            depth_missing_mask = (depth == 0.0)
+            depth = F2.gaussian_blur(depth, kernel_size=kernel_size, sigma=sigma)
+            if depth_missing_mask.any():
+                depth[depth_missing_mask] = 0.0
 
-                brightness_factor = np.random.uniform(
-                    1.0 - self._depth_brightness,
-                    1.0 + self._depth_brightness,
-                )
-                contrast_factor = np.random.uniform(
-                    1.0 - self._depth_contrast,
-                    1.0 + self._depth_contrast,
-                )
-
-                # Apply contrast then brightness (same order as ColorJitter)
-                depth_01 = (depth_01 - 0.5) * contrast_factor + 0.5
-                depth_01 = depth_01 * brightness_factor
-
-                # Add Gaussian noise
-                depth_01 = depth_01 + torch.randn_like(depth_01) * self._depth_noise_std
-
-                # Map back to meters (only valid pixels; missing stay at 0.0)
-                if d_range > 1e-6:
-                    depth[valid_mask] = depth_01[valid_mask].clamp(0.0, 1.0) * d_range + d_min
-
-                # Restore sentinel pixels to 0.0 so downstream replacement works
-                if depth_missing_mask.any():
-                    depth[depth_missing_mask] = 0.0
-
-            # 6b. Depth-Only: Multiplicative scale jitter (calibration drift sim)
-            # Multiplies valid depth values by U(1-h, 1+h). Missing pixels (=0)
-            # are unchanged because 0*scale=0; no explicit mask needed.
-            if self._depth_scale_halfwidth > 0 and np.random.random() < self._depth_scale_jitter_p:
-                scale = float(np.random.uniform(
-                    1.0 - self._depth_scale_halfwidth,
-                    1.0 + self._depth_scale_halfwidth,
+        # 6d. Tier B — hole dropout (sensor missing-data pattern sim). Zero is
+        # the SUN RGB-D sentinel for missing depth, so dropouts go through the
+        # downstream sentinel-replacement path with natural holes.
+        if self._hole_dropout_num_max >= self._hole_dropout_num_min and \
+           np.random.random() < self._hole_dropout_p:
+            _H, _W = depth.shape[-2], depth.shape[-1]
+            n_holes = int(np.random.randint(
+                self._hole_dropout_num_min,
+                self._hole_dropout_num_max + 1,
+            ))
+            for _ in range(n_holes):
+                h = int(np.random.randint(
+                    self._hole_dropout_size_min,
+                    self._hole_dropout_size_max + 1,
                 ))
-                depth = depth * scale
-
-            # 6c. Depth-Only: Gaussian blur (sensor sharpness drift sim)
-            # Mask-aware: blur the depth tensor, then re-zero originally-missing
-            # pixels so they remain sentinels for downstream replacement.
-            if self._depth_blur_sigma_max > 0 and np.random.random() < self._depth_blur_p:
-                kernel_size = int(np.random.choice([3, 5, 7]))
-                sigma = float(np.random.uniform(
-                    self._depth_blur_sigma_min,
-                    self._depth_blur_sigma_max,
+                w = int(np.random.randint(
+                    self._hole_dropout_size_min,
+                    self._hole_dropout_size_max + 1,
                 ))
-                depth_missing_mask = (depth == 0.0)
-                depth = F2.gaussian_blur(depth, kernel_size=kernel_size, sigma=sigma)
-                if depth_missing_mask.any():
-                    depth[depth_missing_mask] = 0.0
+                i = int(np.random.randint(0, max(1, _H - h)))
+                j = int(np.random.randint(0, max(1, _W - w)))
+                depth[..., i:i + h, j:j + w] = 0.0
 
-            # 6d. Depth-Only: Hole dropout (sensor missing-data pattern sim)
-            # Carves N rectangular zero regions. Zero is the SUN RGB-D sentinel
-            # for missing-depth, so these patches go through the same downstream
-            # path as natural sensor holes (replaced with depth_mean post-norm).
-            if self._hole_dropout_num_max >= self._hole_dropout_num_min and \
-               np.random.random() < self._hole_dropout_p:
-                _H, _W = depth.shape[-2], depth.shape[-1]
-                n_holes = int(np.random.randint(
-                    self._hole_dropout_num_min,
-                    self._hole_dropout_num_max + 1,
-                ))
-                for _ in range(n_holes):
-                    h = int(np.random.randint(
-                        self._hole_dropout_size_min,
-                        self._hole_dropout_size_max + 1,
-                    ))
-                    w = int(np.random.randint(
-                        self._hole_dropout_size_min,
-                        self._hole_dropout_size_max + 1,
-                    ))
-                    i = int(np.random.randint(0, max(1, _H - h)))
-                    j = int(np.random.randint(0, max(1, _W - w)))
-                    depth[..., i:i + h, j:j + w] = 0.0
+        return depth
 
-        else:
-            # Val/Test: CenterCrop (256 -> crop_size)
-            rgb = F2.center_crop(rgb, (self.crop_size, self.crop_size))
-            depth = F2.center_crop(depth, (self.crop_size, self.crop_size))
-
-        # ==================== TO FLOAT32 ====================
+    def _normalize_and_erase(self, rgb, depth):
+        """Phase 5 — uint8→float32, sentinel replacement (depth=0 →
+        depth_mean), and (when ``self.normalize`` is True) normalization +
+        post-normalization random erasing on train. GPU-augmentation mode
+        leaves the un-normalized [0, 1]-range tensors for the GPU pipeline.
+        """
         if rgb.dtype == torch.uint8:
             rgb = rgb.float() / 255.0
 
-        # ==================== SENTINEL REPLACEMENT ====================
-        # Replace depth=0 (missing data) with depth_mean so normalization
-        # maps them to ~0 (neutral). Consistent with ScanNet/Omni pipelines.
         zero_mask = (depth == 0.0)
         if zero_mask.any():
             depth[zero_mask] = self._norm_stats['depth_mean'][0]
 
-        # ==================== NORMALIZATION ====================
-        # When normalize=False (GPU augmentation mode), skip — GPU handles it.
         if self.normalize:
             rgb = F2.normalize(
                 rgb,
@@ -525,16 +535,58 @@ class SUNRGBDDataset(Dataset):
                 std=self._norm_stats['depth_std'],
             )
 
-            # 7. Post-normalization Random Erasing (CPU mode only)
-            # GPU augmentation handles erasing on GPU after normalization
             if self.split == 'train':
                 if np.random.random() < self._rgb_erasing_p:
                     rgb = self._rgb_erasing_transform(rgb)
-
                 if np.random.random() < self._depth_erasing_p:
                     depth = self._depth_erasing_transform(depth)
 
+        return rgb, depth
+
+    def _augment_train_view(self, rgb, depth):
+        """Run the full train pipeline for one view: spatial → (rgb appearance
+        if CPU mode) → depth aug → normalize/erase."""
+        rgb, depth = self._apply_spatial_aug(rgb, depth)
+        if self.normalize:
+            rgb = self._apply_rgb_aug(rgb)
+        depth = self._apply_depth_aug(depth)
+        return self._normalize_and_erase(rgb, depth)
+
+    def _center_crop_view(self, rgb, depth):
+        """Val/test path — deterministic CenterCrop ``256 -> crop_size``."""
+        rgb = F2.center_crop(rgb, (self.crop_size, self.crop_size))
+        depth = F2.center_crop(depth, (self.crop_size, self.crop_size))
+        return rgb, depth
+
+    def __getitem__(self, idx):
+        """
+        Returns (single-view, ``return_two_views=False``):
+            rgb: RGB image tensor [3, crop_size, crop_size] float32
+            depth: Depth image tensor [1, crop_size, crop_size] float32
+            label: Class label (0 to num_classes-1)
+
+        Returns (two-view, ``return_two_views=True``, train split only):
+            rgb_a, depth_a, rgb_b, depth_b, label — two independently-
+            augmented views of the same raw image, for KL consistency.
+        """
+        rgb_raw, depth_raw = self._load_raw(idx)
         label = self.labels[idx]
+
+        if self.split == 'train':
+            if self.return_two_views:
+                # Clone for both views: _apply_depth_aug mutates depth in
+                # place and _apply_spatial_aug returns new tensors but reads
+                # from the input. Cheap (~3-channel uint8 256x256 = 192 KB +
+                # 1-channel float32 depth = 256 KB).
+                rgb_a, depth_a = self._augment_train_view(rgb_raw.clone(), depth_raw.clone())
+                rgb_b, depth_b = self._augment_train_view(rgb_raw.clone(), depth_raw.clone())
+                return rgb_a, depth_a, rgb_b, depth_b, label
+            rgb, depth = self._augment_train_view(rgb_raw, depth_raw)
+            return rgb, depth, label
+
+        # Val/test
+        rgb, depth = self._center_crop_view(rgb_raw, depth_raw)
+        rgb, depth = self._normalize_and_erase(rgb, depth)
         return rgb, depth, label
 
     def get_class_weights(self):

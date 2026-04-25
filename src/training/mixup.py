@@ -30,6 +30,8 @@ def mixup_batch(
     streams: Sequence[torch.Tensor],
     labels: torch.Tensor,
     alpha: float,
+    lam: float | None = None,
+    perm: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor, float]:
     """Apply mixup to a multi-stream batch.
 
@@ -38,9 +40,17 @@ def mixup_batch(
             For LiNet3 this is ``[rgb, depth]`` with shapes ``[B, 3, H, W]``
             and ``[B, 1, H, W]``.
         labels: Class labels of shape ``[B]`` (int64).
-        alpha: Beta distribution parameter. If ``<= 0``, no mixup is applied
-            (returns inputs unchanged with ``lam = 1.0`` and ``labels_b =
-            labels``).
+        alpha: Beta distribution parameter. If ``<= 0`` and no explicit
+            ``lam`` is provided, no mixup is applied (returns inputs unchanged
+            with ``lam = 1.0`` and ``labels_b = labels``).
+        lam: Optional pre-sampled mixing coefficient. When provided, used
+            verbatim instead of drawing fresh from ``Beta(alpha, alpha)``.
+            Enables sharing the same blend coefficient across multiple calls
+            (e.g. symmetric two-view mixup for KL consistency training).
+        perm: Optional pre-sampled permutation tensor of shape ``[B]``. When
+            provided, used verbatim instead of drawing fresh via
+            ``torch.randperm``. Pair with ``lam`` to apply identical mixing
+            to two parallel batches.
 
     Returns:
         mixed_streams: List of N tensors, each equal to
@@ -50,17 +60,19 @@ def mixup_batch(
         labels_b: Permuted labels (``labels[perm]``).
         lam: The mixing coefficient ``λ ∈ [0, 1]``.
     """
-    if alpha <= 0:
+    if alpha <= 0 and lam is None:
         # Mixup disabled — pass through unchanged
         return list(streams), labels, labels, 1.0
 
     batch_size = streams[0].shape[0]
     device = streams[0].device
 
-    # Draw lam; draw on CPU to avoid device-specific numpy/cuda interaction
-    lam = float(np.random.beta(alpha, alpha))
+    if lam is None:
+        # Draw lam; draw on CPU to avoid device-specific numpy/cuda interaction
+        lam = float(np.random.beta(alpha, alpha))
 
-    perm = torch.randperm(batch_size, device=device)
+    if perm is None:
+        perm = torch.randperm(batch_size, device=device)
 
     mixed_streams = [lam * s + (1.0 - lam) * s[perm] for s in streams]
     labels_a = labels
