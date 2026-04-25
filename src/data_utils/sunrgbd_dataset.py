@@ -30,6 +30,8 @@ from src.training.augmentation_config import (
     BASE_RGB_ERASING_P,
     BASE_DEPTH_AUG_P,
     BASE_DEPTH_ERASING_P,
+    BASE_DEPTH_SCALE_JITTER_P,
+    BASE_HOLE_DROPOUT_P,
     # Magnitude baselines
     BASE_BRIGHTNESS,
     BASE_CONTRAST,
@@ -44,6 +46,12 @@ from src.training.augmentation_config import (
     BASE_DEPTH_BRIGHTNESS,
     BASE_DEPTH_CONTRAST,
     BASE_DEPTH_NOISE_STD,
+    BASE_DEPTH_SCALE_MIN,
+    BASE_DEPTH_SCALE_MAX,
+    BASE_HOLE_DROPOUT_NUM_MIN,
+    BASE_HOLE_DROPOUT_NUM_MAX,
+    BASE_HOLE_DROPOUT_SIZE_MIN,
+    BASE_HOLE_DROPOUT_SIZE_MAX,
     # Caps
     MAX_PROBABILITY,
     MAX_BRIGHTNESS,
@@ -55,6 +63,9 @@ from src.training.augmentation_config import (
     MAX_DEPTH_CONTRAST,
     MAX_DEPTH_NOISE_STD,
     MAX_ERASING_SCALE,
+    MAX_DEPTH_SCALE_HALFWIDTH,
+    MAX_HOLE_DROPOUT_NUM,
+    MAX_HOLE_DROPOUT_SIZE,
 )
 
 
@@ -241,6 +252,37 @@ class SUNRGBDDataset(Dataset):
         self._depth_erasing_scale_min = BASE_ERASING_SCALE_MIN
         self._depth_erasing_scale_max = min(BASE_ERASING_SCALE_MAX * self.depth_aug_mag, MAX_ERASING_SCALE)
 
+        # === DEPTH-ONLY (Tier B sensor-invariance ops; targets per-sensor drift) ===
+        # Depth gaussian blur — analogous to the RGB blur path. Sigma scales with
+        # depth_aug_mag so sensor noise is simulated at higher intensities.
+        self._depth_blur_p = min(BASE_BLUR_P * self.depth_aug_prob, MAX_PROBABILITY)
+        self._depth_blur_sigma_min = BASE_BLUR_SIGMA_MIN
+        self._depth_blur_sigma_max = min(BASE_BLUR_SIGMA_MAX * self.depth_aug_mag, MAX_BLUR_SIGMA)
+
+        # Depth value-scale jitter — multiply valid depth by (1 ± halfwidth).
+        # Simulates per-sensor calibration differences in absolute distance values.
+        # Halfwidth derived from BASE_DEPTH_SCALE_MIN/MAX (default ±0.10), scaled by mag.
+        _base_scale_halfwidth = (BASE_DEPTH_SCALE_MAX - BASE_DEPTH_SCALE_MIN) / 2.0
+        self._depth_scale_jitter_p = min(
+            BASE_DEPTH_SCALE_JITTER_P * self.depth_aug_prob, MAX_PROBABILITY
+        )
+        self._depth_scale_halfwidth = min(
+            _base_scale_halfwidth * self.depth_aug_mag, MAX_DEPTH_SCALE_HALFWIDTH
+        )
+
+        # Hole dropout — N rectangular zero patches simulating sensor missing-data
+        # patterns. Pixel value 0 is the SUN RGB-D sentinel for "no measurement"
+        # and gets replaced by depth_mean in the sentinel-replacement step.
+        self._hole_dropout_p = min(BASE_HOLE_DROPOUT_P * self.depth_aug_prob, MAX_PROBABILITY)
+        self._hole_dropout_num_min = BASE_HOLE_DROPOUT_NUM_MIN
+        self._hole_dropout_num_max = min(
+            int(BASE_HOLE_DROPOUT_NUM_MAX * self.depth_aug_mag), MAX_HOLE_DROPOUT_NUM
+        )
+        self._hole_dropout_size_min = BASE_HOLE_DROPOUT_SIZE_MIN
+        self._hole_dropout_size_max = min(
+            int(BASE_HOLE_DROPOUT_SIZE_MAX * self.depth_aug_mag), MAX_HOLE_DROPOUT_SIZE
+        )
+
         # === PRE-CREATE REUSABLE TRANSFORM INSTANCES ===
         # Avoids constructing new instances per __getitem__ call
         self._color_jitter_transform = v2.ColorJitter(
@@ -276,6 +318,15 @@ class SUNRGBDDataset(Dataset):
         print(f"    [Depth] Brightness: ±{BASE_DEPTH_BRIGHTNESS:.2f} -> ±{self._depth_brightness:.3f}")
         print(f"    [Depth] Noise std: {BASE_DEPTH_NOISE_STD:.3f} -> {self._depth_noise_std:.3f}")
         print(f"    [Depth] Erasing prob: {BASE_DEPTH_ERASING_P:.2f} -> {self._depth_erasing_p:.3f}")
+        # Tier B sensor-invariance ops
+        print(f"    [Depth] Blur prob: {BASE_BLUR_P:.2f} -> {self._depth_blur_p:.3f}, "
+              f"sigma_max: {BASE_BLUR_SIGMA_MAX:.2f} -> {self._depth_blur_sigma_max:.3f}")
+        print(f"    [Depth] Scale jitter prob: {BASE_DEPTH_SCALE_JITTER_P:.2f} -> "
+              f"{self._depth_scale_jitter_p:.3f}, halfwidth: ±{self._depth_scale_halfwidth:.3f}")
+        print(f"    [Depth] Hole dropout prob: {BASE_HOLE_DROPOUT_P:.2f} -> "
+              f"{self._hole_dropout_p:.3f}, num: [{self._hole_dropout_num_min}, "
+              f"{self._hole_dropout_num_max}], size: [{self._hole_dropout_size_min}, "
+              f"{self._hole_dropout_size_max}] px")
 
     def _load_images_tensor(self, idx):
         """Load pre-resized images from tensor files."""
@@ -395,6 +446,54 @@ class SUNRGBDDataset(Dataset):
                 # Restore sentinel pixels to 0.0 so downstream replacement works
                 if depth_missing_mask.any():
                     depth[depth_missing_mask] = 0.0
+
+            # 6b. Depth-Only: Multiplicative scale jitter (calibration drift sim)
+            # Multiplies valid depth values by U(1-h, 1+h). Missing pixels (=0)
+            # are unchanged because 0*scale=0; no explicit mask needed.
+            if self._depth_scale_halfwidth > 0 and np.random.random() < self._depth_scale_jitter_p:
+                scale = float(np.random.uniform(
+                    1.0 - self._depth_scale_halfwidth,
+                    1.0 + self._depth_scale_halfwidth,
+                ))
+                depth = depth * scale
+
+            # 6c. Depth-Only: Gaussian blur (sensor sharpness drift sim)
+            # Mask-aware: blur the depth tensor, then re-zero originally-missing
+            # pixels so they remain sentinels for downstream replacement.
+            if self._depth_blur_sigma_max > 0 and np.random.random() < self._depth_blur_p:
+                kernel_size = int(np.random.choice([3, 5, 7]))
+                sigma = float(np.random.uniform(
+                    self._depth_blur_sigma_min,
+                    self._depth_blur_sigma_max,
+                ))
+                depth_missing_mask = (depth == 0.0)
+                depth = F2.gaussian_blur(depth, kernel_size=kernel_size, sigma=sigma)
+                if depth_missing_mask.any():
+                    depth[depth_missing_mask] = 0.0
+
+            # 6d. Depth-Only: Hole dropout (sensor missing-data pattern sim)
+            # Carves N rectangular zero regions. Zero is the SUN RGB-D sentinel
+            # for missing-depth, so these patches go through the same downstream
+            # path as natural sensor holes (replaced with depth_mean post-norm).
+            if self._hole_dropout_num_max >= self._hole_dropout_num_min and \
+               np.random.random() < self._hole_dropout_p:
+                _H, _W = depth.shape[-2], depth.shape[-1]
+                n_holes = int(np.random.randint(
+                    self._hole_dropout_num_min,
+                    self._hole_dropout_num_max + 1,
+                ))
+                for _ in range(n_holes):
+                    h = int(np.random.randint(
+                        self._hole_dropout_size_min,
+                        self._hole_dropout_size_max + 1,
+                    ))
+                    w = int(np.random.randint(
+                        self._hole_dropout_size_min,
+                        self._hole_dropout_size_max + 1,
+                    ))
+                    i = int(np.random.randint(0, max(1, _H - h)))
+                    j = int(np.random.randint(0, max(1, _W - w)))
+                    depth[..., i:i + h, j:j + w] = 0.0
 
         else:
             # Val/Test: CenterCrop (256 -> crop_size)

@@ -106,6 +106,12 @@ MIN_CROP_SCALE = 0.5  # Never crop smaller than 50% of image
 # Erasing caps
 MAX_ERASING_SCALE = 0.25  # Never erase more than 25% of image
 
+# Depth-only Tier-B augmentation caps
+# (depth blur reuses MAX_BLUR_SIGMA above)
+MAX_DEPTH_SCALE_HALFWIDTH = 0.5  # multiplicative scale jitter halfwidth (saturated => scale ∈ [0.5, 1.5])
+MAX_HOLE_DROPOUT_NUM = 20        # max simultaneous sensor-hole rectangles per depth image
+MAX_HOLE_DROPOUT_SIZE = 50       # max edge length (pixels) of a hole rectangle
+
 
 # =============================================================================
 # AUGMENTATION CONFIG DATACLASS
