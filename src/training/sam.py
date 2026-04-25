@@ -152,17 +152,22 @@ _BN_TYPES: tuple = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatch
 
 
 def _is_bn_like(module: nn.Module) -> bool:
-    """True for standard torch BN modules AND LIBatchNorm2d (same `momentum` API)."""
+    """True for standard torch BN modules AND LIBatchNorm2d (same `momentum` API).
+
+    Walks the class MRO to recognize subclasses of LIBatchNorm2d (e.g.
+    ``ClassBalancedLIBatchNorm2d``). The previous name-string check
+    (``type(module).__name__ == "LIBatchNorm2d"``) silently excluded
+    subclasses, which caused SAM's second-pass running-stats freeze to skip
+    them — corrupting their running stats with statistics computed at the
+    adversarially-perturbed weights and breaking eval-mode forward.
+
+    Duck-typed (MRO walk by name) rather than ``isinstance(..., LIBatchNorm2d)``
+    to avoid a circular import: ``src.models.linear_integration.li_net3.__init__``
+    imports ``li_net.py`` which imports back from ``src.training.sam``.
+    """
     if isinstance(module, _BN_TYPES):
         return True
-    # LIBatchNorm2d exposes a standard `momentum` attribute with the same
-    # semantics (see src/models/linear_integration/li_net3/conv.py:556, 771).
-    # Duck-typed check avoids an import cycle with the model module.
-    return (
-        hasattr(module, "momentum")
-        and hasattr(module, "track_running_stats")
-        and type(module).__name__ in ("LIBatchNorm2d",)
-    )
+    return any(cls.__name__ == "LIBatchNorm2d" for cls in type(module).__mro__)
 
 
 def disable_running_stats(model: nn.Module) -> None:

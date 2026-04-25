@@ -190,17 +190,33 @@ class ClassBalancedLIBatchNorm2d(LIBatchNorm2d):
                 exponential_average_factor, apply_relu,
             )
 
-        m, v, n_total = _class_balanced_batch_stats(input, labels)
+        # CRITICAL: Promote input to fp32 for the entire CBBN computation.
+        # F.batch_norm internally upcasts to fp32 under autocast; our manual
+        # implementation must do the same or running statistics drift in fp16
+        # (compounding over many EMA updates, eventually corrupting eval).
+        # We cast the output back to the input's original dtype at the end so
+        # downstream layers see the dtype the autocast machinery expects.
+        in_dtype = input.dtype
+        x = input.float() if in_dtype != torch.float32 else input
 
-        # Manual normalize-and-affine (replaces F.batch_norm).
+        m, v, n_total = _class_balanced_batch_stats(x, labels)
+
+        # Manual normalize-and-affine in fp32 (replaces F.batch_norm).
         m_b = m.view(1, -1, 1, 1)
         v_b = v.view(1, -1, 1, 1)
-        out = (input - m_b) / (v_b + self.eps).sqrt()
+        out = (x - m_b) / (v_b + self.eps).sqrt()
         if weight is not None:
+            # weight/bias buffers are fp32; affine stays fp32.
             out = out * weight.view(1, -1, 1, 1) + bias.view(1, -1, 1, 1)
 
-        # Running-stats update (mirrors standard BN's exponential moving avg
-        # with Bessel correction on the variance estimate).
+        # Cast back to the input dtype so downstream ops under autocast see
+        # the same dtype contract that F.batch_norm produces.
+        if in_dtype != torch.float32:
+            out = out.to(in_dtype)
+
+        # Running-stats update (fp32 buffers; m/v are fp32 from the upcast
+        # above). Mirrors standard BN's exponential moving avg with Bessel
+        # correction on the variance estimate.
         if (
             running_mean is not None
             and running_var is not None

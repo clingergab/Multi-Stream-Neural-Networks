@@ -228,3 +228,27 @@ class TestBNRunningStatsHelpers:
         _ = bn(stream_inputs, integrated_input)
         rm0_after = bn.stream0_running_mean.clone()
         assert (rm0_after - rm0_before).abs().sum().item() > 1e-6
+
+    def test_disable_running_stats_recognizes_libn_subclasses(self):
+        """Regression: disable_running_stats must freeze momentum on subclasses
+        of LIBatchNorm2d (e.g. ClassBalancedLIBatchNorm2d), not only on the
+        exact class. A previous name-string check excluded subclasses, which
+        let SAM's second forward pass write adversarial-perturbation stats
+        into running_mean/var of CBBN modules and break eval-time forward.
+        """
+        from src.training.sam import _is_bn_like
+        # Build a class that subclasses LIBatchNorm2d (mimics ClassBalancedLIBatchNorm2d).
+        class _SubBN(LIBatchNorm2d):
+            pass
+        sub = _SubBN(stream_num_features=[8, 8], integrated_num_features=8)
+        # _is_bn_like must return True for the subclass — guards the MRO walk
+        assert _is_bn_like(sub), (
+            "_is_bn_like should recognize LIBatchNorm2d subclasses; "
+            "this guards the SAM second-pass freeze for CBBN-converted modules"
+        )
+        # And disable/enable should round-trip the momentum
+        sub.momentum = 0.1
+        disable_running_stats(nn.Sequential(sub))
+        assert sub.momentum == 0.0, "subclass momentum should be frozen to 0"
+        enable_running_stats(nn.Sequential(sub))
+        assert sub.momentum == 0.1, "subclass momentum should be restored"

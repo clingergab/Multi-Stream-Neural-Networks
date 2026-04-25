@@ -325,3 +325,200 @@ def test_e2e_forward_without_stash_matches_standard_model():
         "without stash_labels, CBBN-converted model must produce identical logits "
         "to standard model"
     )
+
+
+def test_cbbn_e2e_training_then_eval_predicts_correctly():
+    """The real end-to-end check that should have caught the eval-collapse bug.
+    Train a tiny CBBN model on a class-separable problem with a realistic
+    recipe (mixup + modality dropout, AMP-style autocast), then confirm that
+    eval-mode forward produces VARIED, MOSTLY-CORRECT predictions — not a
+    single class for all inputs.
+
+    A model whose running stats are corrupted (e.g. by SAM's second-pass
+    leak, by an fp16 EMA drift, or by any other CBBN-side bug) would
+    produce uniform / degenerate output here. This test is the
+    eval-quality safety net the existing CBBN integration tests lacked.
+    """
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    from torch.amp import autocast
+
+    # Class-separable synthetic data (4 classes with distinct rgb/depth means)
+    torch.manual_seed(0)
+    N_CLASSES = 4
+    N_PER_CLASS = 64
+    rgb_list, depth_list, labels_list = [], [], []
+    for c in range(N_CLASSES):
+        rgb_mean = torch.randn(3, 1, 1) * 0.5
+        depth_mean = torch.randn(1, 1, 1) * 0.3
+        for _ in range(N_PER_CLASS):
+            rgb_list.append(torch.randn(3, 32, 32) * 0.3 + rgb_mean)
+            depth_list.append(torch.randn(1, 32, 32) * 0.3 + depth_mean)
+            labels_list.append(c)
+    ds = TensorDataset(torch.stack(rgb_list), torch.stack(depth_list),
+                       torch.tensor(labels_list, dtype=torch.long))
+    train_loader = DataLoader(ds, batch_size=32, shuffle=True)
+    val_loader = DataLoader(ds, batch_size=32, shuffle=False)
+
+    # Build model with CBBN, recipe matching user's setup
+    torch.manual_seed(0)
+    model = li_resnet18(num_classes=N_CLASSES, stream_input_channels=[3, 1],
+                         width_multiplier=0.25, dropout_p=0.0,
+                         device='cpu', use_amp=False)
+    model.compile(
+        optimizer=torch.optim.AdamW(model.parameters(), lr=3e-3),
+        scheduler=None, loss='cross_entropy',
+        label_smoothing=0.06, gpu_augmentation=False,
+    )
+
+    history = model.fit(
+        train_loader=train_loader, val_loader=val_loader,
+        epochs=10, verbose=False,
+        modality_dropout=True, modality_dropout_rate=0.5, modality_dropout_ramp=0,
+        use_mixup=True, mixup_alpha=0.2,
+        use_sam=False,                # exact user setup: mixup ON, SAM OFF
+        use_class_balanced_bn=True,
+    )
+
+    # Eval-mode quality check — these are the specific assertions a degenerate
+    # eval (val_acc = N/N_test, val_mca = 1/N_classes) would fail.
+    final_val_mca = history['val_mca'][-1]
+    assert final_val_mca > 1.5 / N_CLASSES, (
+        f"Eval val_mca = {final_val_mca:.3f} ≈ 1/{N_CLASSES} = uniform random. "
+        f"CBBN-trained model collapsed at eval time. This is the symptom of "
+        f"corrupted running stats: training works but eval is broken."
+    )
+
+    # Predict on val explicitly, confirm at least 2 unique predicted classes
+    model.eval()
+    all_preds = []
+    with torch.no_grad():
+        for rgb, depth, _ in val_loader:
+            preds = model([rgb, depth]).argmax(dim=1)
+            all_preds.append(preds)
+    preds = torch.cat(all_preds)
+    n_unique = preds.unique().numel()
+    assert n_unique >= 2, (
+        f"Eval-mode predictions are degenerate: only {n_unique}/{N_CLASSES} "
+        f"unique classes predicted across {preds.numel()} val samples. "
+        f"Model is producing a single class for every input — running stats are wrong."
+    )
+
+
+def test_cbbn_e2e_training_then_eval_under_autocast():
+    """Same as test_cbbn_e2e_training_then_eval_predicts_correctly, but with
+    autocast active during training. Catches dtype-related running-stats drift
+    that only manifests under AMP (which is the user's actual setup)."""
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+    from torch.amp import autocast
+
+    torch.manual_seed(0)
+    N_CLASSES = 4
+    N_PER_CLASS = 64
+    rgb_list, depth_list, labels_list = [], [], []
+    for c in range(N_CLASSES):
+        rgb_mean = torch.randn(3, 1, 1) * 0.5
+        depth_mean = torch.randn(1, 1, 1) * 0.3
+        for _ in range(N_PER_CLASS):
+            rgb_list.append(torch.randn(3, 32, 32) * 0.3 + rgb_mean)
+            depth_list.append(torch.randn(1, 32, 32) * 0.3 + depth_mean)
+            labels_list.append(c)
+    ds = TensorDataset(torch.stack(rgb_list), torch.stack(depth_list),
+                       torch.tensor(labels_list, dtype=torch.long))
+    loader = DataLoader(ds, batch_size=32, shuffle=True)
+
+    torch.manual_seed(0)
+    model = li_resnet18(num_classes=N_CLASSES, stream_input_channels=[3, 1],
+                        width_multiplier=0.25, dropout_p=0.0,
+                        device='cpu', use_amp=False)
+    convert_to_class_balanced_bn(model)
+    optim = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.06)
+
+    # 5 epochs of training under bf16 autocast (closest CPU equivalent to fp16 AMP)
+    model.train()
+    for epoch in range(5):
+        for rgb, depth, lbls in loader:
+            optim.zero_grad()
+            with autocast(device_type='cpu', dtype=torch.bfloat16), stash_labels(lbls):
+                out = model([rgb, depth])
+            loss = loss_fn(out.float(), lbls)
+            loss.backward()
+            optim.step()
+
+    # Eval check
+    model.eval()
+    all_preds = []
+    with torch.no_grad():
+        for rgb, depth, _ in loader:
+            all_preds.append(model([rgb, depth]).argmax(dim=1))
+    preds = torch.cat(all_preds)
+    n_unique = preds.unique().numel()
+    assert n_unique >= 2, (
+        f"Under autocast, eval-mode predictions are degenerate: only "
+        f"{n_unique}/{N_CLASSES} unique classes. "
+        f"Running-stats drift / dtype issue under autocast."
+    )
+
+    # Running stats sanity: should be finite, positive var
+    for m in model.modules():
+        if isinstance(m, ClassBalancedLIBatchNorm2d):
+            assert torch.isfinite(m.integrated_running_mean).all()
+            assert torch.isfinite(m.integrated_running_var).all()
+            assert (m.integrated_running_var > 0).all(), \
+                "running_var must be strictly positive"
+
+
+def test_sam_second_pass_does_not_corrupt_cbbn_running_stats():
+    """Regression test for the exact bug that broke Phase 1c: SAM's second
+    forward pass runs at adversarially-perturbed weights (w+ε), and the
+    surrounding ``disable_running_stats(model)`` call must freeze BN momentum
+    on CBBN modules so they don't accumulate stats from the perturbed
+    features. A previous name-string check in `_is_bn_like` skipped subclasses
+    of LIBatchNorm2d, so CBBN modules' momentum stayed at 0.1 during SAM's
+    second pass — corrupting their running stats and producing val_acc
+    stuck at 1/19 (uniform-random) regardless of how well training went.
+    """
+    from src.training.sam import disable_running_stats, enable_running_stats
+
+    bn = LIBatchNorm2d(stream_num_features=[8, 8], integrated_num_features=8)
+    bn.__class__ = ClassBalancedLIBatchNorm2d
+    bn.train()
+
+    streams = [torch.randn(16, 8, 4, 4), torch.randn(16, 8, 4, 4)]
+    integ = torch.randn(16, 8, 4, 4)
+    labels = torch.randint(0, 4, (16,))
+
+    # First pass (good weights): running stats SHOULD update
+    from src.models.linear_integration.li_net3.class_balanced_bn import stash_labels
+    rm_before_first = bn.integrated_running_mean.clone()
+    with stash_labels(labels):
+        bn(streams, integ)
+    rm_after_first = bn.integrated_running_mean.clone()
+    assert not torch.equal(rm_before_first, rm_after_first), (
+        "first SAM pass should update CBBN running stats"
+    )
+
+    # SAM's pre-second-pass freeze
+    disable_running_stats(nn.Sequential(bn))
+    assert bn.momentum == 0.0, (
+        "BUG: disable_running_stats must freeze momentum on CBBN modules "
+        "(subclass of LIBatchNorm2d). Without this, SAM's second pass "
+        "writes adversarial-perturbation stats into running_mean/var."
+    )
+
+    # Second pass (simulated adversarial input): running stats must NOT change
+    integ_adv = integ + torch.randn_like(integ) * 0.5
+    rm_before_second = bn.integrated_running_mean.clone()
+    with stash_labels(labels):
+        bn(streams, integ_adv)
+    rm_after_second = bn.integrated_running_mean.clone()
+    assert torch.equal(rm_before_second, rm_after_second), (
+        "SAM second pass corrupted CBBN running stats — momentum freeze did "
+        "not apply. This is the exact failure mode that broke Phase 1c eval."
+    )
+
+    # And the restore must put momentum back so subsequent batches behave normally
+    enable_running_stats(nn.Sequential(bn))
+    assert bn.momentum > 0.0, "enable_running_stats failed to restore momentum"
