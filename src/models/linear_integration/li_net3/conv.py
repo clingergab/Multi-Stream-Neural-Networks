@@ -277,8 +277,20 @@ class _LIConvNd(nn.Module):
                 init.uniform_(self.integrated_bias, -bound, bound)
 
         # Initialize integration weights (1x1 convolutions for stream mixing)
+        # Symmetry-breaking experiment: the original `init.constant_(W, 1/N)`
+        # was diagnosed as a saddle point — gradient through W_int_i stays
+        # rank-1 along the all-ones direction at every step, so the
+        # per-stream integration mechanism never learns. Replacing with a
+        # tight Gaussian around 1/N preserves the gradient-pathology fix
+        # (mean ≈ 1/N) while breaking exact symmetry so the optimizer has a
+        # non-degenerate starting direction. std = 0.01 / num_streams keeps
+        # entries within ±3% of the mean (~3σ).
         for integration_weight in self.integration_from_streams:
-            init.constant_(integration_weight, 1.0 / self.num_streams)
+            init.normal_(
+                integration_weight,
+                mean=1.0 / self.num_streams,
+                std=0.01 / self.num_streams,
+            )
     
     def extra_repr(self):
         """String representation exactly like _ConvNd."""
