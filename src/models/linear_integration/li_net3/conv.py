@@ -277,19 +277,28 @@ class _LIConvNd(nn.Module):
                 init.uniform_(self.integrated_bias, -bound, bound)
 
         # Initialize integration weights (1x1 convolutions for stream mixing)
-        # Symmetry-breaking experiment: the original `init.constant_(W, 1/N)`
-        # was diagnosed as a saddle point — gradient through W_int_i stays
-        # rank-1 along the all-ones direction at every step, so the
-        # per-stream integration mechanism never learns. Replacing with a
-        # tight Gaussian around 1/N preserves the gradient-pathology fix
-        # (mean ≈ 1/N) while breaking exact symmetry so the optimizer has a
-        # non-degenerate starting direction. std = 0.01 / num_streams keeps
-        # entries within ±3% of the mean (~3σ).
+        # Symmetry-breaking experiment, iteration 2.
+        #
+        # Iteration 1 (std = 0.01 / num_streams) didn't escape the rank-1
+        # basin: post-training rel_drift was ~0.034, identical to the
+        # original `init.constant_(W, 1/N)` baseline. The seed asymmetry
+        # was below the noise floor of the gradient signal pulling weights
+        # back toward the constant mode.
+        #
+        # Iteration 2 widens the spread to test whether magnitude itself is
+        # the trap. std = 0.30 / num_streams gives entries in roughly
+        # [0.05, 0.95] at ±3σ for N=2 — substantial scatter around the 1/N
+        # mean. The aggregate matrix mean is still ≈ 1/N (preserves the
+        # gradient-pathology fix in the average sense), but per-row means
+        # now scatter by O(0.30 / sqrt(M·num_streams)). If post-training
+        # rel_drift remains ~0.03 with this much initial spread, the rank-1
+        # constant configuration is the architecture's natural attractor,
+        # not an accident of init.
         for integration_weight in self.integration_from_streams:
             init.normal_(
                 integration_weight,
                 mean=1.0 / self.num_streams,
-                std=0.01 / self.num_streams,
+                std=0.30 / self.num_streams,
             )
     
     def extra_repr(self):
