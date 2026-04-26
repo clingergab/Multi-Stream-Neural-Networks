@@ -21,6 +21,11 @@ from torch.utils.data import Dataset, WeightedRandomSampler
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as F2
 
+from src.data_utils.hha.augmentation import (
+    HHAAugConfig,
+    apply_hha_aug,
+    replace_nan_with_per_channel_mean,
+)
 from src.training.augmentation_config import (
     # Probability baselines
     BASE_FLIP_P,
@@ -350,6 +355,8 @@ class SUNRGBDDataset(Dataset):
         # so an aggressive depth_aug_mag can't push the offset distribution
         # past a quarter of the channel std.
         self._hha_height_sigma = min(BASE_HEIGHT_SIGMA * self.depth_aug_mag, 0.5)
+        # The HHAAugConfig assembly happens AFTER the hole_dropout block below
+        # since it depends on those scaled values too.
 
         # Depth value-scale jitter — multiply valid depth by (1 ± halfwidth).
         # Simulates per-sensor calibration differences in absolute distance values.
@@ -373,6 +380,25 @@ class SUNRGBDDataset(Dataset):
         self._hole_dropout_size_min = BASE_HOLE_DROPOUT_SIZE_MIN
         self._hole_dropout_size_max = min(
             int(BASE_HOLE_DROPOUT_SIZE_MAX * self.depth_aug_mag), MAX_HOLE_DROPOUT_SIZE
+        )
+
+        # Bundle the scaled HHA values into an HHAAugConfig for the shared
+        # ``apply_hha_aug`` helper. Same canonical pipeline regardless of
+        # which dataset (SUN, ScanNet) is calling.
+        self._hha_aug_config = HHAAugConfig(
+            disp_scale_p=self._hha_disp_scale_p,
+            disp_scale_halfwidth=self._hha_disp_scale_halfwidth,
+            height_offset_p=self._hha_height_offset_p,
+            height_sigma_m=self._hha_height_sigma,
+            blur_p=self._depth_blur_p,
+            blur_sigma_min=self._depth_blur_sigma_min,
+            blur_sigma_max=self._depth_blur_sigma_max,
+            blur_kernel_choices=(3, 5),
+            hole_p=self._hole_dropout_p,
+            hole_num_min=self._hole_dropout_num_min,
+            hole_num_max=self._hole_dropout_num_max,
+            hole_size_min=self._hole_dropout_size_min,
+            hole_size_max=self._hole_dropout_size_max,
         )
 
         # === PRE-CREATE REUSABLE TRANSFORM INSTANCES ===
@@ -606,89 +632,12 @@ class SUNRGBDDataset(Dataset):
         return depth
 
     def _apply_hha_aug(self, hha):
-        """HHA-specific train augmentation. Geometrically valid ops only.
-
-        Order is fixed (matters because hole dropout creates new NaNs and
-        blur would propagate them if it ran after):
-            1. Disparity scale jitter — channel 0 only.
-            2. Ground-plane offset — channel 1 only.
-            3. Blur — NaN-aware via normalized (Knutsson) convolution; same
-               kernel across all 3 channels.
-            4. Hole dropout — sets a rectangular region to NaN across all 3
-               channels; the unconditional NaN-replacement step in
-               ``_normalize_and_erase`` then converts these to channel mean.
-
-        Operates on a [3, H, W] float32 tensor with NaN at missing pixels.
-        Brightness / contrast / additive noise / generic-multiply scale
-        jitter from raw-depth aug are intentionally absent — they mix
-        channels with different physical units (1/m, m, deg) and corrupt
-        geometric semantics.
-        """
-        # Defensive clone: this method mutates hha in-place via channel
-        # assignment. _load_raw materializes a non-mmap copy via .float(), so
-        # the input is currently safe to mutate, but the contract is fragile.
-        # An extra 224x224x3 float32 clone is ~600 KB — negligible vs. safety.
-        hha = hha.clone()
-
-        # 1. Disparity scale jitter (channel 0 only).
-        if self._hha_disp_scale_halfwidth > 0 and np.random.random() < self._hha_disp_scale_p:
-            half = self._hha_disp_scale_halfwidth
-            s = float(np.random.uniform(1.0 - half, 1.0 + half))
-            hha[0] = hha[0] * s
-
-        # 2. Ground-plane offset (channel 1 only). Additive Gaussian.
-        if self._hha_height_sigma > 0 and np.random.random() < self._hha_height_offset_p:
-            offset = float(np.random.normal(0.0, self._hha_height_sigma))
-            valid = ~torch.isnan(hha[1])
-            hha[1] = torch.where(valid, hha[1] + offset, hha[1])
-
-        # 3. Blur — normalized convolution so missing pixels don't drag
-        # boundary-valid pixels toward zero (which would destroy the angle
-        # channel's signal exactly at glass / depth-discontinuity edges
-        # where it's most informative).
-        if self._depth_blur_sigma_max > 0 and np.random.random() < (
-            self._depth_blur_p
-        ):
-            kernel_size = int(np.random.choice([3, 5]))
-            sigma = float(np.random.uniform(
-                self._depth_blur_sigma_min,
-                self._depth_blur_sigma_max,
-            ))
-            nan_mask = torch.isnan(hha)
-            valid = (~nan_mask).to(hha.dtype)
-            clean = torch.where(nan_mask, torch.zeros_like(hha), hha)
-            blurred_data = F2.gaussian_blur(clean, kernel_size=kernel_size, sigma=sigma)
-            blurred_mask = F2.gaussian_blur(valid, kernel_size=kernel_size, sigma=sigma)
-            hha = torch.where(
-                blurred_mask > 1e-6,
-                blurred_data / torch.clamp(blurred_mask, min=1e-6),
-                torch.full_like(hha, float('nan')),
-            )
-            # Re-mark originally-NaN pixels.
-            hha = torch.where(nan_mask, torch.full_like(hha, float('nan')), hha)
-
-        # 4. Hole dropout (creates NaN — must be last).
-        if self._hole_dropout_num_max >= self._hole_dropout_num_min and \
-           np.random.random() < self._hole_dropout_p:
-            _H, _W = hha.shape[-2], hha.shape[-1]
-            n_holes = int(np.random.randint(
-                self._hole_dropout_num_min,
-                self._hole_dropout_num_max + 1,
-            ))
-            for _ in range(n_holes):
-                h = int(np.random.randint(
-                    self._hole_dropout_size_min,
-                    self._hole_dropout_size_max + 1,
-                ))
-                w = int(np.random.randint(
-                    self._hole_dropout_size_min,
-                    self._hole_dropout_size_max + 1,
-                ))
-                i = int(np.random.randint(0, max(1, _H - h)))
-                j = int(np.random.randint(0, max(1, _W - w)))
-                hha[:, i:i + h, j:j + w] = float('nan')
-
-        return hha
+        """HHA-specific train augmentation. Delegates to the shared
+        ``src.data_utils.hha.augmentation.apply_hha_aug`` so SUN and ScanNet
+        run the same canonical pipeline. The dataset-specific magnitudes /
+        probabilities live in ``self._hha_aug_config`` (built in
+        ``_compute_scaled_aug_values``)."""
+        return apply_hha_aug(hha, self._hha_aug_config)
 
     def _normalize_and_erase(self, rgb, depth):
         """Phase 5 — uint8→float32, sentinel replacement, and (when
@@ -704,15 +653,11 @@ class SUNRGBDDataset(Dataset):
             rgb = rgb.float() / 255.0
 
         if self.use_hha:
-            # HHA: NaN sentinel, per-channel mean substitution.
-            nan_mask = torch.isnan(depth)
-            if nan_mask.any():
-                mean_t = torch.tensor(
-                    self._norm_stats['depth_mean'],
-                    dtype=depth.dtype,
-                    device=depth.device,
-                ).view(-1, 1, 1)
-                depth = torch.where(nan_mask, mean_t.expand_as(depth), depth)
+            # HHA: NaN sentinel, per-channel mean substitution. Shared helper
+            # so SUN and ScanNet datasets stay in sync.
+            depth = replace_nan_with_per_channel_mean(
+                depth, self._norm_stats['depth_mean']
+            )
         else:
             # Raw depth: 0 sentinel, scalar-mean substitution.
             zero_mask = (depth == 0.0)

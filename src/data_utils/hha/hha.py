@@ -67,10 +67,23 @@ _MAX_DISPARITY: float = 10.0
 # Window radius for normal estimation (5x5 stencil; 4 cardinal neighbors at +/-r).
 _NORMAL_RADIUS: int = 2
 
+# SUN RGB-D toolbox basis-change matrix that maps a camera-frame point
+# (X_cam, Y_cam, Z_cam) to the toolbox's intermediate frame
+# (X_cam, Z_cam, -Y_cam) = (right, forward, up). Applied as
+# pts_inter = pts_cam @ _M_LEFT.T.
+_M_LEFT: np.ndarray = np.array(
+    [[1.0, 0.0, 0.0],
+     [0.0, 0.0, 1.0],
+     [0.0, -1.0, 0.0]],
+    dtype=np.float64,
+)
 
-def _backproject(depth_m: np.ndarray, K: np.ndarray) -> np.ndarray:
-    """Backproject pixel grid + depth into the intermediate frame
-    ``(X_cam, Z_cam, -Y_cam)`` matching the toolbox.
+
+def _backproject_camera_frame(depth_m: np.ndarray, K: np.ndarray) -> np.ndarray:
+    """Backproject pixel grid + depth into the pure camera frame
+    ``(X_cam, Y_cam, Z_cam)``.
+
+    OpenCV/MATLAB camera convention: +X right, +Y down, +Z forward.
 
     Returns an ``[H, W, 3]`` float64 array; pixels with depth == 0 carry
     zeros (callers should mask them out using the same depth==0 condition).
@@ -81,7 +94,7 @@ def _backproject(depth_m: np.ndarray, K: np.ndarray) -> np.ndarray:
     cx = float(K[0, 2])
     cy = float(K[1, 2])
 
-    # Match MATLAB 1-indexed pixel grid for parity with read_3d_pts_general.
+    # Match MATLAB 1-indexed pixel grid for parity with read_3d_pts_general.m.
     x = np.arange(1, W + 1, dtype=np.float64)
     y = np.arange(1, H + 1, dtype=np.float64)
     xx, yy = np.meshgrid(x, y)
@@ -89,10 +102,22 @@ def _backproject(depth_m: np.ndarray, K: np.ndarray) -> np.ndarray:
     x_cam = (xx - cx) * depth_m / fx
     y_cam = (yy - cy) * depth_m / fy
     z_cam = depth_m
+    return np.stack([x_cam, y_cam, z_cam], axis=-1)
 
-    # Toolbox intermediate frame (X_cam, Z_cam, -Y_cam).
-    pts = np.stack([x_cam, z_cam, -y_cam], axis=-1)
-    return pts
+
+# Backward-compat alias: the old internal name returned intermediate-frame.
+# A few callers may still import it; new code should use _backproject_camera_frame
+# and apply _M_LEFT explicitly.
+def _backproject(depth_m: np.ndarray, K: np.ndarray) -> np.ndarray:
+    """Backproject into the SUN-toolbox intermediate frame
+    ``(X_cam, Z_cam, -Y_cam)``.
+
+    Equivalent to ``_backproject_camera_frame(depth_m, K) @ _M_LEFT.T``.
+    Kept for backward compatibility; new code should call the camera-frame
+    helper and apply the basis swap explicitly via the
+    ``apply_sunrgbd_basis_swap`` flag in ``compute_hha``.
+    """
+    return _backproject_camera_frame(depth_m, K) @ _M_LEFT.T
 
 
 def _estimate_normals_world(
@@ -166,6 +191,7 @@ def compute_hha(
     *,
     invalid_value: float = float("nan"),
     floor_percentile: float = 5.0,
+    apply_sunrgbd_basis_swap: bool = True,
 ) -> np.ndarray:
     """Compute the HHA encoding for one depth image.
 
@@ -174,13 +200,28 @@ def compute_hha(
             treated as missing and propagate to ``invalid_value`` in all
             three output channels.
         K: 3x3 camera intrinsics for the ``depth_m`` resolution.
-        R_tilt: 3x3 basis-converted rotation from
-            ``intrinsics.read_extrinsics`` mapping intermediate-camera
-            ``(X_cam, Z_cam, -Y_cam)`` to toolbox-world XYZ (Y up).
+        R_tilt: 3x3 rotation mapping into the gravity-aligned world frame.
+            What this means depends on ``apply_sunrgbd_basis_swap``:
+
+            * ``True`` (SUN RGB-D toolbox convention, default):
+              ``R_tilt`` maps the toolbox intermediate frame
+              ``(X_cam, Z_cam, -Y_cam)`` to world XYZ. The ``M_LEFT`` basis
+              swap is applied internally before ``R_tilt``. Use this for
+              SUN RGB-D R_tilt values returned by ``intrinsics.read_extrinsics``.
+            * ``False`` (ScanNet / generic):
+              ``R_tilt`` is applied directly to the camera-frame point cloud
+              and is expected to be the camera-to-aligned-world rotation
+              (e.g. ``axisAlignment_rot @ pose_rot[:3, :3]`` for ScanNet).
+              No basis swap is applied internally.
+
+            Either way the output world frame has +Z as the up axis (anti-
+            gravity), since the SUN intermediate frame's third axis
+            ``-Y_cam`` is the up axis.
         invalid_value: value to write at invalid pixels (default NaN).
-        floor_percentile: percentile of valid Y_world used as the per-image
-            floor estimate; the height channel is ``Y_world - floor``.
+        floor_percentile: percentile of valid Z_world used as the per-image
+            floor estimate; the height channel is ``Z_world - floor``.
             Default 5.0 matches Gupta et al.'s "height above lowest point".
+        apply_sunrgbd_basis_swap: see ``R_tilt`` description above.
 
     Returns:
         [3, H, W] float32 array — channels ``(disparity, height_m, angle_deg)``.
@@ -192,6 +233,7 @@ def compute_hha(
             depth_m, K, R_tilt,
             invalid_value=invalid_value,
             floor_percentile=floor_percentile,
+            apply_sunrgbd_basis_swap=apply_sunrgbd_basis_swap,
         )
     except Exception as exc:  # noqa: BLE001 — defensive: caller aggregates failures
         logger.warning("compute_hha failed (%s); returning all-invalid tensor", exc)
@@ -206,6 +248,7 @@ def _compute_hha_inner(
     *,
     invalid_value: float,
     floor_percentile: float,
+    apply_sunrgbd_basis_swap: bool = True,
 ) -> np.ndarray:
     if depth_m.ndim != 2:
         raise ValueError(f"depth_m must be 2-D, got shape {depth_m.shape}")
@@ -222,10 +265,15 @@ def _compute_hha_inner(
         disparity = np.where(valid, 1.0 / depth, np.nan)
     disparity = np.where(disparity > _MAX_DISPARITY, _MAX_DISPARITY, disparity)
 
-    # --- Backproject to intermediate frame, then to world frame. ---
-    pts_inter = _backproject(np.where(valid, depth, 0.0), K)  # zero-fill invalid for math
-    # World coords: pts_world[h, w, :] = R_tilt @ pts_inter[h, w, :]
-    pts_world = pts_inter @ R_tilt.T
+    # --- Backproject to camera frame, optionally apply SUN basis swap, then R_tilt to world. ---
+    pts_cam = _backproject_camera_frame(np.where(valid, depth, 0.0), K)
+    if apply_sunrgbd_basis_swap:
+        # SUN RGB-D toolbox path: pts_inter = M_LEFT @ pts_cam,  pts_world = R_tilt @ pts_inter.
+        pts_inter = pts_cam @ _M_LEFT.T
+        pts_world = pts_inter @ R_tilt.T
+    else:
+        # ScanNet / generic path: R_tilt maps camera frame directly to aligned-world.
+        pts_world = pts_cam @ R_tilt.T
 
     # --- Channel 1: height above ground = Z_world - floor estimate. ---
     # Toolbox convention: axis 2 is the up axis (intermediate is

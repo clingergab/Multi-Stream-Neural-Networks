@@ -29,6 +29,11 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as F2
 
+from src.data_utils.hha.augmentation import (
+    HHAAugConfig,
+    apply_hha_aug,
+    replace_nan_with_per_channel_mean,
+)
 from src.training.augmentation_config import (
     # Probability baselines
     BASE_FLIP_P,
@@ -46,6 +51,11 @@ from src.training.augmentation_config import (
     BASE_HOLE_DROPOUT_NUM_MAX,
     BASE_HOLE_DROPOUT_SIZE_MIN,
     BASE_HOLE_DROPOUT_SIZE_MAX,
+    # HHA-specific
+    BASE_DISP_SCALE,
+    BASE_DISPARITY_SCALE_P,
+    BASE_HEIGHT_OFFSET_P,
+    BASE_HEIGHT_SIGMA,
     # Magnitude baselines
     BASE_BRIGHTNESS,
     BASE_CONTRAST,
@@ -71,6 +81,9 @@ from src.training.augmentation_config import (
     MAX_DEPTH_CONTRAST,
     MAX_DEPTH_NOISE_STD,
     MAX_ERASING_SCALE,
+    MAX_DEPTH_SCALE_HALFWIDTH,
+    MAX_HOLE_DROPOUT_NUM,
+    MAX_HOLE_DROPOUT_SIZE,
 )
 
 
@@ -141,22 +154,26 @@ def _load_norm_stats(data_root: str) -> dict:
 def _discover_samples(
     data_root: str,
     class_names: list[str],
+    *,
+    use_hha: bool = False,
 ) -> list[tuple[str, str, int]]:
-    """Walk class folders and discover paired RGB/depth sample files.
+    """Walk class folders and discover paired RGB/depth(or HHA) sample files.
 
     Args:
         data_root: Root directory with class subfolders.
         class_names: Canonical class list from class_names.txt.
+        use_hha: If True, look for ``*_hha.pt`` instead of ``*_depth.pt``.
 
     Returns:
-        List of (rgb_path, depth_path, label) tuples sorted by
+        List of (rgb_path, depth_or_hha_path, label) tuples sorted by
         (class_name, rgb_filename) for deterministic ordering.
 
     Raises:
-        ValueError: If unpaired rgb/depth files are found.
+        ValueError: If unpaired rgb/depth(or hha) files are found.
     """
     class_to_label = {name: i for i, name in enumerate(class_names)}
     samples = []
+    second_suffix = '_hha.pt' if use_hha else '_depth.pt'
 
     for folder_name in sorted(os.listdir(data_root)):
         folder_path = os.path.join(data_root, folder_name)
@@ -168,7 +185,7 @@ def _discover_samples(
         label = class_to_label[folder_name]
 
         rgb_files = {}
-        depth_files = {}
+        second_files = {}  # depth or hha, depending on use_hha
 
         for fname in os.listdir(folder_path):
             if not fname.endswith('.pt'):
@@ -176,28 +193,29 @@ def _discover_samples(
             if fname.endswith('_rgb.pt'):
                 stem = fname[:-len('_rgb.pt')]
                 rgb_files[stem] = os.path.join(folder_path, fname)
-            elif fname.endswith('_depth.pt'):
-                stem = fname[:-len('_depth.pt')]
-                depth_files[stem] = os.path.join(folder_path, fname)
+            elif fname.endswith(second_suffix):
+                stem = fname[:-len(second_suffix)]
+                second_files[stem] = os.path.join(folder_path, fname)
 
-        rgb_only = set(rgb_files.keys()) - set(depth_files.keys())
-        depth_only = set(depth_files.keys()) - set(rgb_files.keys())
-        if rgb_only or depth_only:
+        rgb_only = set(rgb_files.keys()) - set(second_files.keys())
+        second_only = set(second_files.keys()) - set(rgb_files.keys())
+        if rgb_only or second_only:
+            modality = 'HHA' if use_hha else 'depth'
             msg_parts = []
             if rgb_only:
                 msg_parts.append(
-                    f"RGB without depth: {sorted(rgb_only)[:5]}"
+                    f"RGB without {modality}: {sorted(rgb_only)[:5]}"
                 )
-            if depth_only:
+            if second_only:
                 msg_parts.append(
-                    f"Depth without RGB: {sorted(depth_only)[:5]}"
+                    f"{modality} without RGB: {sorted(second_only)[:5]}"
                 )
             raise ValueError(
                 f"Unpaired files in {folder_path}: {'; '.join(msg_parts)}"
             )
 
         for stem in sorted(rgb_files.keys()):
-            samples.append((rgb_files[stem], depth_files[stem], label))
+            samples.append((rgb_files[stem], second_files[stem], label))
 
     return samples
 
@@ -233,6 +251,7 @@ class ScanNetPretrainDataset(Dataset):
         rgb_aug_mag: float = 1.0,
         depth_aug_prob: float = 1.0,
         depth_aug_mag: float = 1.0,
+        use_hha: bool = False,
     ):
         if split not in self.VALID_SPLITS:
             raise ValueError(
@@ -243,10 +262,22 @@ class ScanNetPretrainDataset(Dataset):
         self.split = split
         self.crop_size = crop_size
         self.normalize = normalize
+        self.use_hha = use_hha
 
         self.CLASS_NAMES = class_names
         self.num_classes = len(class_names)
-        self._norm_stats = norm_stats
+        # Accept both depth-only and HHA-only norm_stats. Alias hha_mean/std
+        # onto depth_mean/std when use_hha=True so the rest of the dataset
+        # code (and any downstream consumer) sees a uniform interface.
+        self._norm_stats = dict(norm_stats)  # shallow copy to avoid mutating caller's dict
+        if use_hha:
+            if 'hha_mean' not in self._norm_stats or 'hha_std' not in self._norm_stats:
+                raise ValueError(
+                    "use_hha=True requires 'hha_mean' and 'hha_std' in norm_stats. "
+                    "Did you load the wrong norm_stats.json (raw-depth vs HHA)?"
+                )
+            self._norm_stats['depth_mean'] = list(self._norm_stats['hha_mean'])
+            self._norm_stats['depth_std'] = list(self._norm_stats['hha_std'])
 
         self.samples = samples
         self.labels = [s[2] for s in samples]
@@ -333,6 +364,31 @@ class ScanNetPretrainDataset(Dataset):
         self._hole_dropout_p = min(
             BASE_HOLE_DROPOUT_P * self.depth_aug_prob, MAX_PROBABILITY
         )
+        self._hole_dropout_num_min = BASE_HOLE_DROPOUT_NUM_MIN
+        self._hole_dropout_num_max = min(
+            int(BASE_HOLE_DROPOUT_NUM_MAX * self.depth_aug_mag), MAX_HOLE_DROPOUT_NUM
+        )
+        self._hole_dropout_size_min = BASE_HOLE_DROPOUT_SIZE_MIN
+        self._hole_dropout_size_max = min(
+            int(BASE_HOLE_DROPOUT_SIZE_MAX * self.depth_aug_mag), MAX_HOLE_DROPOUT_SIZE
+        )
+
+        # === HHA pipeline config (only used when use_hha=True) ===
+        self._hha_aug_config = HHAAugConfig(
+            disp_scale_p=min(BASE_DISPARITY_SCALE_P * self.depth_aug_prob, MAX_PROBABILITY),
+            disp_scale_halfwidth=min(BASE_DISP_SCALE * self.depth_aug_mag, MAX_DEPTH_SCALE_HALFWIDTH),
+            height_offset_p=min(BASE_HEIGHT_OFFSET_P * self.depth_aug_prob, MAX_PROBABILITY),
+            height_sigma_m=min(BASE_HEIGHT_SIGMA * self.depth_aug_mag, 0.5),
+            blur_p=min(BASE_BLUR_P * self.depth_aug_prob, MAX_PROBABILITY),
+            blur_sigma_min=BASE_BLUR_SIGMA_MIN,
+            blur_sigma_max=min(BASE_BLUR_SIGMA_MAX * self.depth_aug_mag, MAX_BLUR_SIGMA),
+            blur_kernel_choices=(3, 5),
+            hole_p=self._hole_dropout_p,
+            hole_num_min=self._hole_dropout_num_min,
+            hole_num_max=self._hole_dropout_num_max,
+            hole_size_min=self._hole_dropout_size_min,
+            hole_size_max=self._hole_dropout_size_max,
+        )
 
         # === PRE-CREATE REUSABLE TRANSFORM INSTANCES ===
         self._color_jitter_transform = v2.ColorJitter(
@@ -412,33 +468,46 @@ class ScanNetPretrainDataset(Dataset):
 
         Returns:
             rgb: float32 [3, crop_size, crop_size]
-            depth: float32 [1, crop_size, crop_size]
+            depth_or_hha: float32
+                - raw depth path: [1, crop_size, crop_size] in meters (after sentinel replacement / normalization)
+                - HHA path: [3, crop_size, crop_size] (after NaN replacement / normalization)
             label: int (0 to num_classes-1)
         """
-        rgb_path, depth_path, label = self.samples[idx]
+        rgb_path, second_path, label = self.samples[idx]
 
         rgb = torch.load(rgb_path, weights_only=True)
-        depth = torch.load(depth_path, weights_only=True)
+        depth = torch.load(second_path, weights_only=True)
 
         assert rgb.shape[0] == 3 and rgb.ndim == 3, (
             f"Bad RGB shape {rgb.shape} at {rgb_path}"
         )
-        assert depth.shape[0] == 1 and depth.ndim == 3, (
-            f"Bad depth shape {depth.shape} at {depth_path}"
-        )
-
-        # Convert depth: uint16 mm -> float32 meters
-        depth = depth.float() / 1000.0
+        if self.use_hha:
+            assert depth.shape[0] == 3 and depth.ndim == 3, (
+                f"Bad HHA shape {depth.shape} at {second_path} (expected [3, H, W])"
+            )
+            # On-disk dtype is float16 (or float32); cast to float32 for stable math.
+            depth = depth.float()
+        else:
+            assert depth.shape[0] == 1 and depth.ndim == 3, (
+                f"Bad depth shape {depth.shape} at {second_path}"
+            )
+            # Convert depth: uint16 mm -> float32 meters
+            depth = depth.float() / 1000.0
 
         # ==================== TRAINING AUGMENTATION ====================
         if self.split == 'train':
-            zero_mask = (depth == 0.0)
+            # Sentinel mask: 0 for raw depth, NaN for HHA. Tracked through the
+            # spatial aug ops (flip / crop) so we can re-apply at the end.
+            if self.use_hha:
+                sentinel_mask = torch.isnan(depth)
+            else:
+                sentinel_mask = (depth == 0.0)
 
             # 1. Synchronized Random Horizontal Flip
             if np.random.random() < self._flip_p:
                 rgb = F2.horizontal_flip(rgb)
                 depth = F2.horizontal_flip(depth)
-                zero_mask = zero_mask.flip(-1)
+                sentinel_mask = sentinel_mask.flip(-1)
 
             # 2. Synchronized RandomCrop (256 -> crop_size)
             i, j, h, w = v2.RandomCrop.get_params(
@@ -446,7 +515,7 @@ class ScanNetPretrainDataset(Dataset):
             )
             rgb = F2.crop(rgb, i, j, h, w)
             depth = F2.crop(depth, i, j, h, w)
-            zero_mask = zero_mask[:, i:i+h, j:j+w]
+            sentinel_mask = sentinel_mask[:, i:i+h, j:j+w]
 
             # 3-5. RGB-Only Appearance Augmentation
             if self.normalize:
@@ -465,60 +534,82 @@ class ScanNetPretrainDataset(Dataset):
                 if np.random.random() < self._grayscale_p:
                     rgb = F2.rgb_to_grayscale(rgb, num_output_channels=3)
 
-            # 6. Depth Scale Jitter
-            if self.normalize and np.random.random() < self._depth_scale_jitter_p:
-                scale_factor = np.random.uniform(
-                    BASE_DEPTH_SCALE_MIN, BASE_DEPTH_SCALE_MAX
-                )
-                depth = depth * scale_factor
+            # 6-8. Depth-stream augmentation. HHA dispatches to the shared
+            # apply_hha_aug pipeline (canonical order: disparity-scale ->
+            # height-offset -> Knutsson blur -> NaN hole dropout). Raw depth
+            # uses the existing inline scale-jitter / appearance-jitter / hole
+            # dropout flow.
+            if self.use_hha:
+                depth = apply_hha_aug(depth, self._hha_aug_config)
+                # apply_hha_aug may have introduced new NaN regions (hole
+                # dropout); refresh the sentinel mask so later code sees them.
+                sentinel_mask = torch.isnan(depth)
+            else:
+                # 6. Depth Scale Jitter
+                if self.normalize and np.random.random() < self._depth_scale_jitter_p:
+                    scale_factor = np.random.uniform(
+                        BASE_DEPTH_SCALE_MIN, BASE_DEPTH_SCALE_MAX
+                    )
+                    depth = depth * scale_factor
 
-            # 7. Depth Appearance Augmentation
-            if self.normalize and np.random.random() < self._depth_aug_p:
-                d_min = depth[~zero_mask].min() if (~zero_mask).any() else 0.0
-                d_max = depth[~zero_mask].max() if (~zero_mask).any() else 1.0
-                d_range = d_max - d_min
+                # 7. Depth Appearance Augmentation
+                if self.normalize and np.random.random() < self._depth_aug_p:
+                    valid = ~sentinel_mask
+                    d_min = depth[valid].min() if valid.any() else 0.0
+                    d_max = depth[valid].max() if valid.any() else 1.0
+                    d_range = d_max - d_min
 
-                depth_01 = torch.zeros_like(depth)
-                if d_range > 1e-6:
-                    depth_01[~zero_mask] = (depth[~zero_mask] - d_min) / d_range
+                    depth_01 = torch.zeros_like(depth)
+                    if d_range > 1e-6:
+                        depth_01[valid] = (depth[valid] - d_min) / d_range
 
-                brightness_factor = np.random.uniform(
-                    1.0 - self._depth_brightness,
-                    1.0 + self._depth_brightness,
-                )
-                contrast_factor = np.random.uniform(
-                    1.0 - self._depth_contrast,
-                    1.0 + self._depth_contrast,
-                )
+                    brightness_factor = np.random.uniform(
+                        1.0 - self._depth_brightness,
+                        1.0 + self._depth_brightness,
+                    )
+                    contrast_factor = np.random.uniform(
+                        1.0 - self._depth_contrast,
+                        1.0 + self._depth_contrast,
+                    )
 
-                depth_01 = (depth_01 - 0.5) * contrast_factor + 0.5
-                depth_01 = depth_01 * brightness_factor
-                depth_01 = depth_01 + torch.randn_like(depth_01) * self._depth_noise_std
+                    depth_01 = (depth_01 - 0.5) * contrast_factor + 0.5
+                    depth_01 = depth_01 * brightness_factor
+                    depth_01 = depth_01 + torch.randn_like(depth_01) * self._depth_noise_std
 
-                if d_range > 1e-6:
-                    depth[~zero_mask] = depth_01[~zero_mask].clamp(0.0, 1.0) * d_range + d_min
+                    if d_range > 1e-6:
+                        depth[valid] = depth_01[valid].clamp(0.0, 1.0) * d_range + d_min
 
-            # 8. Random Hole Dropout
-            if np.random.random() < self._hole_dropout_p:
-                depth = self._apply_hole_dropout(depth)
-                zero_mask = zero_mask | (depth == 0.0)
+                # 8. Random Hole Dropout
+                if np.random.random() < self._hole_dropout_p:
+                    depth = self._apply_hole_dropout(depth)
+                    sentinel_mask = sentinel_mask | (depth == 0.0)
 
-            # Restore original 0-sentinel pixels
-            depth[zero_mask] = 0.0
+                # Restore original 0-sentinel pixels
+                depth[sentinel_mask] = 0.0
 
         else:
             # Val: CenterCrop (256 -> crop_size)
             rgb = F2.center_crop(rgb, (self.crop_size, self.crop_size))
             depth = F2.center_crop(depth, (self.crop_size, self.crop_size))
-            zero_mask = (depth == 0.0)
+            if self.use_hha:
+                sentinel_mask = torch.isnan(depth)
+            else:
+                sentinel_mask = (depth == 0.0)
 
         # ==================== TO FLOAT32 ====================
         if rgb.dtype == torch.uint8:
             rgb = rgb.float() / 255.0
 
         # ==================== SENTINEL REPLACEMENT ====================
-        depth_mean_val = self._norm_stats['depth_mean'][0]
-        depth[zero_mask] = depth_mean_val
+        if self.use_hha:
+            # NaN -> per-channel mean (3-channel HHA). Unconditional, runs
+            # regardless of self.normalize so the model never sees NaN.
+            depth = replace_nan_with_per_channel_mean(
+                depth, self._norm_stats['depth_mean']
+            )
+        else:
+            depth_mean_val = self._norm_stats['depth_mean'][0]
+            depth[sentinel_mask] = depth_mean_val
 
         # ==================== NORMALIZATION ====================
         if self.normalize:
@@ -618,6 +709,7 @@ def get_scannet_pretrain_dataloaders(
     rgb_aug_mag: float = 1.0,
     depth_aug_prob: float = 1.0,
     depth_aug_mag: float = 1.0,
+    use_hha: bool = False,
 ) -> tuple:
     """Create train and val dataloaders for ScanNet pretraining.
 
@@ -640,8 +732,8 @@ def get_scannet_pretrain_dataloaders(
             f"Run the preprocessing notebook to create the split."
         )
 
-    train_samples = _discover_samples(train_dir, class_names)
-    val_samples = _discover_samples(val_dir, class_names)
+    train_samples = _discover_samples(train_dir, class_names, use_hha=use_hha)
+    val_samples = _discover_samples(val_dir, class_names, use_hha=use_hha)
 
     if len(train_samples) == 0:
         raise ValueError(f"No training samples found in {train_dir}")
@@ -660,6 +752,7 @@ def get_scannet_pretrain_dataloaders(
         rgb_aug_mag=rgb_aug_mag,
         depth_aug_prob=depth_aug_prob,
         depth_aug_mag=depth_aug_mag,
+        use_hha=use_hha,
     )
     val_dataset = ScanNetPretrainDataset(
         data_root=data_root,
@@ -669,6 +762,7 @@ def get_scannet_pretrain_dataloaders(
         norm_stats=norm_stats,
         crop_size=crop_size,
         normalize=normalize,
+        use_hha=use_hha,
     )
 
     num_classes = len(class_names)

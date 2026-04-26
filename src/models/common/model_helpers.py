@@ -20,6 +20,8 @@ def load_pretrained_backbone(
     model: nn.Module,
     checkpoint_path: str,
     verbose: bool = True,
+    *,
+    drop_list_path: Optional[str] = "/content/drive/MyDrive/datasets/scannet_drop_list.json",
 ) -> dict[str, list[str]]:
     """Load pretrained weights into a model, skipping mismatched layers.
 
@@ -28,22 +30,35 @@ def load_pretrained_backbone(
     ``num_classes``).  All compatible backbone weights are loaded; layers
     with shape mismatches (e.g. ``fc.weight``, ``fc.bias``) are skipped.
 
+    Also reads ``run_config.json`` next to the checkpoint (if present) and
+    emits a single info line summarizing what's being loaded -- modality,
+    model class, stream channels, dataset hash, drop-list hash, timestamp,
+    git commit. Two qualitatively different staleness signals fire when the
+    sidecar disagrees with the current Drive-resident
+    ``scannet_drop_list.json``:
+
+      * **Tier 1 (soft INFO)**: only the drop-list hash differs. The
+        validated-scenes set has been updated since training but axis
+        convention agrees -- HHA values are still geometrically correct.
+      * **Tier 2 (loud WARNING)**: ``axis_alignment_inverted`` differs.
+        The HHA training data had axes wrong relative to current ground
+        truth; this checkpoint should not be used for transfer learning
+        to current data.
+
+    A third **architecture-mismatch WARNING** fires when the sidecar's
+    ``model_class`` or ``stream_input_channels`` disagree with the loading
+    model. None of these are hard gates -- the user retains autonomy.
+
     Args:
         model: Target model to load weights into.
-        checkpoint_path: Path to a ``.pt`` checkpoint file.  Accepts both
-            raw ``state_dict`` files and checkpoint dicts that contain a
-            ``'model_state_dict'`` key.
-        verbose: Print a summary of loaded / skipped keys.
+        checkpoint_path: Path to a ``.pt`` checkpoint file.
+        verbose: Print summary + sidecar info line + any warnings.
+        drop_list_path: Where to look for the current Drive-resident drop
+            list for the staleness comparison. Default is the canonical
+            Colab path; pass ``None`` to skip the comparison entirely.
 
     Returns:
-        Dict with two lists:
-        - ``'loaded'``: keys that were successfully loaded.
-        - ``'skipped'``: keys that were skipped due to shape mismatch.
-
-    Example::
-
-        info = load_pretrained_backbone(model, 'checkpoints/omni_best.pt')
-        # info['skipped'] == ['fc.weight', 'fc.bias']
+        Dict with two lists: ``'loaded'`` and ``'skipped'``.
     """
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
@@ -92,6 +107,61 @@ def load_pretrained_backbone(
             print(f"  Ignored: {thop_keys} thop profiling buffers")
         if missing.unexpected_keys:
             print(f"  Unexpected keys: {missing.unexpected_keys}")
+
+        # ---- run_config.json sidecar: info line + staleness warnings ----
+        # Best-effort; never fails the load. Imports lazily so existing
+        # callers that don't use sidecars pay no cost.
+        try:
+            from src.utils.run_config import (
+                read_run_config,
+                format_load_info_line,
+                format_arch_mismatch_warning,
+            )
+            sidecar = read_run_config(checkpoint_path)
+        except Exception:  # noqa: BLE001 — never fail the load on a metadata read
+            sidecar = None
+
+        if sidecar is None:
+            print("  (no run_config.json metadata available)")
+        else:
+            print("  " + format_load_info_line(
+                sidecar, current_drop_list_path=drop_list_path,
+            ))
+            # Architecture-mismatch banner if model class / stream channels disagree.
+            try:
+                current_sic = list(getattr(model, 'stream_input_channels',
+                                           [w.shape[1] for w in getattr(model.conv1, 'stream_weights', [])]))
+            except Exception:  # noqa: BLE001
+                current_sic = []
+            arch_warning = format_arch_mismatch_warning(
+                sidecar,
+                current_model_class=type(model).__name__,
+                current_stream_input_channels=current_sic,
+            )
+            if arch_warning:
+                print(arch_warning)
+
+        # ---- Depth-stream channel-mismatch warning ----
+        # The sentinel failure mode for HHA<->raw_depth checkpoint mixups.
+        # Fires whenever any conv1.stream_weights.<i> got skipped.
+        depth_stem_skipped = any(
+            'conv1.stream_weights.' in k or '.stream_weights.1' in k
+            for k in skipped_keys
+        )
+        if depth_stem_skipped:
+            print()
+            print("=" * 70)
+            print("  WARNING: depth-stream stem was SKIPPED during pretrained load.")
+            print("  Likely cause: depth-modality mismatch between checkpoint and")
+            print("  loading model (raw-depth checkpoint -> HHA model, or vice")
+            print("  versa). Effect: depth stem is randomly initialized while")
+            print("  integration weights are pretrained -- they expect a trained")
+            print("  depth signal and will get noise. This can be worse than")
+            print("  fully-random init for the first several epochs.")
+            print("  Recommendation: match pretrained checkpoint's depth modality")
+            print("  to the fine-tune model's depth modality.")
+            print("=" * 70)
+            print()
 
     return {'loaded': loaded_keys, 'skipped': skipped_keys}
 
