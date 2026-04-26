@@ -34,22 +34,19 @@ def _make_K(fx: float = 500.0, fy: float = 500.0,
 
 def _identity_R_tilt() -> np.ndarray:
     """An R_tilt that maps intermediate-camera (X_cam, Z_cam, -Y_cam) to
-    world (X_world, Y_world, Z_world) with Y up.
+    world (X_world, Y_world, Z_world).
 
-    With identity, the toolbox-intermediate (X, Z, -Y) frame IS the world
-    frame: world X = X_cam, world Y = Z_cam (depth), world Z = -Y_cam.
+    Toolbox convention (verified against ``read_3d_pts_general.m``): the
+    intermediate frame is ``(right, forward, up)``, so under identity R_tilt
+    the world frame inherits the same axes:
 
-    For the synthetic tests below this means:
-        - "world Y" is the camera's depth axis (forward).
-        - A frontal plane (constant depth Z) has constant world-Y.
-        - A floor (depth varying with image row) has world-Z varying with
-          camera Y_cam, so it's not a "ground" plane in this frame.
+        - world X = X_cam      (camera right)
+        - world Y = Z_cam      (camera forward / depth axis)
+        - world Z = -Y_cam     (camera up — image rows go down so y_cam is
+                                positive downward; -y_cam is therefore up)
 
-    To build clean synthetic tests we therefore craft scenes where the
-    "floor" is whatever surface has its normal pointing along world +Y.
-    With identity R_tilt, world +Y = camera +Z (forward), so a frontal
-    plane (constant depth) has its normal along world +Y, i.e. it acts as
-    a "horizontal surface facing up" in world coordinates.
+    **Anti-gravity is +Z_world**, NOT +Y_world. Tests must use axis 2
+    (``pts_world[..., 2]``) when reasoning about height or normal-vs-gravity.
     """
     return np.eye(3, dtype=np.float64)
 
@@ -58,9 +55,13 @@ def _identity_R_tilt() -> np.ndarray:
 # Synthetic geometry tests
 # ---------------------------------------------------------------------------
 
-def test_ground_plane_constant_depth():
-    """Frontal plane at depth Z: with identity R_tilt this acts as a 'floor'
-    (normal along world +Y). Disparity = 1/Z, height ~ 0, angle ~ 0.
+def test_frontal_plane_constant_depth():
+    """Constant-depth image is a *frontal wall* (perpendicular to camera Z),
+    not a floor. Under the toolbox convention its normal points along
+    world +Y (forward), so the angle vs gravity should be ~90 deg.
+
+    Disparity = 1/Z is still exact. Height varies with image row because
+    different rows project to different world-Z.
     """
     H, W = 64, 96
     Z = 2.0  # meters
@@ -72,17 +73,66 @@ def test_ground_plane_constant_depth():
     assert hha.shape == (3, H, W)
     assert hha.dtype == np.float32
 
-    # Inspect the inner region to avoid border effects from edge-padded normals.
-    inner = (slice(None), slice(8, H - 8), slice(8, W - 8))
-    disparity, height, angle = hha[inner[0]][:, inner[1], inner[2]], None, None  # noqa
+    # Disparity is exact for valid pixels.
     disp = hha[0, 8:H - 8, 8:W - 8]
-    h = hha[1, 8:H - 8, 8:W - 8]
-    ang = hha[2, 8:H - 8, 8:W - 8]
-
     np.testing.assert_allclose(disp, 1.0 / Z, rtol=1e-5)
-    np.testing.assert_allclose(h, 0.0, atol=0.1)  # ~0 after floor subtract
-    # Angle should be ~0 deg (normal aligned with anti-gravity).
-    assert np.nanmean(ang) < 5.0, f"expected angle ~0, got mean {np.nanmean(ang):.2f}"
+
+    # Angle should be near 90 deg (vertical surface).
+    ang = hha[2, 8:H - 8, 8:W - 8]
+    finite_ang = ang[np.isfinite(ang)]
+    assert finite_ang.size > 0
+    assert np.nanmean(finite_ang) > 80.0, (
+        f"expected angle ~90 (frontal wall), got mean {np.nanmean(finite_ang):.2f}"
+    )
+
+
+def test_horizontal_floor_synthetic():
+    """A genuine horizontal floor: world-Z = const, normal along +Z_world.
+    Under the canonical (signed) HHA convention this should yield
+    angle ~ 180 deg (floor normal opposite to gravity) and
+    height ~ 0 across the whole surface (after floor-percentile subtract).
+    """
+    H, W = 80, 96
+    fx = fy = 200.0
+    cx, cy = W / 2.0, H / 2.0
+    K = _make_K(fx, fy, cx, cy)
+    R = _identity_R_tilt()
+
+    # Floor at world-Z = -1 (i.e., 1 m below the camera).
+    # Camera frame: world Z = -y_cam, so y_cam = +1 on the floor.
+    # depth(u, v) = z_cam such that y_cam = (v - cy) * depth / fy = 1
+    #            -> depth = fy / (v - cy)  for v > cy
+    floor_z_world = -1.0
+    v = np.arange(H, dtype=np.float64)[:, None]
+    valid_rows = v > cy + 1
+    d_v = np.where(valid_rows, fy * (-floor_z_world) / np.maximum(v - cy, 1e-3), 0.0)
+    depth = np.broadcast_to(d_v, (H, W)).astype(np.float32)
+    depth = np.where(depth > 7.5, 0.0, depth).astype(np.float32)
+
+    hha = compute_hha(depth, K, R)
+
+    valid = depth > 0
+    inner = np.zeros_like(valid)
+    inner[H // 2 + 6:H - 6, 6:W - 6] = True
+    region = inner & valid
+    assert region.sum() > 100
+
+    height = hha[1][region]
+    angle = hha[2][region]
+    finite = np.isfinite(height) & np.isfinite(angle)
+    height = height[finite]
+    angle = angle[finite]
+    assert height.size > 50
+
+    assert np.median(height) < 0.05, (
+        f"expected floor height ~0 m, got median {np.median(height):.3f}"
+    )
+    # Floor normal points up (+Z_world); gravity points down (-Z_world).
+    # cos(angle) = N . g = -N_z = -(+1) = -1, so angle ~ 180 deg.
+    assert np.median(angle) > 170.0, (
+        f"expected floor angle ~180 deg (canonical signed HHA), "
+        f"got median {np.median(angle):.2f}"
+    )
 
 
 def test_vertical_wall_depth_varies_with_column():
@@ -167,9 +217,13 @@ def test_45_degree_ramp():
     finite_ang = ang[np.isfinite(ang)]
     assert finite_ang.size > 0
     median_ang = float(np.median(finite_ang))
-    # Allow a generous tolerance because finite-difference normals are noisy.
-    assert 30.0 < median_ang < 60.0, (
-        f"expected ramp angle ~45, got median {median_ang:.2f}"
+    # The ramp is constructed so its surface normal points up-and-back.
+    # Canonical signed HHA: cos(angle) = N . g_down = -N_z. With N_z > 0
+    # (normal points up after camera-orientation disambiguation), the
+    # angle lands in the upper half of [0, 180]. A 45-deg tilt of a
+    # floor-like surface should give ~135 deg (= 180 - 45).
+    assert 120.0 < median_ang < 150.0, (
+        f"expected ramp angle ~135 (canonical signed HHA), got median {median_ang:.2f}"
     )
 
 
@@ -299,7 +353,8 @@ def test_real_sample_smoke():
     assert disp.size > 0 and height.size > 0 and angle.size > 0
     assert 0.0 <= disp.min() and disp.max() <= 10.0 + 1e-6
     assert -3.0 <= np.percentile(height, 1) and np.percentile(height, 99) <= 5.0
-    assert 0.0 <= angle.min() and angle.max() <= 90.0 + 1e-3
+    # Canonical signed HHA: angle in [0, 180] (0=ceiling, 90=wall, 180=floor).
+    assert 0.0 <= angle.min() and angle.max() <= 180.0 + 1e-3
 
 
 # ---------------------------------------------------------------------------

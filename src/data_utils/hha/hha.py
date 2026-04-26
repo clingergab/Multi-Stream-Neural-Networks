@@ -1,18 +1,43 @@
 """Compute the 3-channel HHA encoding from a SUN RGB-D depth image.
 
-Channels (matching Gupta et al. 2014):
+Channels (matching Gupta et al. 2014, ``saveHHA.m`` from rcnn-depth):
     0. Horizontal disparity = 1 / depth_m, clamped to [0, 10] (1/m).
-    1. Height above ground in meters: world-frame Y_world minus a per-image
-       floor estimate (5th percentile of valid Y_world).
-    2. Angle with gravity in degrees, in [0, 90]. Computed as
-       ``arccos(|n_y_world|) * 180/pi`` so the channel is hflip-equivariant
-       (a wall facing left and the same wall facing right yield the same
-       angle).
+    1. Height above ground in meters: world-frame **Z_world** minus a per-image
+       floor estimate (5th percentile of valid Z_world).
+    2. **Signed** angle with gravity in degrees, in [0, 180]. Computed as
+       ``arccos(N · g) * 180/pi`` where ``g`` is the gravity direction (-Z
+       in our world frame). This is the canonical form:
 
-Backprojection follows the SUN RGB-D toolbox conventions:
+           ceiling pixels (normal points down)  -> angle ~   0 deg
+           vertical walls (normal horizontal)   -> angle ~  90 deg
+           floor pixels   (normal points up)    -> angle ~ 180 deg
+
+       The signed form preserves the floor/ceiling distinction. It is still
+       hflip-equivariant because gravity has no x-component, so the
+       horizontal flip (which only flips the x-component of the normal)
+       cannot change ``N · g``. The earlier ``arccos(|N · g|)`` form was a
+       deviation from canonical HHA that collapsed floors and ceilings to
+       the same value with no benefit.
+
+To make the *sign* of N_z geometrically meaningful, we orient normals
+consistently toward the camera origin: any normal with ``N · P_world > 0``
+(pointing AWAY from the camera, i.e., into the surface) is flipped. This
+keeps the cross-product chirality consistent across surfaces.
+
+Toolbox axis convention (verified against ``read_3d_pts_general.m`` lines 22-25
+and ``read3dPoints.m``):
+
+    intermediate point = (X_cam, Z_cam, -Y_cam) = (right, forward, up)
+
+So in the toolbox's "world" frame after R_tilt, **axis 2 (Z_world) is the
+gravity-aligned up axis**, not axis 1. R_tilt is approximately the identity
+for upright cameras; the off-diagonal components correct for camera tilt.
+Earlier versions of this code mistakenly used axis 1 — see Phase 0.1 in the
+plan. The visualization-driven debug at 2026-04-26 caught this.
+
+Backprojection:
     1. Camera-frame XYZ from pixels and depth.
     2. Reorder/flip to intermediate frame ``(X_cam, Z_cam, -Y_cam)``.
-       (This matches ``read_3d_pts_general.m`` lines 22-25.)
     3. World frame: ``XYZ_world = R_tilt @ XYZ_intermediate``, where R_tilt
        is the basis-converted rotation returned by ``read_extrinsics``.
 
@@ -202,27 +227,38 @@ def _compute_hha_inner(
     # World coords: pts_world[h, w, :] = R_tilt @ pts_inter[h, w, :]
     pts_world = pts_inter @ R_tilt.T
 
-    # --- Channel 1: height above ground = Y_world - floor estimate. ---
-    y_world = pts_world[..., 1]  # [H, W]
-    valid_y = y_world[valid]
-    if valid_y.size == 0:
+    # --- Channel 1: height above ground = Z_world - floor estimate. ---
+    # Toolbox convention: axis 2 is the up axis (intermediate is
+    # (right, forward, up); near-identity R_tilt preserves this).
+    z_world = pts_world[..., 2]  # [H, W]
+    valid_z = z_world[valid]
+    if valid_z.size == 0:
         floor = 0.0
     else:
-        floor = float(np.percentile(valid_y, floor_percentile))
-    height = np.where(valid, y_world - floor, np.nan)
+        floor = float(np.percentile(valid_z, floor_percentile))
+    height = np.where(valid, z_world - floor, np.nan)
 
-    # --- Channel 2: angle with gravity in degrees, in [0, 90]. ---
+    # --- Channel 2: signed angle with gravity in degrees, in [0, 180]. ---
     # Estimate normals from the world-frame point cloud (this way the cross
     # product directly yields a world-frame normal). Use zero-filled pts
     # (valid mask sets bad neighborhoods to NaN inside the estimator).
     pts_world_zerofilled = np.where(valid[..., None], pts_world, 0.0)
     normals = _estimate_normals_world(pts_world_zerofilled, valid)
 
-    # arccos(|n_y_world|) — anti-gravity is +Y_world (per the toolbox basis).
-    n_y = normals[..., 1]
-    cos_theta = np.clip(np.abs(n_y), 0.0, 1.0)
-    angle_deg = np.degrees(np.arccos(cos_theta))
-    angle_deg = np.where(np.isnan(n_y), np.nan, angle_deg)
+    # Orient normals consistently toward the camera origin. Any normal with
+    # N . P_world > 0 points AWAY from the camera (into the surface) and gets
+    # flipped. This makes the sign of N_z geometrically meaningful instead of
+    # an artifact of cross-product chirality.
+    dot_with_position = np.nansum(normals * pts_world, axis=-1, keepdims=True)
+    flip_mask = dot_with_position > 0
+    normals = np.where(flip_mask, -normals, normals)
+
+    # arccos(N . gravity). Gravity in world frame = -Z (anti-gravity is +Z).
+    # So cos_theta = N . (0, 0, -1) = -N_z.
+    n_z = normals[..., 2]
+    cos_theta = np.clip(-n_z, -1.0, 1.0)
+    angle_deg = np.degrees(np.arccos(cos_theta))  # in [0, 180]
+    angle_deg = np.where(np.isnan(n_z), np.nan, angle_deg)
     angle_deg = np.where(valid, angle_deg, np.nan)
 
     # --- Stack and substitute invalid_value if not NaN. ---
