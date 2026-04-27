@@ -277,34 +277,30 @@ class _LIConvNd(nn.Module):
                 init.uniform_(self.integrated_bias, -bound, bound)
 
         # Initialize integration weights (1x1 convolutions for stream mixing)
-        # Symmetry-breaking experiment, iteration 3 (option 1 follow-up).
+        # Symmetry-breaking experiment, iteration 4 (option A: pure Kaiming,
+        # no mean shift).
         #
-        # Prior runs:
-        #   constant_(1/N)         -> rel_drift 0.034 (frozen)
-        #   normal_(1/N, 0.01/N)   -> rel_drift 0.036 (still frozen; seed below threshold)
-        #   normal_(1/N, 0.30/N)   -> rel_drift 0.407 (escapes; val_mca unchanged)
+        # Prior runs (all val_mca within ±1 pt):
+        #   constant_(1/N)               -> rel_drift 0.034 (frozen visibly)
+        #   normal_(1/N, 0.01/N)         -> rel_drift 0.036 (frozen visibly)
+        #   normal_(1/N, 0.30/N)         -> rel_drift 0.407 (uniform escape)
+        #   normal_(1/N, 1/sqrt(fan_in)) -> rel_drift 0.11–0.29 (scales w/ fan_in)
         #
-        # That established Reading 2 (architecture is robust; per-stream
-        # W_int_i pathway is functionally redundant with W_prev). This
-        # iteration adds finer mechanistic resolution: a layer-dependent std
-        # of 1/sqrt(fan_in) — Kaiming magnitude with mean held at 1/N. For
-        # 1x1 convs, fan_in = stream_out_channels:
-        #   conv1/layer1 (fan_in=48):  std = 1/sqrt(48)  ≈ 0.144
-        #   layer2       (fan_in=96):  std = 1/sqrt(96)  ≈ 0.102
-        #   layer3       (fan_in=192): std = 1/sqrt(192) ≈ 0.072
-        #   layer4       (fan_in=384): std = 1/sqrt(384) ≈ 0.051
+        # All four hold the row-mean ≈ 1/N invariant. This iteration drops
+        # that constraint entirely: pure Kaiming-normal with mean = 0. At
+        # init each integrated output channel sees a near-zero weighted sum
+        # of the stream's channels (vs. the (channel_sum/N)·ones scalar
+        # broadcast under constant init). Tests whether the row-mean = 1/N
+        # constraint was load-bearing for gradient flow, or whether it was
+        # just one defensible point in a wider basin of valid inits.
         #
-        # The shallow layers see ~σ=0.30/N magnitude; deep layers see ~⅓ of
-        # that. Tells us whether the rel_drift basin's depth scales with
-        # fan_in (deep layers stay frozen at this seed, shallow ones escape).
+        # IMPORTANT: gradient flow at init must be verified before training.
+        # If integrated-stream activations at conv1 collapse to bias-only
+        # (since streams contribute near-zero) and gradients to W_int_i go
+        # to zero, this option is structurally not viable and we fall back
+        # to per-channel gates.
         for integration_weight in self.integration_from_streams:
-            fan_in, _ = init._calculate_fan_in_and_fan_out(integration_weight)
-            std = (1.0 / math.sqrt(fan_in)) if fan_in > 0 else 0.0
-            init.normal_(
-                integration_weight,
-                mean=1.0 / self.num_streams,
-                std=std,
-            )
+            init.kaiming_normal_(integration_weight)
     
     def extra_repr(self):
         """String representation exactly like _ConvNd."""
