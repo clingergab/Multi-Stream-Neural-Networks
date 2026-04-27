@@ -124,7 +124,6 @@ class LINet(BaseModel):
         num_subnodes: int = 3,  # K sub-nodes per class; only used when classifier_head='maxout'
         subnode_dropout: float = 0.1,  # per-sub-node dropout during training to combat winner-takes-all; only for maxout with K>1
         maxout_init_perturb_std: float = 0.1,  # Gaussian noise std added to maxout fc.weight at init; only for maxout with K>1
-        use_integration_gates: bool = False,  # Per-channel sigmoid gate per stream on each LIConv2d's integration step
         **kwargs
     ) -> None:
         # Store LINet-specific parameters BEFORE calling super().__init__
@@ -140,9 +139,6 @@ class LINet(BaseModel):
         self.num_subnodes = num_subnodes
         self.subnode_dropout = subnode_dropout
         self.maxout_init_perturb_std = maxout_init_perturb_std
-        # Per-channel modality gate flag — read by _build_network and _make_layer
-        # to plumb the kwarg into every LIConv2d that gets constructed.
-        self.use_integration_gates = use_integration_gates
 
         # Set LINet default norm layer if not specified
         if norm_layer is None:
@@ -194,8 +190,7 @@ class LINet(BaseModel):
             self.stream_inplanes,  # list[int] of output channels for each stream
             0,  # integrated_in_channels (doesn't exist yet)
             self.integrated_inplanes,  # integrated_out_channels
-            kernel_size=7, stride=2, padding=3, bias=False,
-            use_integration_gates=self.use_integration_gates,
+            kernel_size=7, stride=2, padding=3, bias=False
         )
         self.bn1 = self._norm_layer(self.stream_inplanes, self.integrated_inplanes)
         self.relu = LIReLU(inplace=True)
@@ -296,8 +291,7 @@ class LINet(BaseModel):
                     [p * block.expansion for p in stream_planes],
                     self.integrated_inplanes,
                     integrated_planes * block.expansion,
-                    kernel_size=1, stride=stride, bias=False,
-                    use_integration_gates=self.use_integration_gates,
+                    kernel_size=1, stride=stride, bias=False
                 ),
                 norm_layer([p * block.expansion for p in stream_planes], integrated_planes * block.expansion)
             )
@@ -315,8 +309,7 @@ class LINet(BaseModel):
                 self.groups,
                 self.base_width,
                 previous_dilation,
-                norm_layer,
-                use_integration_gates=self.use_integration_gates,
+                norm_layer
             )
         )
 
@@ -336,7 +329,6 @@ class LINet(BaseModel):
                     base_width=self.base_width,
                     dilation=self.dilation,
                     norm_layer=norm_layer,
-                    use_integration_gates=self.use_integration_gates,
                 )
             )
 
@@ -1304,13 +1296,9 @@ class LINet(BaseModel):
 
             # Capture LRs that were used during this epoch BEFORE stepping the scheduler
             current_lr = self.optimizer.param_groups[-1]['lr']  # Base LR is last group (shared params)
-            # With stem_lr_multiplier: [stem_0, stem_1, backbone_0, backbone_1, integ_no_wd, integ_wd, other]
-            # Without: [stream_0, stream_1, integ_no_wd, integ_wd, other]
-            # (integ_no_wd holds integration_from_streams + modality_gates with weight_decay=0;
-            #  integ_wd holds integrated_weight, fc.*, fc_streams.* with integration_weight_decay)
+            # With stem_lr_multiplier: groups are [stem_0, stem_1, backbone_0, backbone_1, integ, other]
+            # Without: groups are [stream_0, stream_1, integ, other]
             n_groups = len(self.optimizer.param_groups)
-            # Threshold detects stem split because with-stems adds N+1 groups vs without-stems,
-            # while the integration WD/no-WD split only adds 1. Holds for any N >= 1.
             has_stem_split = (n_groups >= 2 * self.num_streams + 2)
             if has_stem_split:
                 epoch_stem_lrs = [pg['lr'] for pg in self.optimizer.param_groups[:self.num_streams]]

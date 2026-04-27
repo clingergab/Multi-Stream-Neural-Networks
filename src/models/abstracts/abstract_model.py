@@ -138,31 +138,24 @@ class BaseModel(nn.Module, ABC):
         """
         Create parameter groups for stream-specific learning rates in N-stream models.
 
-        This method separates model parameters into N+3 groups (or 2N+3 when
-        stem_lr_multiplier != 1.0) when integration_weight_decay is provided:
+        This method separates model parameters into N+2 groups (or 2N+2 when
+        stem_lr_multiplier != 1.0):
         - N stream-specific groups (one per stream): Contains stream_weights.i and stream_biases.i
           (the stream's own feature extraction parameters)
-        - 1 integration-no-WD group: Contains integration_from_streams.* and modality_gates.*.
-          ALWAYS gets weight_decay=0 — WD on a sigmoid logit pulls toward sigmoid(0)=0.5
-          (a half-on prior, which conflicts with the near-identity init); WD on
-          integration_from_streams suppresses the symmetry-breaking the integration step
-          is supposed to learn.
-        - 1 integration-WD group: Contains integrated_weight (4D conv), classifier heads
-          (fc.*, fc_streams.*). Trainable weight matrices that benefit from L2 regularization.
-          Uses integration_weight_decay.
+        - 1 integration group: Contains integration_from_streams.*, integrated_weight, integrated_bias,
+          and classifier heads (fc, fc_streams). These are all trainable weight matrices that benefit
+          from weight decay regularization.
         - 1 other group: Contains BN parameters and any other shared parameters
           (these conventionally get zero weight decay to avoid hurting normalization)
 
         When stem_lr_multiplier != 1.0, each stream group is split into a stem group
         (conv1 parameters, with scaled LR) and a backbone group (layer1-4 parameters),
-        producing 2N+3 groups total. Weight decay for stem groups is scaled down by
+        producing 2N+2 groups total. Weight decay for stem groups is scaled down by
         1/stem_lr_multiplier to keep effective regularization constant under AdamW.
 
-        When integration_weight_decay is None (legacy mode), the integration-WD group
-        is merged into the "other" group with shared_weight_decay (preserving old
-        behavior). The integration-no-WD group is always kept separate so
-        integration_from_streams and modality_gates always have weight_decay=0
-        regardless of mode. Group count: N+2 / 2N+2 in legacy mode.
+        When integration_weight_decay is None (default), the old behavior is preserved:
+        integration params and other params are merged into a single shared group with
+        shared_weight_decay applied to all.
 
         Args:
             stream_lrs: Learning rate(s) for stream-specific parameters.
@@ -175,12 +168,9 @@ class BaseModel(nn.Module, ABC):
                       If None, defaults to mean of stream_lrs.
             shared_weight_decay: Weight decay for non-integration shared parameters
                                 (BN, classifier heads). Default: 0.0.
-            integration_weight_decay: Weight decay for the WD-applied integration
-                                     parameters (integrated_weight conv, fc.*, fc_streams.*).
-                                     Does NOT apply to integration_from_streams or modality_gates,
-                                     which are always weight_decay=0 in their own group.
-                                     If None, the WD-applied integration group is merged into
-                                     "other" with shared_weight_decay (legacy behavior).
+            integration_weight_decay: Weight decay for integration parameters
+                                     (integration_from_streams.*, integrated_weight, integrated_bias).
+                                     If None, integration params use shared_weight_decay (legacy behavior).
             stem_lr_multiplier: Multiplier for stem (conv1) learning rate relative to stream LRs.
                                Default 1.0 preserves the existing 4-group structure.
                                Values > 1.0 give the stem a higher LR to escape Kaiming initialization.
@@ -217,21 +207,13 @@ class BaseModel(nn.Module, ABC):
         if shared_lr is None:
             shared_lr = sum(stream_lrs) / len(stream_lrs)
 
-        # Separate parameters into stem / stream (backbone) / integration_no_wd /
-        # integration_wd / other.
-        # - integration_no_wd: integration_from_streams.* + modality_gates.* (always WD=0)
-        # - integration_wd: integrated_weight (4D conv), integrated_bias (>=2D), fc.*, fc_streams.*
-        # - other: BN affine + 1D integrated_weight/integrated_bias (no WD to preserve normalization)
+        # Separate parameters into stem / stream (backbone) / integration / other
         split_stem = (stem_lr_multiplier != 1.0)
         stem_params = [[] for _ in range(num_streams)]
         stream_params = [[] for _ in range(num_streams)]
-        integration_no_wd_params = []
-        integration_wd_params = []
+        integration_params = []
         other_params = []
 
-        # Match conditions tolerate both '.integration_from_streams.' (typical: nested module
-        # like layer1.0.conv1.integration_from_streams.0) and a top-level prefix like
-        # 'integration_from_streams.0' (no leading dot). Same for modality_gates.
         for name, param in self.named_parameters():
             # Stream-specific: stream_weights.i and stream_biases.i
             if '.stream_weights.' in name or '.stream_biases.' in name:
@@ -243,28 +225,25 @@ class BaseModel(nn.Module, ABC):
                     else:
                         stream_params[stream_idx].append(param)
                     continue
-            # Integration mixing weights — always weight_decay=0 (see docstring)
-            if '.integration_from_streams.' in name or name.startswith('integration_from_streams.'):
-                integration_no_wd_params.append(param)
+            # Integration conv weights: integration_from_streams.* and
+            # integrated_weight/integrated_bias that are conv params (4D or 0D for first-layer).
+            # BN affine params (integrated_weight/integrated_bias with 1D shape) go to other_params
+            # since penalizing BN scale/shift toward zero hurts normalization.
+            if '.integration_from_streams.' in name:
+                integration_params.append(param)
                 continue
-            # Per-channel modality gates — always weight_decay=0 (sigmoid logits)
-            if '.modality_gates.' in name or name.startswith('modality_gates.'):
-                integration_no_wd_params.append(param)
-                continue
-            # integrated_weight / integrated_bias: conv params (>=2D) get integration WD;
-            # BN affine (1D) goes to other_params since penalizing BN scale/shift toward 0
-            # hurts normalization.
             if '.integrated_weight' in name or '.integrated_bias' in name:
                 if param.dim() >= 2:
-                    integration_wd_params.append(param)
+                    integration_params.append(param)
                 else:
                     other_params.append(param)
                 continue
-            # Classifier heads — always trained from scratch, get weight decay
+            # Classifier heads: fc and fc_streams get weight decay with integration params
+            # (classifier is always trained from scratch, even in transfer learning)
             if name.startswith('fc.') or name.startswith('fc_streams.'):
-                integration_wd_params.append(param)
+                integration_params.append(param)
                 continue
-            # Everything else: BN params and other shared params (no weight decay)
+            # Everything else: BN params (no weight decay)
             other_params.append(param)
 
         # Build groups
@@ -288,19 +267,11 @@ class BaseModel(nn.Module, ABC):
                     'weight_decay': stream_weight_decays[i]
                 })
 
-        # Integration-no-WD group (always its own group, always weight_decay=0)
-        if integration_no_wd_params:
-            param_groups.append({
-                'params': integration_no_wd_params,
-                'lr': shared_lr,
-                'weight_decay': 0.0,
-            })
-
         if integration_weight_decay is not None:
-            # Split mode: integration_wd as its own group with integration_weight_decay
-            if integration_wd_params:
+            # Split mode: separate WD for integration vs other
+            if integration_params:
                 param_groups.append({
-                    'params': integration_wd_params,
+                    'params': integration_params,
                     'lr': shared_lr,
                     'weight_decay': integration_weight_decay
                 })
@@ -311,9 +282,8 @@ class BaseModel(nn.Module, ABC):
                     'weight_decay': shared_weight_decay
                 })
         else:
-            # Legacy mode: merge integration_wd with other under shared_weight_decay
-            # (integration_no_wd stays separate above to preserve the WD=0 invariant).
-            all_shared = integration_wd_params + other_params
+            # Legacy mode: all non-stream params in one group
+            all_shared = integration_params + other_params
             if all_shared:
                 param_groups.append({
                     'params': all_shared,
