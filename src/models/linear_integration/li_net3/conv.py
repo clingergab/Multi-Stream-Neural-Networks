@@ -277,28 +277,33 @@ class _LIConvNd(nn.Module):
                 init.uniform_(self.integrated_bias, -bound, bound)
 
         # Initialize integration weights (1x1 convolutions for stream mixing)
-        # Symmetry-breaking experiment, iteration 2.
+        # Symmetry-breaking experiment, iteration 3 (option 1 follow-up).
         #
-        # Iteration 1 (std = 0.01 / num_streams) didn't escape the rank-1
-        # basin: post-training rel_drift was ~0.034, identical to the
-        # original `init.constant_(W, 1/N)` baseline. The seed asymmetry
-        # was below the noise floor of the gradient signal pulling weights
-        # back toward the constant mode.
+        # Prior runs:
+        #   constant_(1/N)         -> rel_drift 0.034 (frozen)
+        #   normal_(1/N, 0.01/N)   -> rel_drift 0.036 (still frozen; seed below threshold)
+        #   normal_(1/N, 0.30/N)   -> rel_drift 0.407 (escapes; val_mca unchanged)
         #
-        # Iteration 2 widens the spread to test whether magnitude itself is
-        # the trap. std = 0.30 / num_streams gives entries in roughly
-        # [0.05, 0.95] at ±3σ for N=2 — substantial scatter around the 1/N
-        # mean. The aggregate matrix mean is still ≈ 1/N (preserves the
-        # gradient-pathology fix in the average sense), but per-row means
-        # now scatter by O(0.30 / sqrt(M·num_streams)). If post-training
-        # rel_drift remains ~0.03 with this much initial spread, the rank-1
-        # constant configuration is the architecture's natural attractor,
-        # not an accident of init.
+        # That established Reading 2 (architecture is robust; per-stream
+        # W_int_i pathway is functionally redundant with W_prev). This
+        # iteration adds finer mechanistic resolution: a layer-dependent std
+        # of 1/sqrt(fan_in) — Kaiming magnitude with mean held at 1/N. For
+        # 1x1 convs, fan_in = stream_out_channels:
+        #   conv1/layer1 (fan_in=48):  std = 1/sqrt(48)  ≈ 0.144
+        #   layer2       (fan_in=96):  std = 1/sqrt(96)  ≈ 0.102
+        #   layer3       (fan_in=192): std = 1/sqrt(192) ≈ 0.072
+        #   layer4       (fan_in=384): std = 1/sqrt(384) ≈ 0.051
+        #
+        # The shallow layers see ~σ=0.30/N magnitude; deep layers see ~⅓ of
+        # that. Tells us whether the rel_drift basin's depth scales with
+        # fan_in (deep layers stay frozen at this seed, shallow ones escape).
         for integration_weight in self.integration_from_streams:
+            fan_in, _ = init._calculate_fan_in_and_fan_out(integration_weight)
+            std = (1.0 / math.sqrt(fan_in)) if fan_in > 0 else 0.0
             init.normal_(
                 integration_weight,
                 mean=1.0 / self.num_streams,
-                std=0.30 / self.num_streams,
+                std=std,
             )
     
     def extra_repr(self):
