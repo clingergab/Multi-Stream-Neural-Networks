@@ -19,7 +19,8 @@ def li_conv3x3(
     integrated_out_planes: int,
     stride: int = 1,
     groups: int = 1,
-    dilation: int = 1
+    dilation: int = 1,
+    use_integration_gates: bool = False,
 ) -> LIConv2d:
     """3x3 linear integration convolution with padding."""
     return LIConv2d(
@@ -33,6 +34,7 @@ def li_conv3x3(
         dilation=dilation,
         groups=groups,
         bias=False,
+        use_integration_gates=use_integration_gates,
     )
 
 
@@ -41,7 +43,8 @@ def li_conv1x1(
     stream_out_planes: list[int],
     integrated_in_planes: int,
     integrated_out_planes: int,
-    stride: int = 1
+    stride: int = 1,
+    use_integration_gates: bool = False,
 ) -> LIConv2d:
     """1x1 linear integration convolution."""
     return LIConv2d(
@@ -52,6 +55,7 @@ def li_conv1x1(
         kernel_size=1,
         stride=stride,
         bias=False,
+        use_integration_gates=use_integration_gates,
     )
 
 
@@ -77,6 +81,7 @@ class LIBasicBlock(nn.Module):
         base_width: int = 64,
         dilation: int = 1,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
+        use_integration_gates: bool = False,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -97,7 +102,8 @@ class LIBasicBlock(nn.Module):
             stream_planes,
             integrated_inplanes,
             integrated_planes,
-            stride=stride
+            stride=stride,
+            use_integration_gates=use_integration_gates,
         )
         self.bn1 = norm_layer(stream_planes, integrated_planes)
         self.relu = LIReLU(inplace=True)
@@ -106,7 +112,8 @@ class LIBasicBlock(nn.Module):
             stream_planes,
             stream_planes,
             integrated_planes,
-            integrated_planes
+            integrated_planes,
+            use_integration_gates=use_integration_gates,
         )
         self.bn2 = norm_layer(stream_planes, integrated_planes)
 
@@ -230,6 +237,7 @@ class LIBottleneck(nn.Module):
         base_width: int = 64,
         dilation: int = 1,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
+        use_integration_gates: bool = False,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -249,7 +257,8 @@ class LIBottleneck(nn.Module):
             stream_inplanes,
             stream_widths,
             integrated_inplanes,
-            integrated_width
+            integrated_width,
+            use_integration_gates=use_integration_gates,
         )
         self.bn1 = norm_layer(stream_widths, integrated_width)
         self.conv2 = li_conv3x3(
@@ -257,14 +266,16 @@ class LIBottleneck(nn.Module):
             stream_widths,
             integrated_width,
             integrated_width,
-            stride, groups, dilation
+            stride, groups, dilation,
+            use_integration_gates=use_integration_gates,
         )
         self.bn2 = norm_layer(stream_widths, integrated_width)
         self.conv3 = li_conv1x1(
             stream_widths,
             self.stream_outplanes,
             integrated_width,
-            self.integrated_outplanes
+            self.integrated_outplanes,
+            use_integration_gates=use_integration_gates,
         )
         self.bn3 = norm_layer(self.stream_outplanes, self.integrated_outplanes)
         self.relu = LIReLU(inplace=True)

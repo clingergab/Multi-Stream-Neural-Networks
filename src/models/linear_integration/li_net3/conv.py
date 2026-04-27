@@ -46,7 +46,8 @@ class _LIConvNd(nn.Module):
         integrated_weight: Optional[Tensor],
         integration_from_streams_weights: list[Tensor],
         stream_biases: list[Optional[Tensor]],
-        integrated_bias: Optional[Tensor]
+        integrated_bias: Optional[Tensor],
+        modality_gates: Optional[list[Tensor]] = None,
     ) -> tuple[list[Tensor], Tensor]:
         """Abstract method to be implemented by subclasses."""
         ...
@@ -88,10 +89,11 @@ class _LIConvNd(nn.Module):
         padding_mode: str,
         device=None,
         dtype=None,
+        use_integration_gates: bool = False,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        
+
         # Validate parameters exactly like _ConvNd
         if groups <= 0:
             raise ValueError("groups must be a positive integer")
@@ -226,6 +228,19 @@ class _LIConvNd(nn.Module):
             for i in range(num_streams)
         ])
 
+        # Optional per-channel sigmoid gate per stream. When enabled, each
+        # stream's contribution to the integrated output is multiplied
+        # channel-wise by sigmoid(modality_gates[i]) of shape (M,). Init at
+        # logit(0.95) ≈ 2.94 → sigmoid ≈ 0.95, near-identity but with a
+        # non-saturated derivative (≈ 0.0475) so gates can move from step 0.
+        if use_integration_gates:
+            self.modality_gates = nn.ParameterList([
+                Parameter(torch.empty(integrated_out_channels, **factory_kwargs))
+                for _ in range(num_streams)
+            ])
+        else:
+            self.modality_gates = None
+
         # Contribution capture flag for stream decomposition visualization.
         # When True, _conv_forward stores per-stream contributions to integrated output.
         # NOT compatible with DataParallel or concurrent forward passes.
@@ -301,7 +316,14 @@ class _LIConvNd(nn.Module):
         # to per-channel gates.
         for integration_weight in self.integration_from_streams:
             init.kaiming_normal_(integration_weight)
-    
+
+        # Initialize per-channel modality gates to logit(0.95) ≈ 2.94 so
+        # sigmoid(gate) ≈ 0.95 at init (near-identity, but with non-saturated
+        # derivative ≈ 0.0475 — gates can move from step 0).
+        if self.modality_gates is not None:
+            for gate in self.modality_gates:
+                init.constant_(gate, 2.94)
+
     def extra_repr(self):
         """String representation exactly like _ConvNd."""
         s = (
@@ -356,6 +378,7 @@ class LIConv2d(_LIConvNd):
         padding_mode: str = "zeros",
         device=None,
         dtype=None,
+        use_integration_gates: bool = False,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size_ = _pair(kernel_size)
@@ -377,6 +400,7 @@ class LIConv2d(_LIConvNd):
             bias,
             padding_mode,
             **factory_kwargs,
+            use_integration_gates=use_integration_gates,
         )
 
     def _conv_forward(
@@ -388,6 +412,7 @@ class LIConv2d(_LIConvNd):
         integration_from_streams_weights: list[Tensor],
         stream_biases: list[Optional[Tensor]],
         integrated_bias: Optional[Tensor],
+        modality_gates: Optional[list[Tensor]] = None,
         blanked_mask: Optional[dict[int, Tensor]] = None
     ) -> tuple[list[Tensor], Tensor]:
         """
@@ -474,16 +499,28 @@ class LIConv2d(_LIConvNd):
 
         balance_norms = [] if self._capture_balance_norms else None
 
-        for stream_out_raw, integration_weight in zip(stream_outputs_raw, integration_from_streams_weights):
+        # NOTE: balance_norms captures the PRE-gate contribution (stream-as-feature-extractor
+        # signal), while _capture_contributions records the POST-gate value (what actually
+        # reached the integrated stream). They answer different questions and should not be
+        # compared directly.
+        for i, (stream_out_raw, integration_weight) in enumerate(
+            zip(stream_outputs_raw, integration_from_streams_weights)
+        ):
             integrated_contrib = F.conv2d(
                 stream_out_raw, integration_weight, None,  # Integrate RAW dendritic signals
                 stride=1, padding=0  # 1x1 conv, stride=1 (already spatially aligned)
             )
+            # Pre-gate balance norm (independent of any gate decision so the balance loss
+            # measures stream capacity rather than gate state).
+            if balance_norms is not None:
+                balance_norms.append(integrated_contrib.norm())
+            # Per-channel modality gate: sigmoid(gate) ∈ (0, 1) scales each output channel.
+            if modality_gates is not None:
+                gate = torch.sigmoid(modality_gates[i]).view(1, -1, 1, 1)
+                integrated_contrib = gate * integrated_contrib
             integrated_out = integrated_out + integrated_contrib
             if self._capture_contributions:
                 contributions['stream_contributions'].append(integrated_contrib.detach().cpu())
-            if balance_norms is not None:
-                balance_norms.append(integrated_contrib.norm())
 
         # Add integrated bias (soma's firing threshold)
         # This is the ONLY bias for integration, representing the membrane potential threshold
@@ -517,6 +554,8 @@ class LIConv2d(_LIConvNd):
         stream_weights_list = list(self.stream_weights)
         integration_from_streams_weights_list = list(self.integration_from_streams)
         stream_biases_list = list(self.stream_biases) if self.stream_biases is not None else [None] * self.num_streams
+        modality_gates_list = (list(self.modality_gates)
+                               if self.modality_gates is not None else None)
 
         return self._conv_forward(
             stream_inputs,
@@ -526,6 +565,7 @@ class LIConv2d(_LIConvNd):
             integration_from_streams_weights_list,
             stream_biases_list,
             self.integrated_bias,
+            modality_gates_list,
             blanked_mask
         )
 
