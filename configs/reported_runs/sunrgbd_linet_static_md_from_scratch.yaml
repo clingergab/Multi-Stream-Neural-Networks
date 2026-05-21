@@ -1,0 +1,69 @@
+# LINet + Static Modality Dropout (constant from epoch 0), from scratch on SUN RGB-D.
+# Ablation: tests whether dropout from the very first update is catastrophic.
+# Result is that static MD remains viable (paper §4.4.1).
+#
+# Source: Paper Appendix Table B1 column 3.
+# Reported test MCA (Fusion / RGB-only / Depth-only): 43.2 / 32.9 / 33.7
+# Reported test Acc (Fusion / RGB-only / Depth-only): 47.2 / 36.1 / 36.0
+
+meta:
+  paper_table: "Table B1 col. 3"
+  reported_mca:
+    fusion: 43.2
+    rgb_only: 32.9
+    depth_only: 33.7
+  schedule: static_md
+
+dataset:
+  name: sunrgbd_19
+  data_root: data/sunrgbd_19
+  batch_size: 64
+  num_workers: 2
+  num_classes: 19
+  use_hha: false
+  stratified: true
+  normalize: true
+
+model:
+  architecture: li_resnet18
+  stream_input_channels: [3, 1]
+  width_multiplier: 0.75
+  dropout_p: 0.34
+  num_classes: 19
+  device: cuda
+  use_amp: true
+
+optimizer:
+  type: adamw
+  lr: 1.15e-4
+  weight_decay: 9.22e-5
+  stem_lr_multiplier: 21
+
+scheduler:
+  type: cosine
+  t_max: 86
+  eta_min: 3.48e-6
+  warmup_epochs: 0
+  warmup_start_factor: 1.0
+
+training:
+  epochs: 86
+  grad_clip_norm: 1.00
+  label_smoothing: 0.10
+  monitor: val_mca
+  early_stopping: false
+  restore_best_weights: false
+  seed: 42
+
+augmentation:
+  rgb_aug_prob: 0.97
+  rgb_aug_mag: 1.10
+  depth_aug_prob: 1.06
+  depth_aug_mag: 0.94
+
+modality_dropout:
+  enabled: true
+  rate: 0.48                              # constant from epoch 0 (no ramp)
+  start: 0
+  ramp: 0                                 # ramp=0 -> rate is applied immediately
+  schedule: ramp_up                       # schedule key ignored when ramp=0

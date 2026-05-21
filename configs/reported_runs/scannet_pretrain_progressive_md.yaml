@@ -1,0 +1,74 @@
+# LINet pretraining on the 100K-frame ScanNet subset, with Progressive MD.
+# Phase 1 of the ScanNet-pretrained recipe; produces the checkpoint that
+# is fine-tuned by sunrgbd_linet_progressive_md_scannet_pretrained.yaml.
+#
+# Source: Paper Appendix Table B3 footnote, "Progressive MD" pretraining
+# (the No-MD pretraining differs only in the MD schedule).
+# Reported on ScanNet (val) MCA (Fusion / RGB-only / Depth-only): 99.8 / 98.9 / 97.3
+
+meta:
+  paper_table: "Table B3 footnote (Progressive MD pretraining)"
+  reported_mca_scannet_val:
+    fusion: 99.8
+    rgb_only: 98.9
+    depth_only: 97.3
+  phase: pretrain
+  schedule: progressive_md
+  notes: |
+    Best checkpoint reported at epoch 50. ScanNet labels do not align with
+    the SUN RGB-D 19-class taxonomy; the pretraining objective is feature
+    learning for downstream SUN RGB-D fine-tuning, not direct SUN evaluation.
+
+dataset:
+  name: scannet_100k
+  data_root: data/scannet_100k            # override with --data-root on CLI
+  batch_size: 128                         # paper §4.2: ScanNet pretraining on A100
+  num_workers: 4
+  num_classes: null                       # set to the number of ScanNet scene categories used at preprocess time
+  use_hha: false
+  stratified: false
+  normalize: true
+
+model:
+  architecture: li_resnet18
+  stream_input_channels: [3, 1]
+  width_multiplier: 0.75
+  dropout_p: 0.13
+  num_classes: null                       # match dataset.num_classes
+  device: cuda
+  use_amp: true
+
+optimizer:
+  type: adamw
+  lr: 3.14e-4
+  weight_decay: 4.01e-4
+  stem_lr_multiplier: 16.0
+
+scheduler:
+  type: cosine
+  t_max: 50                               # best checkpoint at epoch 50
+  eta_min: 3.0e-6
+  warmup_epochs: 0
+  warmup_start_factor: 1.0
+
+training:
+  epochs: 50
+  grad_clip_norm: 1.20
+  label_smoothing: 0.07
+  monitor: val_mca
+  early_stopping: false
+  restore_best_weights: false
+  seed: 42
+
+augmentation:
+  rgb_aug_prob: 0.43
+  rgb_aug_mag: 0.80
+  depth_aug_prob: 0.54
+  depth_aug_mag: 0.70
+
+modality_dropout:
+  enabled: true
+  rate: 0.48
+  start: 0
+  ramp: 30
+  schedule: ramp_up

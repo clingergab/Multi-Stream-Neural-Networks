@@ -1,0 +1,70 @@
+# LINet (no Modality Dropout), fine-tuned on SUN RGB-D from a
+# ScanNet-pretrained checkpoint.
+#
+# Source: Paper Table 1 ("LINet (no M.D.)" row, "ScanNet" pretraining
+# column); Appendix Table B3 column 1 ("No-MD").
+# Reported test MCA (Fusion / RGB-only / Depth-only): 48.0 / 36.5 / 37.2
+# Reported test Acc (Fusion / RGB-only / Depth-only): 49.2 / 38.0 / 38.7
+#
+# Requires --pretrained <path-to-scannet-checkpoint> (produced by
+# scannet_pretrain_no_md.yaml).
+
+meta:
+  paper_table: "Table 1, Table B3 col. 1"
+  reported_mca:
+    fusion: 48.0
+    rgb_only: 36.5
+    depth_only: 37.2
+  phase: finetune
+  schedule: no_md
+  pretrain_source: scannet_pretrain_no_md.yaml
+
+dataset:
+  name: sunrgbd_19
+  data_root: data/sunrgbd_19
+  batch_size: 64
+  num_workers: 2
+  num_classes: 19
+  use_hha: false
+  stratified: true
+  normalize: true
+
+model:
+  architecture: li_resnet18
+  stream_input_channels: [3, 1]
+  width_multiplier: 0.75
+  dropout_p: 0.78
+  num_classes: 19
+  device: cuda
+  use_amp: true
+
+optimizer:
+  type: adamw
+  lr: 1.884e-4
+  weight_decay: 4.138e-2
+  stem_lr_multiplier: 1.70
+
+scheduler:
+  type: cosine
+  t_max: 13                               # best checkpoint at epoch 13
+  eta_min: 4.724e-6
+  warmup_epochs: 0
+  warmup_start_factor: 1.0
+
+training:
+  epochs: 13
+  grad_clip_norm: 1.00
+  label_smoothing: 0.05
+  monitor: val_mca
+  early_stopping: false
+  restore_best_weights: true              # best checkpoint at epoch 13
+  seed: 42
+
+augmentation:
+  rgb_aug_prob: 0.85
+  rgb_aug_mag: 1.20
+  depth_aug_prob: 1.27
+  depth_aug_mag: 1.27
+
+modality_dropout:
+  enabled: false

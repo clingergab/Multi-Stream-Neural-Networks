@@ -1,0 +1,66 @@
+# LINet (no Modality Dropout), trained from scratch on SUN RGB-D.
+# Unregularized baseline that exposes severe modality co-dependence
+# (the "pathway collapse" signature; paper §4.4.1).
+#
+# Source: Paper Table 1 ("LINet (no M.D.)" row, "No" pretraining column);
+#         Appendix Table B1 column 1.
+# Reported test MCA (Fusion / RGB-only / Depth-only): 43.5 / 15.0 / 14.4
+# Reported test Acc (Fusion / RGB-only / Depth-only): 49.2 / 15.0 / 17.4
+
+meta:
+  paper_table: "Table 1, Table B1 col. 1"
+  reported_mca:
+    fusion: 43.5
+    rgb_only: 15.0
+    depth_only: 14.4
+  schedule: no_md
+
+dataset:
+  name: sunrgbd_19
+  data_root: data/sunrgbd_19
+  batch_size: 64
+  num_workers: 2
+  num_classes: 19
+  use_hha: false
+  stratified: true
+  normalize: true
+
+model:
+  architecture: li_resnet18
+  stream_input_channels: [3, 1]
+  width_multiplier: 0.75
+  dropout_p: 0.38
+  num_classes: 19
+  device: cuda
+  use_amp: true
+
+optimizer:
+  type: adamw
+  lr: 1.57e-4
+  weight_decay: 3.52e-4
+  stem_lr_multiplier: 13
+
+scheduler:
+  type: cosine
+  t_max: 70
+  eta_min: 3.94e-6
+  warmup_epochs: 0
+  warmup_start_factor: 1.0
+
+training:
+  epochs: 70
+  grad_clip_norm: 1.00
+  label_smoothing: 0.18
+  monitor: val_mca
+  early_stopping: false
+  restore_best_weights: false
+  seed: 42
+
+augmentation:
+  rgb_aug_prob: 0.73
+  rgb_aug_mag: 1.01
+  depth_aug_prob: 0.79
+  depth_aug_mag: 1.08
+
+modality_dropout:
+  enabled: false

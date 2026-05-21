@@ -1,0 +1,77 @@
+# LINet + Delayed Modality Dropout, from scratch on SUN RGB-D.
+# Ablation: tests whether warm-up without MD followed by a delayed ramp
+# produces stronger features. Result is that the delayed activation
+# introduces a regularization shock that disrupts feature learning
+# (paper §4.4.1, Figure 6c).
+#
+# Source: Paper Appendix Table B1 column 4.
+# Reported test MCA (Fusion / RGB-only / Depth-only): 43.8 / 33.7 / 36.5
+# Reported test Acc (Fusion / RGB-only / Depth-only): 48.8 / 37.0 / 40.1
+#
+# Note on schedule shape: paper §4.4.1 prose describes Delayed MD as
+# "p=0 for 30 epochs, then a 15-epoch ramp". Appendix Table B1 lists the
+# same schedule as "start ep 20, ramp 15". This config follows Table B1
+# since the appendix is the explicit reproducibility source; flagged in
+# configs/reported_runs/README.md for transparency.
+
+meta:
+  paper_table: "Table B1 col. 4"
+  reported_mca:
+    fusion: 43.8
+    rgb_only: 33.7
+    depth_only: 36.5
+  schedule: delayed_md
+
+dataset:
+  name: sunrgbd_19
+  data_root: data/sunrgbd_19
+  batch_size: 64
+  num_workers: 2
+  num_classes: 19
+  use_hha: false
+  stratified: true
+  normalize: true
+
+model:
+  architecture: li_resnet18
+  stream_input_channels: [3, 1]
+  width_multiplier: 0.75
+  dropout_p: 0.27
+  num_classes: 19
+  device: cuda
+  use_amp: true
+
+optimizer:
+  type: adamw
+  lr: 1.53e-4
+  weight_decay: 1.46e-4
+  stem_lr_multiplier: 21
+
+scheduler:
+  type: cosine
+  t_max: 81
+  eta_min: 1.73e-6
+  warmup_epochs: 0
+  warmup_start_factor: 1.0
+
+training:
+  epochs: 81
+  grad_clip_norm: 1.00
+  label_smoothing: 0.10
+  monitor: val_mca
+  early_stopping: false
+  restore_best_weights: false
+  seed: 42
+
+augmentation:
+  rgb_aug_prob: 0.92
+  rgb_aug_mag: 1.17
+  depth_aug_prob: 0.95
+  depth_aug_mag: 1.04
+
+modality_dropout:
+  enabled: true
+  rate: 0.48
+  start: 20                               # delayed activation (Appendix B1)
+  ramp: 15
+  schedule: ramp_up

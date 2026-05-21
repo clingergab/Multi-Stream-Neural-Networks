@@ -1,0 +1,64 @@
+# LINet (no Modality Dropout), trained from scratch on NYU Depth V2.
+# Secondary-benchmark unregularized baseline.
+#
+# Source: Paper Table 2 ("LINet (no M.D.)" row); Appendix Table B4 col. 1.
+# Reported test MCA (Fusion / RGB-only / Depth-only): 50.1 / 27.0 / 16.1
+# Reported test Acc (Fusion / RGB-only / Depth-only): 49.5 / 25.8 / 26.8
+
+meta:
+  paper_table: "Table 2, Table B4 col. 1"
+  reported_mca:
+    fusion: 50.1
+    rgb_only: 27.0
+    depth_only: 16.1
+  schedule: no_md
+
+dataset:
+  name: nyu_depth_v2
+  data_root: data/nyu_depth_v2
+  batch_size: 64
+  num_workers: 2
+  num_classes: 10
+  use_hha: false
+  stratified: true
+  normalize: true
+
+model:
+  architecture: li_resnet18
+  stream_input_channels: [3, 1]
+  width_multiplier: 0.75
+  dropout_p: 0.41
+  num_classes: 10
+  device: cuda
+  use_amp: true
+
+optimizer:
+  type: adamw
+  lr: 1.40e-4
+  weight_decay: 9.07e-4
+  stem_lr_multiplier: 20
+
+scheduler:
+  type: cosine
+  t_max: 61
+  eta_min: 3.84e-6
+  warmup_epochs: 0
+  warmup_start_factor: 1.0
+
+training:
+  epochs: 61
+  grad_clip_norm: 1.35
+  label_smoothing: 0.19
+  monitor: val_mca
+  early_stopping: false
+  restore_best_weights: false
+  seed: 42
+
+augmentation:
+  rgb_aug_prob: 1.13
+  rgb_aug_mag: 1.13
+  depth_aug_prob: 0.71
+  depth_aug_mag: 0.91
+
+modality_dropout:
+  enabled: false

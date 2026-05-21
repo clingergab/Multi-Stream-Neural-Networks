@@ -1,0 +1,69 @@
+# LINet + Progressive Modality Dropout, trained from scratch on NYU Depth V2.
+# Secondary benchmark confirming that LINet's training dynamics transfer
+# beyond SUN RGB-D.
+#
+# Source: Paper Table 2 ("LINet + prog. M.D." row); Appendix Table B4 col. 2.
+# Reported test MCA (Fusion / RGB-only / Depth-only): 50.8 / 37.8 / 40.3
+# Reported test Acc (Fusion / RGB-only / Depth-only): 49.5 / 30.9 / 38.8
+
+meta:
+  paper_table: "Table 2, Table B4 col. 2"
+  reported_mca:
+    fusion: 50.8
+    rgb_only: 37.8
+    depth_only: 40.3
+  schedule: progressive_md
+
+dataset:
+  name: nyu_depth_v2
+  data_root: data/nyu_depth_v2            # override with --data-root on CLI
+  batch_size: 64
+  num_workers: 2
+  num_classes: 10
+  use_hha: false
+  stratified: true
+  normalize: true
+
+model:
+  architecture: li_resnet18
+  stream_input_channels: [3, 1]
+  width_multiplier: 0.75
+  dropout_p: 0.41
+  num_classes: 10
+  device: cuda
+  use_amp: true
+
+optimizer:
+  type: adamw
+  lr: 1.40e-4
+  weight_decay: 1.36e-4
+  stem_lr_multiplier: 23
+
+scheduler:
+  type: cosine
+  t_max: 65
+  eta_min: 2.17e-6
+  warmup_epochs: 0
+  warmup_start_factor: 1.0
+
+training:
+  epochs: 65
+  grad_clip_norm: 1.05
+  label_smoothing: 0.16
+  monitor: val_mca
+  early_stopping: false
+  restore_best_weights: false
+  seed: 42
+
+augmentation:
+  rgb_aug_prob: 0.99
+  rgb_aug_mag: 0.87
+  depth_aug_prob: 0.75
+  depth_aug_mag: 0.80
+
+modality_dropout:
+  enabled: true
+  rate: 0.44                              # p_max (NYU-specific HPO optimum)
+  start: 0
+  ramp: 30
+  schedule: ramp_up

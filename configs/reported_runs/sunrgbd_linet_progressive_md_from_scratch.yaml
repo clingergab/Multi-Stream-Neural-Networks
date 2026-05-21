@@ -1,0 +1,78 @@
+# LINet + Progressive Modality Dropout, trained from scratch on SUN RGB-D
+# Paper headline from-scratch result.
+#
+# Source: Paper Table 1 ("LINet + prog. M.D." row, "No" pretraining column);
+#         Appendix Table B1 column 2 ("Progressive MD").
+# Reported test MCA (Fusion / RGB-only / Depth-only): 45.2 / 33.7 / 35.7
+# Reported test Acc (Fusion / RGB-only / Depth-only): 49.4 / 36.4 / 37.8
+
+meta:
+  paper_table: "Table 1, Table B1 col. 2"
+  reported_mca:
+    fusion: 45.2
+    rgb_only: 33.7
+    depth_only: 35.7
+  schedule: progressive_md
+  notes: |
+    Strongest from-scratch result in the table at ResNet-18 scale.
+    The Progressive-MD (p_max = 0.8) variant in paper Table 3
+    (44.1% Fusion MCA) reuses this exact config with only
+    modality_dropout.rate changed to 0.8.
+
+dataset:
+  name: sunrgbd_19
+  data_root: data/sunrgbd_19              # override with --data-root on CLI
+  batch_size: 64
+  num_workers: 2
+  num_classes: 19
+  use_hha: false
+  stratified: true                        # WeightedRandomSampler over training set
+  normalize: true
+
+model:
+  architecture: li_resnet18
+  stream_input_channels: [3, 1]           # RGB (3) + Depth (1); integration stream is built internally
+  width_multiplier: 0.75                  # α from paper -> channels [48, 48, 96, 192, 384]
+  dropout_p: 0.28
+  num_classes: 19
+  device: cuda
+  use_amp: true
+
+optimizer:
+  type: adamw
+  lr: 1.53e-4
+  weight_decay: 6.74e-5
+  stem_lr_multiplier: 21
+
+scheduler:
+  type: cosine
+  # Paper §4.2: "cosine annealing schedule (minimum threshold η_min)".
+  # Set t_max == training.epochs for a single full cosine cycle.
+  t_max: 80
+  eta_min: 3.27e-6
+  warmup_epochs: 0
+  warmup_start_factor: 1.0
+
+training:
+  epochs: 80
+  grad_clip_norm: 1.00
+  label_smoothing: 0.10
+  monitor: val_mca
+  early_stopping: false                   # fixed epoch budget per Appendix A
+  restore_best_weights: false
+  seed: 42
+
+augmentation:
+  # Per-modality global control dials (Appendix A). NOT literal probabilities;
+  # values above 1.0 turn the dial past its nominal setting.
+  rgb_aug_prob: 0.94
+  rgb_aug_mag: 1.20
+  depth_aug_prob: 1.06
+  depth_aug_mag: 0.98
+
+modality_dropout:
+  enabled: true
+  rate: 0.48                              # p_max
+  start: 0                                # epoch at which the ramp begins
+  ramp: 30                                # T_ramp (epochs); linear 0 -> p_max
+  schedule: ramp_up                       # Progressive

@@ -1,0 +1,75 @@
+# LINet + Progressive Modality Dropout, fine-tuned on SUN RGB-D from a
+# ScanNet-pretrained checkpoint. Paper headline pretrained result.
+#
+# Source: Paper Table 1 ("LINet + prog. M.D." row, "ScanNet" pretraining
+# column); Appendix Table B3 column 2 ("Progressive MD").
+# Reported test MCA (Fusion / RGB-only / Depth-only): 49.6 / 39.2 / 38.4
+# Reported test Acc (Fusion / RGB-only / Depth-only): 53.1 / 40.5 / 42.2
+#
+# Requires --pretrained <path-to-scannet-checkpoint> (produced by
+# scannet_pretrain_progressive_md.yaml). The fc head is reinitialized at
+# load time because the SUN class count differs from ScanNet's.
+
+meta:
+  paper_table: "Table 1, Table B3 col. 2"
+  reported_mca:
+    fusion: 49.6
+    rgb_only: 39.2
+    depth_only: 38.4
+  phase: finetune
+  schedule: progressive_md
+  pretrain_source: scannet_pretrain_progressive_md.yaml
+
+dataset:
+  name: sunrgbd_19
+  data_root: data/sunrgbd_19
+  batch_size: 64
+  num_workers: 2
+  num_classes: 19
+  use_hha: false
+  stratified: true
+  normalize: true
+
+model:
+  architecture: li_resnet18
+  stream_input_channels: [3, 1]
+  width_multiplier: 0.75
+  dropout_p: 0.65
+  num_classes: 19
+  device: cuda
+  use_amp: true
+
+optimizer:
+  type: adamw
+  lr: 1.404e-4
+  weight_decay: 7.293e-4
+  stem_lr_multiplier: 0.90
+
+scheduler:
+  type: cosine
+  t_max: 18                               # best checkpoint at epoch 18
+  eta_min: 9.632e-7
+  warmup_epochs: 0
+  warmup_start_factor: 1.0
+
+training:
+  epochs: 18
+  grad_clip_norm: 1.20
+  label_smoothing: 0.05
+  monitor: val_mca
+  early_stopping: false
+  restore_best_weights: true              # best checkpoint at epoch 18
+  seed: 42
+
+augmentation:
+  rgb_aug_prob: 0.70
+  rgb_aug_mag: 1.07
+  depth_aug_prob: 1.26
+  depth_aug_mag: 1.10
+
+modality_dropout:
+  enabled: true
+  rate: 0.48
+  start: 0
+  ramp: 30
+  schedule: ramp_up
