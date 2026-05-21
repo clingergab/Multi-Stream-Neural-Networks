@@ -81,7 +81,7 @@ LINet also transfers to **NYU Depth V2** (secondary benchmark, 10 scene categori
 ## Quick Start
 
 ```bash
-git clone https://github.com/<your-username>/Multi-Stream-Neural-Networks.git
+git clone https://github.com/clingergab/Multi-Stream-Neural-Networks.git
 cd Multi-Stream-Neural-Networks
 pip install -e .
 ```
