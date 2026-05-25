@@ -37,6 +37,7 @@ import yaml
 from src.data_utils.sunrgbd_dataset import get_sunrgbd_dataloaders
 from src.data_utils.nyu_depth_v2_dataset import get_nyu_depth_v2_dataloaders
 from src.data_utils.scannet_pretrain_dataset import get_scannet_pretrain_dataloaders
+from src.models.common.model_helpers import load_pretrained_backbone
 from src.models.linear_integration.li_net3 import li_resnet18
 from src.training.optimizers import create_stream_optimizer
 from src.training.schedulers import setup_scheduler
@@ -141,21 +142,15 @@ def _build_model(cfg: dict, num_classes: int) -> torch.nn.Module:
 def _load_pretrained(model: torch.nn.Module, ckpt_path: str) -> None:
     """Load a pretrained checkpoint, skipping the classifier head.
 
-    The classifier head (`model.fc`) is reinitialized because the source
-    (ScanNet) and target (SUN RGB-D / NYU) class counts differ.
+    Delegates to ``load_pretrained_backbone`` so the silent-corruption
+    guards fire on real fine-tune runs: HHA<->raw-depth depth-stem skip
+    warning, ``run_config.json`` sidecar staleness (drop-list hash,
+    axis_alignment_inverted), and architecture mismatch
+    (model_class / stream_input_channels). The classifier head is
+    skipped automatically via shape-mismatch on ``fc.*`` because the
+    source (ScanNet, 20 classes) and target (SUN/NYU) class counts differ.
     """
-    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    sd = state.get("model_state_dict", state)
-    own = model.state_dict()
-    filtered = {
-        k: v for k, v in sd.items()
-        if k in own and own[k].shape == v.shape and not k.startswith("fc.")
-    }
-    missing = [k for k in own if k not in filtered]
-    model.load_state_dict(filtered, strict=False)
-    print(f"[pretrained] loaded {len(filtered)} tensors from {ckpt_path}")
-    print(f"[pretrained] reinitialized (not loaded): {len(missing)} tensors "
-          f"(includes classifier head)")
+    load_pretrained_backbone(model, ckpt_path, verbose=True)
 
 
 def _build_optimizer_and_scheduler(model: torch.nn.Module, cfg: dict, train_loader_len: int):
