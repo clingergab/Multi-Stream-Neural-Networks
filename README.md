@@ -1,10 +1,19 @@
 # LINet: Linear Integration Networks
 
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white) ![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
+
 A biologically-inspired multi-stream neural network architecture for continuous cross-modal learning, applied to RGB-D scene classification.
 
 > **Multi-stream** describes the architecture (parallel per-modality pathways plus a learned integration pathway). **Multi-modal** describes the application (here, RGB and Depth as complementary input modalities). LINet is a multi-stream architecture applied to a multi-modal task; the two terms are not interchangeable.
 
 This repository accompanies the paper **"MSNN-LINet: Cross-Modal Learning via Continuous Linear Integration"** (Clinger). See [`configs/reported_runs/`](configs/reported_runs/) for the exact hyperparameters used for every result in the paper.
+
+## Highlights
+
+- **A novel architecture, built from scratch.** A custom `LIConv2d` operator that fuses RGB and Depth at the pre-activation stage of *every* layer on a ResNet-18 backbone, not a fine-tune or a config of an existing model.
+- **Competitive results.** 45.2% mean class accuracy from scratch on SUN RGB-D (the strongest result at ResNet-18 scale without pretraining), 49.6% with in-domain ScanNet pretraining, and 50.8% on NYU Depth V2.
+- **Fully reproducible.** Exact hyperparameters for every number in the paper live in [`configs/reported_runs/`](configs/reported_runs/), one YAML per table row, driven by a single `train.py`.
+- **~100% Python / PyTorch**, MIT licensed. Custom training stack: stream-specific optimizers, progressive modality dropout, GPU-side augmentation, and pathway-collapse monitoring.
 
 ## Overview
 
