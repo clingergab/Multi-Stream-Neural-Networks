@@ -1,12 +1,12 @@
 # LINet: Linear Integration Networks
 
-![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white) ![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white) ![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white) ![License: MIT](https://img.shields.io/badge/License-MIT-green) [![arXiv](https://img.shields.io/badge/arXiv-2606.31135-b31b1b.svg)](https://arxiv.org/abs/2606.31135)
 
 A biologically-inspired multi-stream neural network architecture for continuous cross-modal learning, applied to RGB-D scene classification.
 
 > **Multi-stream** describes the architecture (parallel per-modality pathways plus a learned integration pathway). **Multi-modal** describes the application (here, RGB and Depth as complementary input modalities). LINet is a multi-stream architecture applied to a multi-modal task; the two terms are not interchangeable.
 
-This repository accompanies the paper **"MSNN-LINet: Cross-Modal Learning via Continuous Linear Integration"** (Clinger). See [`configs/reported_runs/`](configs/reported_runs/) for the exact hyperparameters used for every result in the paper.
+This repository accompanies the paper **["MSNN-LINet: Cross-Modal Learning via Continuous Linear Integration"](https://arxiv.org/abs/2606.31135)** (Clinger, arXiv:2606.31135). See [`configs/reported_runs/`](configs/reported_runs/) for the exact hyperparameters used for every result in the paper.
 
 ## Highlights
 
